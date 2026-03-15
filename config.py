@@ -1,7 +1,10 @@
 import os
-from dotenv import load_dotenv
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 TOKEN          = os.getenv('BOT_TOKEN', '')
 SUPER_ADMIN    = int(os.getenv('SUPER_ADMIN', '0'))
