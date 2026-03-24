@@ -64,6 +64,12 @@ def init_db():
         CREATE TABLE IF NOT EXISTS paid_setups (
             user_id INTEGER PRIMARY KEY
         );
+        CREATE TABLE IF NOT EXISTS bot_templates (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id     INTEGER NOT NULL,
+            text       TEXT    NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     ''')
     conn.commit()
     # Миграции для старых схем
@@ -333,6 +339,33 @@ def db_clear_paid(user_id: int):
     c = _conn()
     c.execute('DELETE FROM paid_setups WHERE user_id=?', (user_id,))
     c.commit(); c.close()
+
+# ── Bot Templates ─────────────────────────────────────
+def db_get_templates(bot_id: int) -> list:
+    c = _conn()
+    rows = c.execute(
+        'SELECT id, text FROM bot_templates WHERE bot_id=? ORDER BY created_at',
+        (bot_id,)
+    ).fetchall()
+    c.close(); return rows
+
+def db_add_template(bot_id: int, text: str) -> int:
+    c = _conn()
+    c.execute('INSERT INTO bot_templates (bot_id, text) VALUES (?,?)', (bot_id, text))
+    row_id = c.execute('SELECT last_insert_rowid()').fetchone()[0]
+    c.commit(); c.close(); return row_id
+
+def db_del_template(template_id: int, bot_id: int):
+    c = _conn()
+    c.execute('DELETE FROM bot_templates WHERE id=? AND bot_id=?', (template_id, bot_id))
+    c.commit(); c.close()
+
+def db_get_template(template_id: int, bot_id: int):
+    c = _conn()
+    row = c.execute(
+        'SELECT text FROM bot_templates WHERE id=? AND bot_id=?', (template_id, bot_id)
+    ).fetchone()
+    c.close(); return row[0] if row else None
 
 # ── Statistics ────────────────────────────────────────
 def db_get_stats():
