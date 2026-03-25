@@ -10,7 +10,8 @@ from database import (db_add_user, db_get_bot_users, db_deactivate_bot, DBState,
                       db_get_bot_setting, db_set_bot_setting,
                       db_get_bot_admins, db_add_bot_admin, db_remove_bot_admin,
                       db_set_primary_admin,
-                      db_get_templates, db_add_template, db_del_template, db_get_template)
+                      db_get_templates, db_add_template, db_del_template, db_get_template,
+                      db_log_message, db_get_bot_msg_stats)
 from keyboards import broadcast_type_kb
 from config import SUPER_ADMIN
 
@@ -139,9 +140,11 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         return ''
 
     # ── Клавиатуры ─────────────────────────────────────
-    def pk_start():
+    def pk_start(show_admin: bool = False):
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton('📤 Отправить сообщение', callback_data='p_send'))
+        if show_admin:
+            kb.add(InlineKeyboardButton('⚙️ Панель админа', callback_data='p_open_admin'))
         return kb
 
     def pk_back():
@@ -189,6 +192,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
 
     def pk_admin():
         kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton('📊 Статистика',            callback_data='p_stats'))
         kb.add(InlineKeyboardButton('📢 Рассылка',             callback_data='p_broadcast'))
         kb.add(InlineKeyboardButton('✏️ Изменить приветствие',  callback_data='p_edit_welcome'))
         kb.add(InlineKeyboardButton('👥 Заблокированные',       callback_data='p_blocked_list'))
@@ -208,7 +212,8 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     @pbot.message_handler(commands=['start'])
     def pstart(m):
         db_add_user(db_bot_id, m.from_user.id)
-        pbot.send_message(m.chat.id, get_welcome(), parse_mode='HTML', reply_markup=pk_start())
+        pbot.send_message(m.chat.id, get_welcome(), parse_mode='HTML',
+                          reply_markup=pk_start(is_admin(m.from_user.id)))
 
     @pbot.message_handler(commands=['admin'])
     def padmin_cmd(m):
@@ -254,15 +259,38 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def p_back_admin_cb(cb):
         if not is_admin(cb.from_user.id): return
         pstate.pop(cb.from_user.id, None)
-        pbot.edit_message_text("<b>⚙️ Панель админа</b>",
+        pbot.edit_message_text(
+            f"<b>⚙️ Панель админа</b>\n\n⏳ Подписка до: <b>{_get_exp_str()}</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_admin())
+
+    @pbot.callback_query_handler(func=lambda c: c.data == 'p_open_admin')
+    def p_open_admin_cb(cb):
+        if not is_admin(cb.from_user.id): return
+        pbot.edit_message_text(
+            f"<b>⚙️ Панель админа</b>\n\n⏳ Подписка до: <b>{_get_exp_str()}</b>",
+            cb.message.chat.id, cb.message.message_id,
+            parse_mode='HTML', reply_markup=pk_admin())
+
+    @pbot.callback_query_handler(func=lambda c: c.data == 'p_stats')
+    def p_stats_cb(cb):
+        if not is_admin(cb.from_user.id): return
+        s = db_get_bot_msg_stats(db_bot_id)
+        pbot.edit_message_text(
+            f"<b>📊 Статистика бота</b>\n\n"
+            f"📩 Сообщений сегодня: <b>{s['today']}</b>\n"
+            f"📨 Сообщений за неделю: <b>{s['week']}</b>\n"
+            f"👥 Уникальных пользователей: <b>{s['total_users']}</b>\n"
+            f"🚫 Заблокировано: <b>{s['blocked']}</b>\n\n"
+            f"⏳ Подписка до: <b>{_get_exp_str()}</b>",
+            cb.message.chat.id, cb.message.message_id,
+            parse_mode='HTML', reply_markup=pk_back_admin())
 
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_cancel')
     def p_cancel(cb):
         pstate.pop(cb.from_user.id, None)
         pbot.edit_message_text(get_welcome(), cb.message.chat.id, cb.message.message_id,
-            parse_mode='HTML', reply_markup=pk_start())
+            parse_mode='HTML', reply_markup=pk_start(is_admin(cb.from_user.id)))
 
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_close')
     def p_close(cb):
@@ -312,6 +340,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if not _user_msg_checks(m): return
         header = _make_header(m)
         send_to_admins(f"{header}\n\n💬 {m.text}", reply_markup=pk_reply(m.from_user.id))
+        db_log_message(db_bot_id, m.from_user.id)
         pbot.send_message(m.chat.id, "<b>✅ Сообщение отправлено</b>",
             parse_mode='HTML', reply_markup=pk_close())
         pstate.pop(m.from_user.id, None)
@@ -324,6 +353,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def p_user_media(m):
         if not _user_msg_checks(m): return
         send_media_to_admins(m, _make_header(m))
+        db_log_message(db_bot_id, m.from_user.id)
         pbot.send_message(m.chat.id, "<b>✅ Сообщение отправлено</b>",
             parse_mode='HTML', reply_markup=pk_close())
         pstate.pop(m.from_user.id, None)

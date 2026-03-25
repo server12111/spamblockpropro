@@ -15,6 +15,9 @@ from database import (db_add_user, db_get_owner_bots, db_add_bot,
                        get_price, set_price,
                        db_set_pending, db_del_pending,
                        db_mark_paid, db_is_paid, db_clear_paid,
+                       db_has_used_trial, db_mark_trial_used,
+                       db_set_referral, db_get_referrer, db_mark_referral_paid,
+                       db_get_discount_count, db_use_discount,
                        DBState)
 from keyboards import (start_kb, back_to_start_kb, back_to_payment_kb, cancel_kb,
                        close_kb, reply_kb, payment_kb, cryptobot_kb,
@@ -97,6 +100,10 @@ def start_subscription_checker(main_bot):
 
 def register(bot: telebot.TeleBot):
     state = DBState(0)
+    try:
+        _bot_username = bot.get_me().username or ''
+    except Exception:
+        _bot_username = ''
 
     def _safe_send(uid, text):
         try: bot.send_message(uid, text, parse_mode='HTML'); return True
@@ -112,6 +119,21 @@ def register(bot: telebot.TeleBot):
 
     def _after_payment_confirmed(uid, chat_id, message_id):
         """Вызывается после любой успешной оплаты."""
+        # Нагородження реферера при першій оплаті
+        referrer = db_get_referrer(uid)
+        if referrer:
+            db_mark_referral_paid(uid)
+            try:
+                disc = db_get_discount_count(referrer)
+                bot.send_message(referrer,
+                    f"🎉 <b>Твой реферал оплатил подписку!</b>\n\n"
+                    f"💎 Накоплено скидок: <b>{disc}</b>\n"
+                    f"Каждая скидка = 1 бесплатное продление на 30 дней.\n"
+                    f"Используй при следующей оплате через кнопку «🛒 Купить бота».",
+                    parse_mode='HTML')
+            except Exception:
+                pass
+
         s = state.get(uid)
         if isinstance(s, dict) and s.get('step') == 'renewing':
             bot_id = s['bot_id']
@@ -140,7 +162,17 @@ def register(bot: telebot.TeleBot):
     # ── /start ───────────────────────────────────────────
     @bot.message_handler(commands=['start'])
     def cmd_start(m):
-        db_add_user(0, m.from_user.id)
+        uid = m.from_user.id
+        db_add_user(0, uid)
+        # Обработка реферального deep link: /start ref_123456789
+        payload = m.text.strip().split(' ', 1)[1] if ' ' in m.text else ''
+        if payload.startswith('ref_'):
+            try:
+                referrer_id = int(payload[4:])
+                if referrer_id != uid:
+                    db_set_referral(referrer_id, uid)
+            except (ValueError, Exception):
+                pass
         bot.send_message(m.chat.id, start_text(ADMIN_USERNAME),
             parse_mode='HTML', reply_markup=start_kb())
 
@@ -176,11 +208,14 @@ def register(bot: telebot.TeleBot):
 
     @bot.callback_query_handler(func=lambda c: c.data == 'back_to_payment')
     def back_to_payment_cb(cb):
-        state.pop(cb.from_user.id, None)
-        db_del_pending(cb.from_user.id)
+        uid = cb.from_user.id
+        state.pop(uid, None)
+        db_del_pending(uid)
+        disc = db_get_discount_count(uid)
+        show_trial = not db_has_used_trial(uid)
         bot.edit_message_text(buy_text(),
             cb.message.chat.id, cb.message.message_id,
-            parse_mode='HTML', reply_markup=payment_kb())
+            parse_mode='HTML', reply_markup=payment_kb(disc, show_trial))
 
     # ── Отправить сообщение ──────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'user_send')
@@ -279,26 +314,82 @@ def register(bot: telebot.TeleBot):
             return
 
         # Нет ботов — обычная покупка
+        disc = db_get_discount_count(uid)
+        show_trial = not db_has_used_trial(uid)
         bot.edit_message_text(buy_text(),
             cb.message.chat.id, cb.message.message_id,
-            parse_mode='HTML', reply_markup=payment_kb())
+            parse_mode='HTML', reply_markup=payment_kb(disc, show_trial))
 
     @bot.callback_query_handler(func=lambda c: c.data == 'buy_new_bot')
     def buy_new_bot_cb(cb):
+        uid = cb.from_user.id
+        disc = db_get_discount_count(uid)
+        show_trial = not db_has_used_trial(uid)
         bot.edit_message_text(buy_text(),
             cb.message.chat.id, cb.message.message_id,
-            parse_mode='HTML', reply_markup=payment_kb())
+            parse_mode='HTML', reply_markup=payment_kb(disc, show_trial))
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith('renew_bot_'))
     def renew_bot_cb(cb):
+        uid = cb.from_user.id
         bot_id = int(cb.data.split('_')[-1])
-        state[cb.from_user.id] = {'step': 'renewing', 'bot_id': bot_id}
+        state[uid] = {'step': 'renewing', 'bot_id': bot_id}
+        disc = db_get_discount_count(uid)
         bot.edit_message_text(
             f"<b>🔄 Продление подписки на 30 дней</b>\n\n"
             f"Сумма: <b>{get_price()} USDT</b>\n\n"
             f"Выбери способ оплаты:",
             cb.message.chat.id, cb.message.message_id,
-            parse_mode='HTML', reply_markup=payment_kb())
+            parse_mode='HTML', reply_markup=payment_kb(disc))
+
+    # ── Реферальная ссылка ───────────────────────────────
+    @bot.callback_query_handler(func=lambda c: c.data == 'get_ref_link')
+    def get_ref_link_cb(cb):
+        uid = cb.from_user.id
+        disc = db_get_discount_count(uid)
+        ref_link = f"https://t.me/{_bot_username}?start=ref_{uid}" if _bot_username else f"start=ref_{uid}"
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton('❌ Закрыть', callback_data='close'))
+        bot.send_message(uid,
+            f"🔗 <b>Твоя реферальная ссылка:</b>\n"
+            f"<code>{ref_link}</code>\n\n"
+            f"За каждого приведённого клиента, который оплатит подписку, "
+            f"ты получишь 1 бесплатное продление на 30 дней.\n\n"
+            f"💎 Накоплено скидок: <b>{disc}</b>",
+            parse_mode='HTML', reply_markup=kb)
+        bot.answer_callback_query(cb.id)
+
+    # ── Пробний период ───────────────────────────────────
+    @bot.callback_query_handler(func=lambda c: c.data == 'try_free')
+    def try_free_cb(cb):
+        uid = cb.from_user.id
+        if db_has_used_trial(uid):
+            bot.answer_callback_query(cb.id,
+                "❌ Ты уже использовал бесплатный пробный период.", show_alert=True)
+            return
+        db_mark_trial_used(uid)
+        db_mark_paid(uid)
+        state[uid] = 'await_bot_token_trial'
+        bot.edit_message_text(
+            "<b>🆓 Бесплатный пробный период (3 дня) активирован!\n\n"
+            "🤖 Введи токен своего бота (получи в @BotFather):</b>",
+            cb.message.chat.id, cb.message.message_id,
+            parse_mode='HTML', reply_markup=cancel_kb())
+
+    # ── Использовать скидку ──────────────────────────────
+    @bot.callback_query_handler(func=lambda c: c.data == 'use_discount')
+    def use_discount_cb(cb):
+        uid = cb.from_user.id
+        if db_get_discount_count(uid) <= 0:
+            bot.answer_callback_query(cb.id, "❌ У тебя нет скидок.", show_alert=True)
+            return
+        db_use_discount(uid)
+        # Якщо renewal — state вже має 'renewing' step, _after_payment_confirmed обробить
+        # Якщо новий бот — mark_paid і await_token
+        s = state.get(uid)
+        if not (isinstance(s, dict) and s.get('step') == 'renewing'):
+            db_mark_paid(uid)
+        _after_payment_confirmed(uid, cb.message.chat.id, cb.message.message_id)
 
     # ── CryptoBot ────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'pay_cryptobot')
@@ -397,8 +488,9 @@ def register(bot: telebot.TeleBot):
                 parse_mode='HTML', reply_markup=kb)
 
     # ── Настройка бота после оплаты ──────────────────────
-    @bot.message_handler(func=lambda m: state.get(m.from_user.id) == 'await_bot_token')
+    @bot.message_handler(func=lambda m: state.get(m.from_user.id) in ('await_bot_token', 'await_bot_token_trial'))
     def get_bot_token(m):
+        is_trial = state.get(m.from_user.id) == 'await_bot_token_trial'
         token_val = m.text.strip()
         if ':' not in token_val or len(token_val) < 30:
             bot.send_message(m.chat.id, "<b>❌ Неверный формат токена. Попробуй ещё раз:</b>",
@@ -410,7 +502,8 @@ def register(bot: telebot.TeleBot):
             bot.send_message(m.chat.id, "<b>❌ Токен недействителен. Проверь и введи правильный:</b>",
                 parse_mode='HTML')
             return
-        state[m.from_user.id] = {'step': 'await_admin_id', 'token': token_val, 'username': me.username or ''}
+        state[m.from_user.id] = {'step': 'await_admin_id', 'token': token_val,
+                                  'username': me.username or '', 'trial': is_trial}
         bot.send_message(m.chat.id,
             "<b>👤 Теперь введи свой Telegram ID\n"
             "(сообщения от пользователей будут приходить именно тебе)\n\n"
@@ -429,8 +522,9 @@ def register(bot: telebot.TeleBot):
         s         = state.pop(m.from_user.id)
         token_val = s['token']
         uname     = s.get('username', '')
+        days      = 3 if s.get('trial') else 30
         try:
-            bot_db_id = db_add_bot(m.from_user.id, token_val, admin_id_val)
+            bot_db_id = db_add_bot(m.from_user.id, token_val, admin_id_val, days=days)
         except Exception:
             bot.send_message(m.chat.id,
                 "<b>❌ Этот токен уже зарегистрирован. Используй другой.</b>", parse_mode='HTML')

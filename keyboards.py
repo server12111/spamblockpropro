@@ -7,6 +7,7 @@ def start_kb():
         InlineKeyboardButton('📤 Отправить сообщение', callback_data='user_send'),
         InlineKeyboardButton('🛒 Купить бота',         callback_data='buy_bot'),
     )
+    kb.add(InlineKeyboardButton('🔗 Реферальная ссылка', callback_data='get_ref_link'))
     return kb
 
 def back_to_start_kb():
@@ -34,8 +35,14 @@ def reply_kb(target_id):
     kb.add(InlineKeyboardButton('📤 Ответить', callback_data=f'admin_reply_{target_id}'))
     return kb
 
-def payment_kb():
+def payment_kb(discount_count: int = 0, show_trial: bool = False):
     kb = InlineKeyboardMarkup()
+    if discount_count > 0:
+        kb.add(InlineKeyboardButton(
+            f'🎁 Использовать скидку (осталось: {discount_count})',
+            callback_data='use_discount'))
+    if show_trial:
+        kb.add(InlineKeyboardButton('🆓 Попробовать бесплатно (3 дня)', callback_data='try_free'))
     kb.add(InlineKeyboardButton('💳 Оплатить через CryptoBot',  callback_data='pay_cryptobot'))
     kb.add(InlineKeyboardButton('💎 Оплатить через TON Keeper', callback_data='pay_ton'))
     kb.add(InlineKeyboardButton('🔙 Назад',                     callback_data='back_to_start'))

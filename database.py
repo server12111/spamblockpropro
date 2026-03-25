@@ -70,6 +70,26 @@ def init_db():
             text       TEXT    NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS trial_used (
+            user_id    INTEGER PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS referrals (
+            referrer_id INTEGER NOT NULL,
+            referred_id INTEGER NOT NULL PRIMARY KEY,
+            paid        INTEGER DEFAULT 0,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS referral_discounts (
+            user_id        INTEGER PRIMARY KEY,
+            discount_count INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS bot_messages (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id    INTEGER NOT NULL,
+            user_id   INTEGER NOT NULL,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     ''')
     conn.commit()
     # Миграции для старых схем
@@ -84,8 +104,8 @@ def init_db():
     conn.close()
 
 # ── Bots ──────────────────────────────────────────────
-def db_add_bot(owner_id, token, admin_id):
-    expires = datetime.now() + timedelta(days=30)
+def db_add_bot(owner_id, token, admin_id, days: int = 30):
+    expires = datetime.now() + timedelta(days=days)
     c = _conn()
     c.execute(
         'INSERT INTO bots (owner_id, token, admin_id, expires_at) VALUES (?,?,?,?)',
@@ -380,3 +400,76 @@ def db_get_stats():
     ).fetchall()
     c.close()
     return bots_count, main_users, total_users, breakdown
+
+# ── Trial ─────────────────────────────────────────────
+def db_has_used_trial(user_id: int) -> bool:
+    c = _conn()
+    row = c.execute('SELECT 1 FROM trial_used WHERE user_id=?', (user_id,)).fetchone()
+    c.close(); return row is not None
+
+def db_mark_trial_used(user_id: int):
+    c = _conn()
+    c.execute('INSERT OR IGNORE INTO trial_used (user_id) VALUES (?)', (user_id,))
+    c.commit(); c.close()
+
+# ── Referrals ─────────────────────────────────────────
+def db_set_referral(referrer_id: int, referred_id: int):
+    c = _conn()
+    c.execute('INSERT OR IGNORE INTO referrals (referrer_id, referred_id) VALUES (?,?)',
+              (referrer_id, referred_id))
+    c.commit(); c.close()
+
+def db_get_referrer(referred_id: int):
+    c = _conn()
+    row = c.execute('SELECT referrer_id FROM referrals WHERE referred_id=? AND paid=0',
+                    (referred_id,)).fetchone()
+    c.close(); return row[0] if row else None
+
+def db_mark_referral_paid(referred_id: int):
+    c = _conn()
+    row = c.execute('SELECT referrer_id FROM referrals WHERE referred_id=?',
+                    (referred_id,)).fetchone()
+    if row:
+        referrer_id = row[0]
+        c.execute('UPDATE referrals SET paid=1 WHERE referred_id=?', (referred_id,))
+        c.execute('''INSERT INTO referral_discounts (user_id, discount_count) VALUES (?,1)
+                     ON CONFLICT(user_id) DO UPDATE SET discount_count=discount_count+1''',
+                  (referrer_id,))
+    c.commit(); c.close()
+
+def db_get_discount_count(user_id: int) -> int:
+    c = _conn()
+    row = c.execute('SELECT discount_count FROM referral_discounts WHERE user_id=?',
+                    (user_id,)).fetchone()
+    c.close(); return row[0] if row else 0
+
+def db_use_discount(user_id: int):
+    c = _conn()
+    c.execute('''UPDATE referral_discounts SET discount_count=MAX(0, discount_count-1)
+                 WHERE user_id=?''', (user_id,))
+    c.commit(); c.close()
+
+# ── Bot Message Stats ─────────────────────────────────
+def db_log_message(bot_id: int, user_id: int):
+    c = _conn()
+    c.execute('INSERT INTO bot_messages (bot_id, user_id) VALUES (?,?)', (bot_id, user_id))
+    c.commit(); c.close()
+
+def db_get_bot_msg_stats(bot_id: int) -> dict:
+    c = _conn()
+    today = c.execute(
+        "SELECT COUNT(*) FROM bot_messages WHERE bot_id=? AND timestamp >= date('now')",
+        (bot_id,)
+    ).fetchone()[0]
+    week = c.execute(
+        "SELECT COUNT(*) FROM bot_messages WHERE bot_id=? AND timestamp >= date('now','-7 days')",
+        (bot_id,)
+    ).fetchone()[0]
+    total_users = c.execute(
+        'SELECT COUNT(*) FROM bot_users WHERE bot_id=?', (bot_id,)
+    ).fetchone()[0]
+    blocked = c.execute(
+        'SELECT COUNT(*) FROM blocked_users WHERE bot_id=?', (bot_id,)
+    ).fetchone()[0]
+    c.close()
+    return {'today': today, 'week': week, 'total_users': total_users, 'blocked': blocked}
