@@ -194,7 +194,10 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton('📊 Статистика',            callback_data='p_stats'))
         kb.add(InlineKeyboardButton('📢 Рассылка',             callback_data='p_broadcast'))
-        kb.add(InlineKeyboardButton('✏️ Изменить приветствие',  callback_data='p_edit_welcome'))
+        kb.row(
+            InlineKeyboardButton('✏️ Приветствие',             callback_data='p_edit_welcome'),
+            InlineKeyboardButton('📋 Шаблоны',                 callback_data='p_admin_templates'),
+        )
         kb.add(InlineKeyboardButton('👥 Заблокированные',       callback_data='p_blocked_list'))
         kb.add(InlineKeyboardButton('👤 Управление админами',   callback_data='p_admins'))
         kb.add(InlineKeyboardButton('🗑 Удалить бота',          callback_data='p_delete_bot'))
@@ -285,6 +288,22 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             f"⏳ Подписка до: <b>{_get_exp_str()}</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_back_admin())
+
+    @pbot.callback_query_handler(func=lambda c: c.data == 'p_admin_templates')
+    def p_admin_templates_cb(cb):
+        if not is_admin(cb.from_user.id): return
+        templates = db_get_templates(db_bot_id)
+        kb = InlineKeyboardMarkup()
+        for tid, text in templates:
+            preview = text[:35] + '…' if len(text) > 35 else text
+            kb.add(InlineKeyboardButton(f'💬 {preview}', callback_data=f'p_view_tpl_{tid}'))
+        kb.add(InlineKeyboardButton('🔙 Назад', callback_data='p_back_admin'))
+        text = (f"<b>📋 Шаблоны ответов ({len(templates)}):</b>\n\n"
+                f"Шаблоны доступны при ответе на сообщение пользователя — кнопка «📋 Шаблони»."
+                if templates else
+                "<b>📋 Шаблоны ответов пусты</b>\n\nДобавь шаблон при ответе на сообщение — кнопка «📋 Шаблони».")
+        pbot.edit_message_text(text, cb.message.chat.id, cb.message.message_id,
+            parse_mode='HTML', reply_markup=kb)
 
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_cancel')
     def p_cancel(cb):

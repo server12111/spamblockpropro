@@ -39,7 +39,7 @@ def payment_kb(discount_count: int = 0, show_trial: bool = False):
     kb = InlineKeyboardMarkup()
     if discount_count > 0:
         kb.add(InlineKeyboardButton(
-            f'🎁 Использовать скидку (осталось: {discount_count})',
+            f'🎁 Использовать скидку +10 дней (осталось: {discount_count})',
             callback_data='use_discount'))
     if show_trial:
         kb.add(InlineKeyboardButton('🆓 Попробовать бесплатно (3 дня)', callback_data='try_free'))

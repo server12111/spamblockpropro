@@ -122,8 +122,8 @@ def register(bot: telebot.TeleBot):
         if scope == 'all': return db_get_all_users()
         return db_get_bot_users(0)
 
-    def _after_payment_confirmed(uid, chat_id, message_id):
-        """Вызывается после любой успешной оплаты."""
+    def _after_payment_confirmed(uid, chat_id, message_id, renew_days=30):
+        """Вызывается после любой успешной оплаты. renew_days — сколько дней добавить при продлении."""
         # Нагородження реферера при першій оплаті
         referrer = db_get_referrer(uid)
         if referrer:
@@ -133,7 +133,7 @@ def register(bot: telebot.TeleBot):
                 bot.send_message(referrer,
                     f"🎉 <b>Твой реферал оплатил подписку!</b>\n\n"
                     f"💎 Накоплено скидок: <b>{disc}</b>\n"
-                    f"Каждая скидка = 1 бесплатное продление на 30 дней.\n"
+                    f"Каждая скидка = 1 бесплатное продление на 10 дней.\n"
                     f"Используй при следующей оплате через кнопку «🛒 Купить бота».",
                     parse_mode='HTML')
             except Exception:
@@ -143,7 +143,7 @@ def register(bot: telebot.TeleBot):
         if isinstance(s, dict) and s.get('step') == 'renewing':
             bot_id = s['bot_id']
             state.pop(uid, None)
-            new_exp = db_renew_bot(bot_id, 30)
+            new_exp = db_renew_bot(bot_id, renew_days)
             info = db_get_bot_info(bot_id)
             if info:
                 token, admin_id_val, _, _ = info
@@ -153,7 +153,7 @@ def register(bot: telebot.TeleBot):
             kb = InlineKeyboardMarkup()
             kb.add(InlineKeyboardButton('❌ Закрыть', callback_data='close'))
             bot.edit_message_text(
-                f"<b>✅ Подписка успешно продлена на 30 дней!</b>\n\n"
+                f"<b>✅ Подписка успешно продлена на {renew_days} дней!</b>\n\n"
                 f"Действует до: <b>{exp_str}</b>",
                 chat_id, message_id, parse_mode='HTML', reply_markup=kb)
         else:
@@ -360,7 +360,7 @@ def register(bot: telebot.TeleBot):
             f"🔗 <b>Твоя реферальная ссылка:</b>\n"
             f"<code>{ref_link}</code>\n\n"
             f"За каждого приведённого клиента, который оплатит подписку, "
-            f"ты получишь 1 бесплатное продление на 30 дней.\n\n"
+            f"ты получишь 1 бесплатное продление на 10 дней.\n\n"
             f"💎 Накоплено скидок: <b>{disc}</b>",
             parse_mode='HTML', reply_markup=kb)
         bot.answer_callback_query(cb.id)
@@ -390,12 +390,10 @@ def register(bot: telebot.TeleBot):
             bot.answer_callback_query(cb.id, "❌ У тебя нет скидок.", show_alert=True)
             return
         db_use_discount(uid)
-        # Якщо renewal — state вже має 'renewing' step, _after_payment_confirmed обробить
-        # Якщо новий бот — mark_paid і await_token
         s = state.get(uid)
         if not (isinstance(s, dict) and s.get('step') == 'renewing'):
             db_mark_paid(uid)
-        _after_payment_confirmed(uid, cb.message.chat.id, cb.message.message_id)
+        _after_payment_confirmed(uid, cb.message.chat.id, cb.message.message_id, renew_days=10)
 
     # ── CryptoBot ────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'pay_cryptobot')
