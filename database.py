@@ -432,9 +432,14 @@ def db_mark_referral_paid(referred_id: int):
     if row:
         referrer_id = row[0]
         c.execute('UPDATE referrals SET paid=1 WHERE referred_id=?', (referred_id,))
-        c.execute('''INSERT INTO referral_discounts (user_id, discount_count) VALUES (?,1)
-                     ON CONFLICT(user_id) DO UPDATE SET discount_count=discount_count+1''',
-                  (referrer_id,))
+        existing = c.execute('SELECT discount_count FROM referral_discounts WHERE user_id=?',
+                             (referrer_id,)).fetchone()
+        if existing:
+            c.execute('UPDATE referral_discounts SET discount_count=discount_count+1 WHERE user_id=?',
+                      (referrer_id,))
+        else:
+            c.execute('INSERT INTO referral_discounts (user_id, discount_count) VALUES (?,1)',
+                      (referrer_id,))
     c.commit(); c.close()
 
 def db_get_discount_count(user_id: int) -> int:

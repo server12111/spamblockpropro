@@ -17,10 +17,10 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 bot = telebot.TeleBot(TOKEN)
-register(bot)
 
 if __name__ == '__main__':
     init_db()
+    register(bot)
     for db_bot_id, token, admin_id, owner_id in db_get_all_bots():
         launch_bot(db_bot_id, token, admin_id, bot)
     log.info(f'Started. Loaded {len(running_bots)} purchased bot(s).')

@@ -100,10 +100,15 @@ def start_subscription_checker(main_bot):
 
 def register(bot: telebot.TeleBot):
     state = DBState(0)
-    try:
-        _bot_username = bot.get_me().username or ''
-    except Exception:
-        _bot_username = ''
+    _bot_username_cache = [None]
+
+    def _get_bot_username():
+        if _bot_username_cache[0] is None:
+            try:
+                _bot_username_cache[0] = bot.get_me().username or ''
+            except Exception:
+                _bot_username_cache[0] = ''
+        return _bot_username_cache[0]
 
     def _safe_send(uid, text):
         try: bot.send_message(uid, text, parse_mode='HTML'); return True
@@ -347,7 +352,8 @@ def register(bot: telebot.TeleBot):
     def get_ref_link_cb(cb):
         uid = cb.from_user.id
         disc = db_get_discount_count(uid)
-        ref_link = f"https://t.me/{_bot_username}?start=ref_{uid}" if _bot_username else f"start=ref_{uid}"
+        username = _get_bot_username()
+        ref_link = f"https://t.me/{username}?start=ref_{uid}" if username else f"start=ref_{uid}"
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton('❌ Закрыть', callback_data='close'))
         bot.send_message(uid,
