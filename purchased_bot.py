@@ -289,21 +289,63 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_back_admin())
 
-    @pbot.callback_query_handler(func=lambda c: c.data == 'p_admin_templates')
-    def p_admin_templates_cb(cb):
-        if not is_admin(cb.from_user.id): return
+    def pk_manage_templates():
         templates = db_get_templates(db_bot_id)
         kb = InlineKeyboardMarkup()
         for tid, text in templates:
-            preview = text[:35] + '…' if len(text) > 35 else text
-            kb.add(InlineKeyboardButton(f'💬 {preview}', callback_data=f'p_view_tpl_{tid}'))
+            preview = text[:30] + '…' if len(text) > 30 else text
+            kb.row(
+                InlineKeyboardButton(f'💬 {preview}', callback_data=f'p_noop'),
+                InlineKeyboardButton('🗑', callback_data=f'p_mgdel_tpl_{tid}'),
+            )
+        kb.add(InlineKeyboardButton('➕ Добавить шаблон', callback_data='p_mgadd_tpl'))
         kb.add(InlineKeyboardButton('🔙 Назад', callback_data='p_back_admin'))
-        text = (f"<b>📋 Шаблоны ответов ({len(templates)}):</b>\n\n"
-                f"Шаблоны доступны при ответе на сообщение пользователя — кнопка «📋 Шаблони»."
-                if templates else
-                "<b>📋 Шаблоны ответов пусты</b>\n\nДобавь шаблон при ответе на сообщение — кнопка «📋 Шаблони».")
-        pbot.edit_message_text(text, cb.message.chat.id, cb.message.message_id,
+        return kb, templates
+
+    @pbot.callback_query_handler(func=lambda c: c.data == 'p_admin_templates')
+    def p_admin_templates_cb(cb):
+        if not is_admin(cb.from_user.id): return
+        kb, templates = pk_manage_templates()
+        header = f"<b>📋 Шаблоны ответов ({len(templates)}):</b>" if templates else "<b>📋 Шаблоны ответов пусты</b>"
+        pbot.edit_message_text(header, cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=kb)
+
+    @pbot.callback_query_handler(func=lambda c: c.data == 'p_mgadd_tpl')
+    def p_mgadd_tpl_cb(cb):
+        if not is_admin(cb.from_user.id): return
+        pstate[cb.from_user.id] = 'mgadd_tpl'
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton('❌ Отмена', callback_data='p_admin_templates'))
+        pbot.edit_message_text("<b>➕ Введи текст нового шаблона:</b>",
+            cb.message.chat.id, cb.message.message_id, parse_mode='HTML', reply_markup=kb)
+
+    @pbot.message_handler(func=lambda m: pstate.get(m.from_user.id) == 'mgadd_tpl')
+    def p_mgadd_tpl_save(m):
+        if not is_admin(m.from_user.id): return
+        pstate.pop(m.from_user.id, None)
+        db_add_template(db_bot_id, m.text)
+        kb, templates = pk_manage_templates()
+        pbot.send_message(m.chat.id,
+            f"<b>📋 Шаблоны ответов ({len(templates)}):</b>",
+            parse_mode='HTML', reply_markup=kb)
+
+    @pbot.callback_query_handler(func=lambda c: c.data.startswith('p_mgdel_tpl_'))
+    def p_mgdel_tpl_cb(cb):
+        if not is_admin(cb.from_user.id): return
+        tid = int(cb.data.split('_')[-1])
+        db_del_template(tid, db_bot_id)
+        pbot.answer_callback_query(cb.id, "✅ Шаблон удалён")
+        kb, templates = pk_manage_templates()
+        header = f"<b>📋 Шаблоны ответов ({len(templates)}):</b>" if templates else "<b>📋 Шаблоны ответов пусты</b>"
+        try:
+            pbot.edit_message_text(header, cb.message.chat.id, cb.message.message_id,
+                parse_mode='HTML', reply_markup=kb)
+        except Exception:
+            pass
+
+    @pbot.callback_query_handler(func=lambda c: c.data == 'p_noop')
+    def p_noop_cb(cb):
+        pbot.answer_callback_query(cb.id)
 
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_cancel')
     def p_cancel(cb):
