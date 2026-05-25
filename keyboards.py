@@ -1,18 +1,17 @@
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from database import get_price
 
-# ── Premium emoji (tg-emoji HTML tags) ────────────────
-# Используются в текстах сообщений (parse_mode='HTML')
-PE_FIRE    = '<tg-emoji emoji-id="5199885118214255386">🔥</tg-emoji>'
-PE_DIAMOND = '<tg-emoji emoji-id="5368324170671202286">💎</tg-emoji>'
-PE_STAR    = '<tg-emoji emoji-id="5357419614756478218">⭐</tg-emoji>'
-PE_ROCKET  = '<tg-emoji emoji-id="5359085491492010099">🚀</tg-emoji>'
-PE_TROPHY  = '<tg-emoji emoji-id="5361704642471728661">🏆</tg-emoji>'
-PE_MONEY   = '<tg-emoji emoji-id="5368324170671202286">💰</tg-emoji>'
-PE_CROWN   = '<tg-emoji emoji-id="5361704642471728661">👑</tg-emoji>'
-PE_GIFT    = '<tg-emoji emoji-id="5449683594425410475">🎁</tg-emoji>'
-PE_CHECK   = '<tg-emoji emoji-id="5368324170671202286">✅</tg-emoji>'
-PE_BELL    = '<tg-emoji emoji-id="5361704642471728661">🔔</tg-emoji>'
+# ── Emoji константи ────────────────────────────────────
+PE_FIRE    = '🔥'
+PE_DIAMOND = '💎'
+PE_STAR    = '⭐'
+PE_ROCKET  = '🚀'
+PE_TROPHY  = '🏆'
+PE_MONEY   = '💰'
+PE_CROWN   = '👑'
+PE_GIFT    = '🎁'
+PE_CHECK   = '✅'
+PE_BELL    = '🔔'
 
 
 def _btn(text, **kwargs):
