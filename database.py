@@ -1,9 +1,12 @@
 import sqlite3
 import json
+import os
 from datetime import datetime, timedelta
 from config import PRICE_USDT
 
-DB_PATH = 'spambots.db'
+_data_dir = os.getenv('DATA_DIR', '.')
+os.makedirs(_data_dir, exist_ok=True)
+DB_PATH = os.path.join(_data_dir, 'spambots.db')
 
 def _conn():
     return sqlite3.connect(DB_PATH)

@@ -1,4 +1,5 @@
 import logging
+import os
 import telebot
 from config import TOKEN, WEBHOOK_URL, WEBHOOK_PORT
 from database import init_db, db_get_all_bots
@@ -6,11 +7,13 @@ from purchased_bot import launch_bot, running_bots
 from handlers import register, start_subscription_checker
 
 # ── Логування ────────────────────────────────────────
+_data_dir = os.getenv('DATA_DIR', '.')
+os.makedirs(_data_dir, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     handlers=[
-        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.FileHandler(os.path.join(_data_dir, 'bot.log'), encoding='utf-8'),
         logging.StreamHandler(),
     ]
 )
