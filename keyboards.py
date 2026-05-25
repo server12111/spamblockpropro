@@ -1,83 +1,124 @@
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from database import get_price
 
+# ── Premium emoji (tg-emoji HTML tags) ────────────────
+# Используются в текстах сообщений (parse_mode='HTML')
+PE_FIRE    = '<tg-emoji emoji-id="5199885118214255386">🔥</tg-emoji>'
+PE_DIAMOND = '<tg-emoji emoji-id="5368324170671202286">💎</tg-emoji>'
+PE_STAR    = '<tg-emoji emoji-id="5357419614756478218">⭐</tg-emoji>'
+PE_ROCKET  = '<tg-emoji emoji-id="5359085491492010099">🚀</tg-emoji>'
+PE_TROPHY  = '<tg-emoji emoji-id="5361704642471728661">🏆</tg-emoji>'
+PE_MONEY   = '<tg-emoji emoji-id="5368324170671202286">💰</tg-emoji>'
+PE_CROWN   = '<tg-emoji emoji-id="5361704642471728661">👑</tg-emoji>'
+PE_GIFT    = '<tg-emoji emoji-id="5449683594425410475">🎁</tg-emoji>'
+PE_CHECK   = '<tg-emoji emoji-id="5368324170671202286">✅</tg-emoji>'
+PE_BELL    = '<tg-emoji emoji-id="5361704642471728661">🔔</tg-emoji>'
+
+
+def _btn(text, **kwargs):
+    """Создаёт InlineKeyboardButton с поддержкой color."""
+    return InlineKeyboardButton(text, **kwargs)
+
+
 def start_kb():
     kb = InlineKeyboardMarkup()
     kb.row(
-        InlineKeyboardButton('📤 Отправить сообщение', callback_data='user_send'),
-        InlineKeyboardButton('🛒 Купить бота',         callback_data='buy_bot'),
+        _btn('📤 Отправить сообщение', callback_data='user_send'),
+        _btn('🛒 Купить бота',         callback_data='buy_bot'),
     )
-    kb.add(InlineKeyboardButton('🔗 Реферальная ссылка', callback_data='get_ref_link'))
+    kb.add(_btn('🔗 Реферальная ссылка', callback_data='get_ref_link'))
     return kb
+
 
 def back_to_start_kb():
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton('🔙 Назад', callback_data='back_to_start'))
+    kb.add(_btn('🔙 Назад', callback_data='back_to_start'))
     return kb
+
 
 def back_to_payment_kb():
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton('🔙 Назад', callback_data='back_to_payment'))
+    kb.add(_btn('🔙 Назад', callback_data='back_to_payment'))
     return kb
+
 
 def cancel_kb():
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton('❌ Отмена', callback_data='cancel'))
+    kb.add(_btn('❌ Отмена', callback_data='cancel'))
     return kb
+
 
 def close_kb():
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton('❌ Закрыть', callback_data='close'))
+    kb.add(_btn('❌ Закрыть', callback_data='close'))
     return kb
+
 
 def reply_kb(target_id):
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton('📤 Ответить', callback_data=f'admin_reply_{target_id}'))
+    kb.add(_btn('📤 Ответить', callback_data=f'admin_reply_{target_id}'))
     return kb
+
 
 def payment_kb(discount_count: int = 0, show_trial: bool = False):
     kb = InlineKeyboardMarkup()
     if discount_count > 0:
-        kb.add(InlineKeyboardButton(
+        kb.add(_btn(
             f'🎁 Использовать скидку +10 дней (осталось: {discount_count})',
             callback_data='use_discount'))
     if show_trial:
-        kb.add(InlineKeyboardButton('🆓 Попробовать бесплатно (3 дня)', callback_data='try_free'))
-    kb.add(InlineKeyboardButton('💳 Оплатить через CryptoBot',  callback_data='pay_cryptobot'))
-    kb.add(InlineKeyboardButton('💎 Оплатить через TON Keeper', callback_data='pay_ton'))
-    kb.add(InlineKeyboardButton('🔙 Назад',                     callback_data='back_to_start'))
+        kb.add(_btn('🆓 Попробовать бесплатно (3 дня)', callback_data='try_free'))
+    kb.add(_btn('💳 Оплатить через CryptoBot',  callback_data='pay_cryptobot'))
+    kb.add(_btn('💎 Оплатить через TON Keeper', callback_data='pay_ton'))
+    kb.add(_btn('🔙 Назад',                     callback_data='back_to_start'))
     return kb
+
 
 def cryptobot_kb(invoice_url, invoice_id):
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton('💳 Оплатить',         url=invoice_url))
-    kb.add(InlineKeyboardButton('✅ Проверить оплату', callback_data=f'check_payment_{invoice_id}'))
-    kb.add(InlineKeyboardButton('🔙 Назад',            callback_data='back_to_payment'))
+    kb.add(_btn('💳 Оплатить',         url=invoice_url))
+    kb.add(_btn('✅ Проверить оплату', callback_data=f'check_payment_{invoice_id}'))
+    kb.add(_btn('🔙 Назад',            callback_data='back_to_payment'))
     return kb
+
 
 def broadcast_type_kb(scope):
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton('📝 Только текст', callback_data=f'bcast_text_{scope}'))
-    kb.add(InlineKeyboardButton('🖼 С фото',       callback_data=f'bcast_photo_{scope}'))
-    kb.add(InlineKeyboardButton('❌ Отмена',        callback_data='cancel'))
+    kb.add(_btn('📝 Только текст', callback_data=f'bcast_text_{scope}'))
+    kb.add(_btn('🖼 С фото',       callback_data=f'bcast_photo_{scope}'))
+    kb.add(_btn('❌ Отмена',        callback_data='cancel'))
     return kb
+
 
 def super_admin_kb():
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton('📢 Рассылка (главный бот)',   callback_data='broadcast'))
-    kb.add(InlineKeyboardButton('📡 Рассылка по всем ботам',  callback_data='broadcast_all'))
-    kb.add(InlineKeyboardButton('🤖 Управление ботами',       callback_data='manage_bots'))
-    kb.add(InlineKeyboardButton('📊 Статистика',              callback_data='stats'))
-    kb.add(InlineKeyboardButton('💰 Установить цену',         callback_data='set_price'))
+    kb.row(
+        _btn('📢 Рассылка (главный бот)',  callback_data='broadcast'),
+        _btn('📡 Рассылка по всем ботам', callback_data='broadcast_all'),
+    )
+    kb.row(
+        _btn('🤖 Управление ботами', callback_data='manage_bots'),
+        _btn('📊 Статистика',        callback_data='stats'),
+    )
+    kb.row(
+        _btn('💰 Установить цену',    callback_data='set_price'),
+        _btn('🛒 Маркетплейс',       callback_data='marketplace'),
+    )
+    kb.row(
+        _btn('🎁 Бесплатная выдача', callback_data='free_give'),
+        _btn('💸 Запросы на вывод',  callback_data='withdrawal_list'),
+    )
     return kb
+
 
 # ── Тексты ────────────────────────────────────────────
 def start_text(admin_username):
-    return (f"<b>🤖 Привет, это бот обратной связи с {admin_username}\n\n"
-            "💬 Отправь своё сообщение и он обязательно прочитает, когда будет онлайн</b>")
+    return (f"{PE_ROCKET} <b>Привет! Это бот обратной связи с {admin_username}</b>\n\n"
+            f"💬 Отправь своё сообщение и он обязательно прочитает, когда будет онлайн")
+
 
 def buy_text():
-    return (f"<b>🤖 SpamBot — бот обратной связи</b>\n\n"
+    return (f"{PE_DIAMOND} <b>SpamBot — бот обратной связи</b>\n\n"
             f"Что получишь:\n"
             f"• Собственный бот для приёма сообщений\n"
             f"• Ответы пользователям прямо из Telegram\n"

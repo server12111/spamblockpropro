@@ -11,9 +11,14 @@ from database import (db_add_user, db_get_bot_users, db_deactivate_bot, DBState,
                       db_get_bot_admins, db_add_bot_admin, db_remove_bot_admin,
                       db_set_primary_admin,
                       db_get_templates, db_add_template, db_del_template, db_get_template,
-                      db_log_message, db_get_bot_msg_stats)
-from keyboards import broadcast_type_kb
-from config import SUPER_ADMIN
+                      db_log_message, db_get_bot_msg_stats,
+                      db_is_marketplace_enabled,
+                      db_get_bot_earnings, db_deduct_bot_earnings,
+                      db_create_withdrawal, db_renew_bot,
+                      db_return_bot_earnings)
+from keyboards import broadcast_type_kb, PE_MONEY, PE_CHECK, PE_GIFT, PE_FIRE
+from config import SUPER_ADMIN, WITHDRAWAL_CHANNEL, BOT_USERNAME
+from payments import get_ton_amount
 
 log = logging.getLogger(__name__)
 
@@ -145,6 +150,11 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         kb.add(InlineKeyboardButton('📤 Отправить сообщение', callback_data='p_send'))
         if show_admin:
             kb.add(InlineKeyboardButton('⚙️ Панель админа', callback_data='p_open_admin'))
+        if db_is_marketplace_enabled(db_bot_id) and BOT_USERNAME:
+            kb.add(InlineKeyboardButton(
+                '💎 Купить такого бота',
+                url=f'https://t.me/{BOT_USERNAME}?start=via_{db_bot_id}'
+            ))
         return kb
 
     def pk_back():
@@ -192,15 +202,18 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
 
     def pk_admin():
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton('📊 Статистика',            callback_data='p_stats'))
-        kb.add(InlineKeyboardButton('📢 Рассылка',             callback_data='p_broadcast'))
         kb.row(
-            InlineKeyboardButton('✏️ Приветствие',             callback_data='p_edit_welcome'),
-            InlineKeyboardButton('📋 Шаблоны',                 callback_data='p_admin_templates'),
+            InlineKeyboardButton('📊 Статистика',  callback_data='p_stats'),
+            InlineKeyboardButton('💰 Мой баланс', callback_data='p_balance'),
         )
-        kb.add(InlineKeyboardButton('👥 Заблокированные',       callback_data='p_blocked_list'))
-        kb.add(InlineKeyboardButton('👤 Управление админами',   callback_data='p_admins'))
-        kb.add(InlineKeyboardButton('🗑 Удалить бота',          callback_data='p_delete_bot'))
+        kb.add(InlineKeyboardButton('📢 Рассылка', callback_data='p_broadcast'))
+        kb.row(
+            InlineKeyboardButton('✏️ Приветствие',   callback_data='p_edit_welcome'),
+            InlineKeyboardButton('📋 Шаблоны',       callback_data='p_admin_templates'),
+        )
+        kb.add(InlineKeyboardButton('👥 Заблокированные',     callback_data='p_blocked_list'))
+        kb.add(InlineKeyboardButton('👤 Управление админами', callback_data='p_admins'))
+        kb.add(InlineKeyboardButton('🗑 Удалить бота',        callback_data='p_delete_bot'))
         return kb
 
     def pk_confirm_delete():
@@ -814,6 +827,207 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         def _delayed_stop():
             time.sleep(1); stop_bot(token)
         threading.Thread(target=_delayed_stop, daemon=True).start()
+
+    # ── Баланс и вывод ─────────────────────────────────
+    @pbot.callback_query_handler(func=lambda c: c.data == 'p_balance')
+    def p_balance_cb(cb):
+        if not is_admin(cb.from_user.id): return
+        balance, total = db_get_bot_earnings(db_bot_id)
+        ton_rate = get_ton_amount() if balance > 0 else 0
+        from database import get_price as _get_price
+        price = _get_price()
+        ton_equiv = round(balance * ton_rate / price, 2) if (ton_rate and price and balance) else 0
+        kb = InlineKeyboardMarkup()
+        if balance > 0:
+            kb.row(
+                InlineKeyboardButton('💸 Вывести TON',   callback_data='p_withdraw'),
+                InlineKeyboardButton('⏰ Продлить бота', callback_data='p_renew_balance'),
+            )
+        kb.add(InlineKeyboardButton('🔙 Назад', callback_data='p_back_admin'))
+        ton_text = f"\n💎 Эквивалент: ~<b>{ton_equiv} TON</b>" if ton_equiv else ""
+        pbot.edit_message_text(
+            f"{PE_MONEY} <b>Мой баланс</b>\n\n"
+            f"💵 Текущий баланс: <b>{balance:.4f} USDT</b>{ton_text}\n"
+            f"📈 Всего заработано: <b>{total:.4f} USDT</b>\n\n"
+            f"<i>Баланс пополняется когда пользователи покупают бота через твою кнопку «💎 Купить такого бота» (50% с каждой продажи)</i>",
+            cb.message.chat.id, cb.message.message_id,
+            parse_mode='HTML', reply_markup=kb)
+
+    @pbot.callback_query_handler(func=lambda c: c.data == 'p_withdraw')
+    def p_withdraw_cb(cb):
+        if not is_admin(cb.from_user.id): return
+        balance, _ = db_get_bot_earnings(db_bot_id)
+        if balance <= 0:
+            pbot.answer_callback_query(cb.id, "❌ Баланс равен нулю", show_alert=True)
+            return
+        pstate[cb.from_user.id] = {'step': 'p_await_ton_address', 'balance': balance}
+        pbot.edit_message_text(
+            f"<b>💸 Вывод средств</b>\n\n"
+            f"Баланс для вывода: <b>{balance:.4f} USDT</b>\n\n"
+            f"Введи свой TON-адрес (кошелёк для получения):",
+            cb.message.chat.id, cb.message.message_id,
+            parse_mode='HTML', reply_markup=pk_back_admin())
+        pstate[cb.from_user.id] = {'step': 'p_await_ton_address', 'balance': balance}
+
+    @pbot.message_handler(func=lambda m: isinstance(pstate.get(m.from_user.id), dict)
+                                         and pstate[m.from_user.id].get('step') == 'p_await_ton_address')
+    def p_save_ton_address(m):
+        if not is_admin(m.from_user.id): return
+        address = m.text.strip()
+        if len(address) < 32:
+            pbot.send_message(m.chat.id, "<b>❌ Неверный TON-адрес. Попробуй ещё раз:</b>",
+                parse_mode='HTML')
+            return
+        s = pstate[m.from_user.id]
+        s['address'] = address
+        s['step'] = 'p_await_withdraw_amount'
+        pstate[m.from_user.id] = s
+        balance = s['balance']
+        pbot.send_message(m.chat.id,
+            f"<b>💸 Адрес принят.</b>\n\n"
+            f"Введи сумму для вывода (USDT) или отправь <code>всё</code> чтобы вывести весь баланс.\n\n"
+            f"Доступно: <b>{balance:.4f} USDT</b>",
+            parse_mode='HTML', reply_markup=pk_back_admin())
+
+    @pbot.message_handler(func=lambda m: isinstance(pstate.get(m.from_user.id), dict)
+                                         and pstate[m.from_user.id].get('step') == 'p_await_withdraw_amount')
+    def p_save_withdraw_amount(m):
+        if not is_admin(m.from_user.id): return
+        s = pstate[m.from_user.id]
+        balance = s['balance']
+        address = s['address']
+        text = m.text.strip().lower()
+        if text in ('всё', 'all', 'все', 'all'):
+            amount = balance
+        else:
+            try:
+                amount = float(text.replace(',', '.'))
+                if amount <= 0 or amount > balance:
+                    raise ValueError
+            except ValueError:
+                pbot.send_message(m.chat.id,
+                    f"<b>❌ Неверная сумма. Максимум: {balance:.4f} USDT</b>",
+                    parse_mode='HTML')
+                return
+        pstate.pop(m.from_user.id, None)
+        # Заморозить баланс (вычесть сразу)
+        db_deduct_bot_earnings(db_bot_id, amount)
+        # Получаем данные владельца бота
+        info = db_get_bot_info(db_bot_id)
+        owner_id = info[2] if info else m.from_user.id
+        # Создаём запрос
+        wr_id = db_create_withdrawal(db_bot_id, owner_id, address, amount)
+        # Отправляем в канал суперадмина через main_bot (чтобы кнопки обрабатывались в нём)
+        if WITHDRAWAL_CHANNEL and main_bot:
+            try:
+                kb_admin = InlineKeyboardMarkup()
+                kb_admin.row(
+                    InlineKeyboardButton(f'✅ Подтвердить #{wr_id}', callback_data=f'wr_confirm_{wr_id}'),
+                    InlineKeyboardButton(f'❌ Отклонить #{wr_id}',   callback_data=f'wr_reject_{wr_id}'),
+                )
+                from database import get_price as _get_price
+                ton_rate = get_ton_amount()
+                price = _get_price()
+                ton_equiv = round(amount * ton_rate / price, 2) if (ton_rate and price) else '?'
+                main_bot.send_message(WITHDRAWAL_CHANNEL,
+                    f"💸 <b>Новый запрос на вывод #{wr_id}</b>\n\n"
+                    f"Bot #{db_bot_id} | Owner: <code>{owner_id}</code>\n"
+                    f"Адрес: <code>{address}</code>\n"
+                    f"Сумма: <b>{amount:.4f} USDT</b> (~{ton_equiv} TON)",
+                    parse_mode='HTML', reply_markup=kb_admin)
+            except Exception as e:
+                log.warning(f'withdrawal channel notify failed: {e}')
+        pbot.send_message(m.chat.id,
+            f"{PE_CHECK} <b>Запрос на вывод создан!</b>\n\n"
+            f"Сумма: <b>{amount:.4f} USDT</b>\n"
+            f"Адрес: <code>{address}</code>\n\n"
+            f"Администратор обработает запрос в ближайшее время.",
+            parse_mode='HTML', reply_markup=pk_close())
+
+    @pbot.callback_query_handler(func=lambda c: c.data == 'p_renew_balance')
+    def p_renew_balance_cb(cb):
+        if not is_admin(cb.from_user.id): return
+        balance, _ = db_get_bot_earnings(db_bot_id)
+        if balance <= 0:
+            pbot.answer_callback_query(cb.id, "❌ Баланс равен нулю", show_alert=True)
+            return
+        from database import get_price as _get_price
+        price = _get_price()
+        max_days_full = int((balance / price) * 30) if price > 0 else 0
+        kb = InlineKeyboardMarkup()
+        options = []
+        for days_opt in [30, 90, 180]:
+            cost = round(price * days_opt / 30, 4)
+            if balance >= cost:
+                kb.add(InlineKeyboardButton(
+                    f'⏰ {days_opt} дней ({cost} USDT)',
+                    callback_data=f'p_renew_bal_{days_opt}'))
+                options.append(days_opt)
+        if balance > 0 and max_days_full > 0:
+            kb.add(InlineKeyboardButton(
+                f'💰 На весь баланс (~{max_days_full} дней)',
+                callback_data='p_renew_bal_all'))
+        if not options and max_days_full == 0:
+            pbot.answer_callback_query(cb.id,
+                f"❌ Баланса ({balance:.4f} USDT) недостаточно даже на 30 дней ({round(price,4)} USDT)",
+                show_alert=True)
+            return
+        kb.add(InlineKeyboardButton('🔙 Назад', callback_data='p_balance'))
+        pbot.edit_message_text(
+            f"<b>⏰ Продление через баланс</b>\n\n"
+            f"Баланс: <b>{balance:.4f} USDT</b>\n"
+            f"Цена 30 дней: <b>{price} USDT</b>\n\n"
+            f"Выбери срок:",
+            cb.message.chat.id, cb.message.message_id,
+            parse_mode='HTML', reply_markup=kb)
+
+    @pbot.callback_query_handler(func=lambda c: c.data.startswith('p_renew_bal_'))
+    def p_renew_bal_cb(cb):
+        if not is_admin(cb.from_user.id): return
+        from database import get_price as _get_price
+        balance, _ = db_get_bot_earnings(db_bot_id)
+        price = _get_price()
+        arg = cb.data.split('_')[-1]
+        if arg == 'all':
+            days = int((balance / price) * 30) if price > 0 else 0
+            cost = balance
+        else:
+            days = int(arg)
+            cost = round(price * days / 30, 4)
+        if days <= 0:
+            pbot.answer_callback_query(cb.id, "❌ Недостаточно средств", show_alert=True)
+            return
+        if balance < cost:
+            pbot.answer_callback_query(cb.id, f"❌ Недостаточно баланса. Нужно: {cost:.4f} USDT", show_alert=True)
+            return
+        db_deduct_bot_earnings(db_bot_id, cost)
+        new_exp = db_renew_bot(db_bot_id, days)
+        exp_str = str(new_exp)[:10] if new_exp else '—'
+        pbot.edit_message_text(
+            f"{PE_CHECK} <b>Бот продлён на {days} дней!</b>\n\n"
+            f"Списано: <b>{cost:.4f} USDT</b>\n"
+            f"Подписка до: <b>{exp_str}</b>",
+            cb.message.chat.id, cb.message.message_id,
+            parse_mode='HTML', reply_markup=pk_close())
+
+    @pbot.callback_query_handler(func=lambda c: c.data == 'p_balance')
+    def p_balance_redirect(cb):
+        if not is_admin(cb.from_user.id): return
+        balance, total = db_get_bot_earnings(db_bot_id)
+        kb = InlineKeyboardMarkup()
+        if balance > 0:
+            kb.row(
+                InlineKeyboardButton('💸 Вывести TON',   callback_data='p_withdraw'),
+                InlineKeyboardButton('⏰ Продлить бота', callback_data='p_renew_balance'),
+            )
+        kb.add(InlineKeyboardButton('🔙 Назад', callback_data='p_back_admin'))
+        pbot.edit_message_text(
+            f"{PE_MONEY} <b>Мой баланс</b>\n\n"
+            f"💵 Текущий баланс: <b>{balance:.4f} USDT</b>\n"
+            f"📈 Всего заработано: <b>{total:.4f} USDT</b>\n\n"
+            f"<i>Баланс пополняется когда пользователи покупают бота через кнопку «💎 Купить такого бота»</i>",
+            cb.message.chat.id, cb.message.message_id,
+            parse_mode='HTML', reply_markup=kb)
 
     # ── Рассылка ───────────────────────────────────────
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_broadcast')

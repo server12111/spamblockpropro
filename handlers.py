@@ -5,7 +5,7 @@ import threading
 import logging
 from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from config import SUPER_ADMIN, ADMIN_USERNAME, TON_WALLET
+from config import SUPER_ADMIN, ADMIN_USERNAME, TON_WALLET, WITHDRAWAL_CHANNEL, BOT_USERNAME
 from database import (db_add_user, db_get_owner_bots, db_add_bot,
                        db_get_all_users, db_get_bot_users, db_get_stats,
                        db_get_active_bots_list, db_get_bot_info,
@@ -18,11 +18,19 @@ from database import (db_add_user, db_get_owner_bots, db_add_bot,
                        db_has_used_trial, db_mark_trial_used,
                        db_set_referral, db_get_referrer, db_mark_referral_paid,
                        db_get_discount_count, db_use_discount,
+                       db_set_marketplace, db_is_marketplace_enabled,
+                       db_get_marketplace_bots,
+                       db_add_bot_earnings, db_get_bot_earnings,
+                       db_create_withdrawal, db_get_pending_withdrawals,
+                       db_get_withdrawal, db_update_withdrawal_status,
+                       db_return_bot_earnings,
+                       db_set_free_coupon, db_get_free_coupon, db_mark_coupon_used,
                        DBState)
 from keyboards import (start_kb, back_to_start_kb, back_to_payment_kb, cancel_kb,
                        close_kb, reply_kb, payment_kb, cryptobot_kb,
                        broadcast_type_kb, super_admin_kb,
-                       start_text, buy_text)
+                       start_text, buy_text,
+                       PE_FIRE, PE_DIAMOND, PE_STAR, PE_ROCKET, PE_GIFT, PE_CHECK, PE_MONEY)
 from payments import (cb_create_invoice, cb_check_invoice,
                       get_ton_amount, ton_payment_link, ton_check_transfer)
 from purchased_bot import launch_bot, stop_bot, running_bots, running_bot_ids
@@ -70,20 +78,24 @@ def start_subscription_checker(main_bot):
                     elif days_left == 3 and not db_get_bot_setting(bot_id, 'reminded_3d', ''):
                         db_set_bot_setting(bot_id, 'reminded_3d', '1')
                         try:
+                            kb = InlineKeyboardMarkup()
+                            kb.add(InlineKeyboardButton('🔄 Продлить сейчас', callback_data=f'renew_bot_{bot_id}'))
                             main_bot.send_message(owner_id,
-                                "⚠️ <b>Подписка истекает через 3 дня!</b>\n\n"
-                                "Продли через «🛒 Купить бота» в главном меню.",
-                                parse_mode='HTML')
+                                f"⚠️ <b>Подписка истекает через 3 дня!</b>\n\n"
+                                f"Продли через «🛒 Купить бота» в главном меню или нажми кнопку ниже.",
+                                parse_mode='HTML', reply_markup=kb)
                         except Exception:
                             pass
 
                     elif days_left == 1 and not db_get_bot_setting(bot_id, 'reminded_1d', ''):
                         db_set_bot_setting(bot_id, 'reminded_1d', '1')
                         try:
+                            kb = InlineKeyboardMarkup()
+                            kb.add(InlineKeyboardButton('🔄 Продлить срочно', callback_data=f'renew_bot_{bot_id}'))
                             main_bot.send_message(owner_id,
                                 "🚨 <b>Подписка истекает завтра!</b>\n\n"
                                 "Срочно продли через «🛒 Купить бота».",
-                                parse_mode='HTML')
+                                parse_mode='HTML', reply_markup=kb)
                         except Exception:
                             pass
 
@@ -123,8 +135,14 @@ def register(bot: telebot.TeleBot):
         return db_get_bot_users(0)
 
     def _after_payment_confirmed(uid, chat_id, message_id, renew_days=30):
-        """Вызывается после любой успешной оплаты. renew_days — сколько дней добавить при продлении."""
-        # Нагородження реферера при першій оплаті
+        """Вызывается после любой успешной оплаты."""
+        # Начисление комиссии владельцу бота через маркетплейс (50%)
+        s_cur = state.get(uid)
+        via_bot_id = None
+        if isinstance(s_cur, dict):
+            via_bot_id = s_cur.get('via_bot_id')
+
+        # Реферальный бонус при первой оплате
         referrer = db_get_referrer(uid)
         if referrer:
             db_mark_referral_paid(uid)
@@ -138,6 +156,23 @@ def register(bot: telebot.TeleBot):
                     parse_mode='HTML')
             except Exception:
                 pass
+
+        # 50% комиссия владельцу бота-реферера
+        if via_bot_id:
+            commission = round(get_price() * 0.5, 4)
+            db_add_bot_earnings(via_bot_id, commission)
+            info = db_get_bot_info(via_bot_id)
+            if info:
+                owner_id_ref = info[2]
+                try:
+                    bot.send_message(owner_id_ref,
+                        f"{PE_MONEY} <b>Новая комиссия!</b>\n\n"
+                        f"Пользователь купил бота через твой бот.\n"
+                        f"Начислено: <b>{commission} USDT</b> (50%)\n\n"
+                        f"Баланс: смотри в /admin своего бота → 💰 Мой баланс",
+                        parse_mode='HTML')
+                except Exception:
+                    pass
 
         s = state.get(uid)
         if isinstance(s, dict) and s.get('step') == 'renewing':
@@ -153,15 +188,15 @@ def register(bot: telebot.TeleBot):
             kb = InlineKeyboardMarkup()
             kb.add(InlineKeyboardButton('❌ Закрыть', callback_data='close'))
             bot.edit_message_text(
-                f"<b>✅ Подписка успешно продлена на {renew_days} дней!</b>\n\n"
+                f"{PE_CHECK} <b>Подписка успешно продлена на {renew_days} дней!</b>\n\n"
                 f"Действует до: <b>{exp_str}</b>",
                 chat_id, message_id, parse_mode='HTML', reply_markup=kb)
         else:
             db_mark_paid(uid)
             state[uid] = 'await_bot_token'
             bot.edit_message_text(
-                "<b>✅ Оплата получена!\n\n"
-                "🤖 Введи токен своего бота (получи в @BotFather):</b>",
+                f"{PE_CHECK} <b>Оплата получена!\n\n"
+                f"🤖 Введи токен своего бота (получи в @BotFather):</b>",
                 chat_id, message_id, parse_mode='HTML', reply_markup=cancel_kb())
 
     # ── /start ───────────────────────────────────────────
@@ -169,8 +204,8 @@ def register(bot: telebot.TeleBot):
     def cmd_start(m):
         uid = m.from_user.id
         db_add_user(0, uid)
-        # Обработка реферального deep link: /start ref_123456789
         payload = m.text.strip().split(' ', 1)[1] if ' ' in m.text else ''
+
         if payload.startswith('ref_'):
             try:
                 referrer_id = int(payload[4:])
@@ -178,6 +213,19 @@ def register(bot: telebot.TeleBot):
                     db_set_referral(referrer_id, uid)
             except (ValueError, Exception):
                 pass
+
+        elif payload.startswith('via_'):
+            try:
+                via_bot_id = int(payload[4:])
+                cur = state.get(uid)
+                if isinstance(cur, dict):
+                    cur['via_bot_id'] = via_bot_id
+                    state[uid] = cur
+                else:
+                    state[uid] = {'via_bot_id': via_bot_id}
+            except (ValueError, Exception):
+                pass
+
         bot.send_message(m.chat.id, start_text(ADMIN_USERNAME),
             parse_mode='HTML', reply_markup=start_kb())
 
@@ -280,11 +328,25 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data == 'buy_bot')
     def buy_bot_cb(cb):
         uid = cb.from_user.id
+
+        # Проверяем бесплатный купон от суперадмина
+        coupon_days = db_get_free_coupon(uid)
+        if coupon_days:
+            db_mark_coupon_used(uid)
+            db_mark_paid(uid)
+            state[uid] = {'step': 'await_bot_token_free', 'days': coupon_days}
+            bot.edit_message_text(
+                f"{PE_GIFT} <b>У тебя есть бесплатный купон на {coupon_days} дней!</b>\n\n"
+                f"🤖 Введи токен своего бота (получи в @BotFather):",
+                cb.message.chat.id, cb.message.message_id,
+                parse_mode='HTML', reply_markup=cancel_kb())
+            return
+
         # Уже оплатил — продолжаем настройку
         if db_is_paid(uid):
             state[uid] = 'await_bot_token'
             bot.edit_message_text(
-                "<b>✅ Оплата уже получена!\n\n"
+                f"{PE_CHECK} <b>Оплата уже получена!\n\n"
                 "🤖 Введи токен своего бота (получи в @BotFather):</b>",
                 cb.message.chat.id, cb.message.message_id,
                 parse_mode='HTML', reply_markup=cancel_kb())
@@ -338,7 +400,11 @@ def register(bot: telebot.TeleBot):
     def renew_bot_cb(cb):
         uid = cb.from_user.id
         bot_id = int(cb.data.split('_')[-1])
-        state[uid] = {'step': 'renewing', 'bot_id': bot_id}
+        cur = state.get(uid)
+        new_state = {'step': 'renewing', 'bot_id': bot_id}
+        if isinstance(cur, dict) and 'via_bot_id' in cur:
+            new_state['via_bot_id'] = cur['via_bot_id']
+        state[uid] = new_state
         disc = db_get_discount_count(uid)
         bot.edit_message_text(
             f"<b>🔄 Продление подписки на 30 дней</b>\n\n"
@@ -365,7 +431,7 @@ def register(bot: telebot.TeleBot):
             parse_mode='HTML', reply_markup=kb)
         bot.answer_callback_query(cb.id)
 
-    # ── Пробний период ───────────────────────────────────
+    # ── Пробный период ───────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'try_free')
     def try_free_cb(cb):
         uid = cb.from_user.id
@@ -377,7 +443,7 @@ def register(bot: telebot.TeleBot):
         db_mark_paid(uid)
         state[uid] = 'await_bot_token_trial'
         bot.edit_message_text(
-            "<b>🆓 Бесплатный пробный период (3 дня) активирован!\n\n"
+            f"{PE_GIFT} <b>Бесплатный пробный период (3 дня) активирован!\n\n"
             "🤖 Введи токен своего бота (получи в @BotFather):</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=cancel_kb())
@@ -430,12 +496,14 @@ def register(bot: telebot.TeleBot):
             return
         payment_code = f"SPB{cb.from_user.id}"
         link = ton_payment_link(ton_amount, payment_code)
-        # сохраняем ton_pending поверх renewing если есть
         cur = state.get(cb.from_user.id)
         new_state = {'step': 'ton_pending', 'ton': ton_amount, 'code': payment_code}
-        if isinstance(cur, dict) and cur.get('step') == 'renewing':
-            new_state['bot_id'] = cur['bot_id']
-            new_state['renewing'] = True
+        if isinstance(cur, dict):
+            if cur.get('step') == 'renewing':
+                new_state['bot_id'] = cur['bot_id']
+                new_state['renewing'] = True
+            if 'via_bot_id' in cur:
+                new_state['via_bot_id'] = cur['via_bot_id']
         state[cb.from_user.id] = new_state
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton('💎 Открыть TON Keeper и оплатить', url=link))
@@ -468,11 +536,16 @@ def register(bot: telebot.TeleBot):
             cb.message.chat.id, cb.message.message_id, parse_mode='HTML')
         found = ton_check_transfer(uid, ton_amount, payment_code)
         if found:
-            # восстанавливаем renewing если был
             if s.get('renewing'):
-                state[uid] = {'step': 'renewing', 'bot_id': s['bot_id']}
+                new_s = {'step': 'renewing', 'bot_id': s['bot_id']}
+                if 'via_bot_id' in s:
+                    new_s['via_bot_id'] = s['via_bot_id']
+                state[uid] = new_s
             else:
-                state.pop(uid, None)
+                if 'via_bot_id' in s:
+                    state[uid] = {'via_bot_id': s['via_bot_id']}
+                else:
+                    state.pop(uid, None)
             _after_payment_confirmed(uid, cb.message.chat.id, cb.message.message_id)
         else:
             link = ton_payment_link(ton_amount, payment_code)
@@ -492,9 +565,15 @@ def register(bot: telebot.TeleBot):
                 parse_mode='HTML', reply_markup=kb)
 
     # ── Настройка бота после оплаты ──────────────────────
-    @bot.message_handler(func=lambda m: state.get(m.from_user.id) in ('await_bot_token', 'await_bot_token_trial'))
+    @bot.message_handler(func=lambda m: state.get(m.from_user.id) in ('await_bot_token', 'await_bot_token_trial')
+                                        or (isinstance(state.get(m.from_user.id), dict)
+                                            and state[m.from_user.id].get('step') == 'await_bot_token_free'))
     def get_bot_token(m):
-        is_trial = state.get(m.from_user.id) == 'await_bot_token_trial'
+        s = state.get(m.from_user.id)
+        is_trial = (s == 'await_bot_token_trial')
+        is_free_coupon = isinstance(s, dict) and s.get('step') == 'await_bot_token_free'
+        free_days = s.get('days', 30) if is_free_coupon else None
+
         token_val = m.text.strip()
         if ':' not in token_val or len(token_val) < 30:
             bot.send_message(m.chat.id, "<b>❌ Неверный формат токена. Попробуй ещё раз:</b>",
@@ -507,7 +586,9 @@ def register(bot: telebot.TeleBot):
                 parse_mode='HTML')
             return
         state[m.from_user.id] = {'step': 'await_admin_id', 'token': token_val,
-                                  'username': me.username or '', 'trial': is_trial}
+                                  'username': me.username or '',
+                                  'trial': is_trial,
+                                  'free_days': free_days}
         bot.send_message(m.chat.id,
             "<b>👤 Теперь введи свой Telegram ID\n"
             "(сообщения от пользователей будут приходить именно тебе)\n\n"
@@ -526,7 +607,12 @@ def register(bot: telebot.TeleBot):
         s         = state.pop(m.from_user.id)
         token_val = s['token']
         uname     = s.get('username', '')
-        days      = 3 if s.get('trial') else 30
+        if s.get('free_days'):
+            days = s['free_days']
+        elif s.get('trial'):
+            days = 3
+        else:
+            days = 30
         try:
             bot_db_id = db_add_bot(m.from_user.id, token_val, admin_id_val, days=days)
         except Exception:
@@ -540,7 +626,7 @@ def register(bot: telebot.TeleBot):
                 kb.add(InlineKeyboardButton(f'🤖 Перейти к @{uname}', url=f'https://t.me/{uname}'))
             kb.add(InlineKeyboardButton('❌ Закрыть', callback_data='close'))
             bot.send_message(m.chat.id,
-                f"<b>🎉 Бот успешно запущен!\n\n"
+                f"{PE_ROCKET} <b>Бот успешно запущен!\n\n"
                 f"Управляй через /admin в своём боте.\n"
                 f"Статистика: /status в своём боте.</b>",
                 parse_mode='HTML', reply_markup=kb)
@@ -725,3 +811,248 @@ def register(bot: telebot.TeleBot):
         state.pop(m.from_user.id, None)
         bot.send_message(m.chat.id, f"<b>✅ Цена обновлена: {new_price} USDT</b>",
             parse_mode='HTML', reply_markup=close_kb())
+
+    # ── Маркетплейс ───────────────────────────────────────
+    @bot.callback_query_handler(func=lambda c: c.data == 'marketplace')
+    def marketplace_cb(cb):
+        if cb.from_user.id != SUPER_ADMIN: return
+        _show_marketplace(cb.message.chat.id, cb.message.message_id)
+
+    def _show_marketplace(chat_id, message_id=None):
+        bots_list = db_get_active_bots_list()
+        if not bots_list:
+            text = "<b>🛒 Нет активных ботов для маркетплейса</b>"
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton('🔙 Назад', callback_data='back_admin_panel'))
+            if message_id:
+                bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
+            else:
+                bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=kb)
+            return
+        lines = ["<b>🛒 Маркетплейс ботов</b>\n",
+                 "Включи кнопку «Купить такого бота» для нужных ботов.\n",
+                 "Владелец получает 50% с каждой покупки через его бота.\n"]
+        kb = InlineKeyboardMarkup()
+        for row in bots_list:
+            bot_id, owner_id = row[0], row[1]
+            info = db_get_bot_info(bot_id)
+            uname = info[0] if info else None
+            enabled = db_is_marketplace_enabled(bot_id)
+            status_icon = '🟢' if enabled else '⚫'
+            label = f"{status_icon} Bot #{bot_id} (owner {owner_id})"
+            toggle_label = '⚫ Выключить' if enabled else '🟢 Включить'
+            kb.row(
+                InlineKeyboardButton(label, callback_data='noop'),
+                InlineKeyboardButton(toggle_label, callback_data=f'mp_toggle_{bot_id}'),
+            )
+        kb.add(InlineKeyboardButton('🔙 Назад', callback_data='back_admin_panel'))
+        text = "\n".join(lines)
+        if message_id:
+            bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
+        else:
+            bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=kb)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith('mp_toggle_'))
+    def mp_toggle_cb(cb):
+        if cb.from_user.id != SUPER_ADMIN: return
+        bot_id = int(cb.data.split('_')[-1])
+        enabled = db_is_marketplace_enabled(bot_id)
+        db_set_marketplace(bot_id, not enabled)
+        status = 'включён' if not enabled else 'выключен'
+        bot.answer_callback_query(cb.id, f"✅ Маркетплейс {status} для Bot #{bot_id}", show_alert=True)
+        _show_marketplace(cb.message.chat.id, cb.message.message_id)
+
+    @bot.callback_query_handler(func=lambda c: c.data == 'back_admin_panel')
+    def back_admin_panel_cb(cb):
+        if cb.from_user.id != SUPER_ADMIN: return
+        bot.edit_message_text("<b>⚙️ Панель супер-админа</b>",
+            cb.message.chat.id, cb.message.message_id,
+            parse_mode='HTML', reply_markup=super_admin_kb())
+
+    @bot.callback_query_handler(func=lambda c: c.data == 'noop')
+    def noop_cb(cb):
+        bot.answer_callback_query(cb.id)
+
+    # ── Бесплатная выдача ─────────────────────────────────
+    @bot.callback_query_handler(func=lambda c: c.data == 'free_give')
+    def free_give_cb(cb):
+        if cb.from_user.id != SUPER_ADMIN: return
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton('🆕 Купон для нового бота',     callback_data='free_coupon'))
+        kb.add(InlineKeyboardButton('🔄 Продлить существующий бот', callback_data='free_renew'))
+        kb.add(InlineKeyboardButton('🔙 Назад',                     callback_data='back_admin_panel'))
+        bot.edit_message_text(
+            f"{PE_GIFT} <b>Бесплатная выдача</b>\n\n"
+            "Выбери тип:",
+            cb.message.chat.id, cb.message.message_id,
+            parse_mode='HTML', reply_markup=kb)
+
+    @bot.callback_query_handler(func=lambda c: c.data == 'free_coupon')
+    def free_coupon_cb(cb):
+        if cb.from_user.id != SUPER_ADMIN: return
+        bot.edit_message_text(
+            "<b>🆕 Купон для нового бота</b>\n\n"
+            "Введи в формате:\n<code>user_id дни</code>\n\n"
+            "Пример: <code>123456789 30</code>",
+            cb.message.chat.id, cb.message.message_id,
+            parse_mode='HTML', reply_markup=back_to_start_kb())
+        state[cb.from_user.id] = 'await_coupon_input'
+
+    @bot.message_handler(func=lambda m: state.get(m.from_user.id) == 'await_coupon_input')
+    def handle_coupon_input(m):
+        if m.from_user.id != SUPER_ADMIN: return
+        parts = m.text.strip().split()
+        if len(parts) != 2:
+            bot.send_message(m.chat.id, "<b>❌ Неверный формат. Пример: 123456789 30</b>",
+                parse_mode='HTML')
+            return
+        try:
+            target_uid = int(parts[0])
+            days       = int(parts[1])
+            if days <= 0: raise ValueError
+        except ValueError:
+            bot.send_message(m.chat.id, "<b>❌ Неверные данные. user_id и дни должны быть числами > 0</b>",
+                parse_mode='HTML')
+            return
+        state.pop(m.from_user.id, None)
+        db_set_free_coupon(target_uid, days)
+        try:
+            bot.send_message(target_uid,
+                f"{PE_GIFT} <b>Тебе выдан бесплатный купон на {days} дней!</b>\n\n"
+                f"Нажми «🛒 Купить бота» в главном меню — купон применится автоматически.",
+                parse_mode='HTML')
+        except Exception:
+            pass
+        bot.send_message(m.chat.id,
+            f"<b>✅ Купон на {days} дней выдан пользователю <code>{target_uid}</code></b>",
+            parse_mode='HTML', reply_markup=close_kb())
+
+    @bot.callback_query_handler(func=lambda c: c.data == 'free_renew')
+    def free_renew_cb(cb):
+        if cb.from_user.id != SUPER_ADMIN: return
+        bot.edit_message_text(
+            "<b>🔄 Бесплатное продление бота</b>\n\n"
+            "Введи в формате:\n<code>bot_id дни</code>\n\n"
+            "Пример: <code>5 30</code>",
+            cb.message.chat.id, cb.message.message_id,
+            parse_mode='HTML', reply_markup=back_to_start_kb())
+        state[cb.from_user.id] = 'await_free_renew_input'
+
+    @bot.message_handler(func=lambda m: state.get(m.from_user.id) == 'await_free_renew_input')
+    def handle_free_renew_input(m):
+        if m.from_user.id != SUPER_ADMIN: return
+        parts = m.text.strip().split()
+        if len(parts) != 2:
+            bot.send_message(m.chat.id, "<b>❌ Неверный формат. Пример: 5 30</b>",
+                parse_mode='HTML')
+            return
+        try:
+            target_bot_id = int(parts[0])
+            days          = int(parts[1])
+            if days <= 0: raise ValueError
+        except ValueError:
+            bot.send_message(m.chat.id, "<b>❌ Неверные данные</b>", parse_mode='HTML')
+            return
+        info = db_get_bot_info(target_bot_id)
+        if not info:
+            bot.send_message(m.chat.id, f"<b>❌ Бот #{target_bot_id} не найден</b>",
+                parse_mode='HTML')
+            return
+        state.pop(m.from_user.id, None)
+        new_exp = db_renew_bot(target_bot_id, days)
+        owner_id = info[2]
+        exp_str  = str(new_exp)[:10] if new_exp else '—'
+        try:
+            bot.send_message(owner_id,
+                f"{PE_GIFT} <b>Твой бот продлён бесплатно на {days} дней!</b>\n\n"
+                f"Подписка действует до: <b>{exp_str}</b>",
+                parse_mode='HTML')
+        except Exception:
+            pass
+        bot.send_message(m.chat.id,
+            f"<b>✅ Bot #{target_bot_id} продлён на {days} дней. До: {exp_str}</b>",
+            parse_mode='HTML', reply_markup=close_kb())
+
+    # ── Запросы на вывод (super admin) ───────────────────
+    @bot.callback_query_handler(func=lambda c: c.data == 'withdrawal_list')
+    def withdrawal_list_cb(cb):
+        if cb.from_user.id != SUPER_ADMIN: return
+        _show_withdrawal_list(cb.message.chat.id, cb.message.message_id)
+
+    def _show_withdrawal_list(chat_id, message_id=None):
+        pending = db_get_pending_withdrawals()
+        if not pending:
+            text = "<b>💸 Нет ожидающих запросов на вывод</b>"
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton('🔙 Назад', callback_data='back_admin_panel'))
+            if message_id:
+                bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
+            else:
+                bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=kb)
+            return
+        text = f"<b>💸 Запросы на вывод ({len(pending)}):</b>\n\n"
+        kb = InlineKeyboardMarkup()
+        for wr_id, bot_id, owner_id, ton_address, usdt_amount, created_at in pending:
+            date = str(created_at)[:16] if created_at else '—'
+            text += (f"#{wr_id} | Bot #{bot_id} | Owner: <code>{owner_id}</code>\n"
+                     f"Адрес: <code>{ton_address}</code>\n"
+                     f"Сумма: <b>{usdt_amount} USDT</b> | {date}\n\n")
+            kb.row(
+                InlineKeyboardButton(f"✅ #{wr_id}", callback_data=f'wr_confirm_{wr_id}'),
+                InlineKeyboardButton(f"❌ #{wr_id}", callback_data=f'wr_reject_{wr_id}'),
+            )
+        kb.add(InlineKeyboardButton('🔙 Назад', callback_data='back_admin_panel'))
+        if message_id:
+            bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
+        else:
+            bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=kb)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith('wr_confirm_'))
+    def wr_confirm_cb(cb):
+        if cb.from_user.id != SUPER_ADMIN: return
+        wr_id = int(cb.data.split('_')[-1])
+        row   = db_get_withdrawal(wr_id)
+        if not row:
+            bot.answer_callback_query(cb.id, "❌ Запрос не найден", show_alert=True)
+            return
+        bot_id, owner_id, ton_address, usdt_amount, status = row
+        if status != 'pending':
+            bot.answer_callback_query(cb.id, f"⚠️ Статус уже: {status}", show_alert=True)
+            return
+        db_update_withdrawal_status(wr_id, 'approved')
+        try:
+            bot.send_message(owner_id,
+                f"{PE_CHECK} <b>Запрос на вывод #{wr_id} подтверждён!</b>\n\n"
+                f"Сумма: <b>{usdt_amount} USDT</b>\n"
+                f"Адрес: <code>{ton_address}</code>\n\n"
+                f"Средства переведены. Спасибо!",
+                parse_mode='HTML')
+        except Exception:
+            pass
+        bot.answer_callback_query(cb.id, f"✅ Запрос #{wr_id} подтверждён", show_alert=True)
+        _show_withdrawal_list(cb.message.chat.id, cb.message.message_id)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith('wr_reject_'))
+    def wr_reject_cb(cb):
+        if cb.from_user.id != SUPER_ADMIN: return
+        wr_id = int(cb.data.split('_')[-1])
+        row   = db_get_withdrawal(wr_id)
+        if not row:
+            bot.answer_callback_query(cb.id, "❌ Запрос не найден", show_alert=True)
+            return
+        bot_id, owner_id, ton_address, usdt_amount, status = row
+        if status != 'pending':
+            bot.answer_callback_query(cb.id, f"⚠️ Статус уже: {status}", show_alert=True)
+            return
+        db_update_withdrawal_status(wr_id, 'rejected')
+        db_return_bot_earnings(bot_id, usdt_amount)
+        try:
+            bot.send_message(owner_id,
+                f"❌ <b>Запрос на вывод #{wr_id} отклонён.</b>\n\n"
+                f"Сумма <b>{usdt_amount} USDT</b> возвращена на твой баланс.\n"
+                f"Свяжись с {ADMIN_USERNAME} для уточнения.",
+                parse_mode='HTML')
+        except Exception:
+            pass
+        bot.answer_callback_query(cb.id, f"❌ Запрос #{wr_id} отклонён, баланс возвращён", show_alert=True)
+        _show_withdrawal_list(cb.message.chat.id, cb.message.message_id)

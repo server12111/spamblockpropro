@@ -90,6 +90,30 @@ def init_db():
             user_id   INTEGER NOT NULL,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS bot_marketplace (
+            bot_id  INTEGER PRIMARY KEY,
+            enabled INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS bot_earnings (
+            bot_id        INTEGER PRIMARY KEY,
+            balance_usdt  REAL DEFAULT 0.0,
+            total_earned  REAL DEFAULT 0.0
+        );
+        CREATE TABLE IF NOT EXISTS withdrawal_requests (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id      INTEGER NOT NULL,
+            owner_id    INTEGER NOT NULL,
+            ton_address TEXT NOT NULL,
+            usdt_amount REAL NOT NULL,
+            status      TEXT DEFAULT 'pending',
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS free_coupons (
+            user_id    INTEGER PRIMARY KEY,
+            days       INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            used       INTEGER DEFAULT 0
+        );
     ''')
     conn.commit()
     # Миграции для старых схем
@@ -478,3 +502,106 @@ def db_get_bot_msg_stats(bot_id: int) -> dict:
     ).fetchone()[0]
     c.close()
     return {'today': today, 'week': week, 'total_users': total_users, 'blocked': blocked}
+
+# ── Marketplace ───────────────────────────────────────
+def db_set_marketplace(bot_id: int, enabled: bool):
+    c = _conn()
+    c.execute('INSERT OR REPLACE INTO bot_marketplace (bot_id, enabled) VALUES (?,?)',
+              (bot_id, 1 if enabled else 0))
+    c.commit(); c.close()
+
+def db_is_marketplace_enabled(bot_id: int) -> bool:
+    c = _conn()
+    row = c.execute('SELECT enabled FROM bot_marketplace WHERE bot_id=?', (bot_id,)).fetchone()
+    c.close(); return bool(row and row[0])
+
+def db_get_marketplace_bots() -> list:
+    """Returns [(bot_id, enabled), ...] for all bots that have marketplace record."""
+    c = _conn()
+    rows = c.execute('SELECT bot_id, enabled FROM bot_marketplace').fetchall()
+    c.close(); return rows
+
+# ── Bot Earnings ──────────────────────────────────────
+def db_add_bot_earnings(bot_id: int, usdt: float):
+    c = _conn()
+    c.execute('''
+        INSERT INTO bot_earnings (bot_id, balance_usdt, total_earned) VALUES (?,?,?)
+        ON CONFLICT(bot_id) DO UPDATE SET
+            balance_usdt = balance_usdt + excluded.balance_usdt,
+            total_earned = total_earned + excluded.total_earned
+    ''', (bot_id, usdt, usdt))
+    c.commit(); c.close()
+
+def db_get_bot_earnings(bot_id: int) -> tuple:
+    """Returns (balance_usdt, total_earned)."""
+    c = _conn()
+    row = c.execute('SELECT balance_usdt, total_earned FROM bot_earnings WHERE bot_id=?',
+                    (bot_id,)).fetchone()
+    c.close(); return (row[0], row[1]) if row else (0.0, 0.0)
+
+def db_deduct_bot_earnings(bot_id: int, usdt: float):
+    c = _conn()
+    c.execute('UPDATE bot_earnings SET balance_usdt = MAX(0, balance_usdt - ?) WHERE bot_id=?',
+              (usdt, bot_id))
+    c.commit(); c.close()
+
+def db_return_bot_earnings(bot_id: int, usdt: float):
+    """Return earnings (e.g. after rejected withdrawal)."""
+    c = _conn()
+    c.execute('''
+        INSERT INTO bot_earnings (bot_id, balance_usdt, total_earned) VALUES (?,?,0)
+        ON CONFLICT(bot_id) DO UPDATE SET balance_usdt = balance_usdt + excluded.balance_usdt
+    ''', (bot_id, usdt))
+    c.commit(); c.close()
+
+# ── Withdrawal Requests ───────────────────────────────
+def db_create_withdrawal(bot_id: int, owner_id: int, ton_address: str, usdt_amount: float) -> int:
+    c = _conn()
+    c.execute(
+        'INSERT INTO withdrawal_requests (bot_id, owner_id, ton_address, usdt_amount) VALUES (?,?,?,?)',
+        (bot_id, owner_id, ton_address, usdt_amount)
+    )
+    row_id = c.execute('SELECT last_insert_rowid()').fetchone()[0]
+    c.commit(); c.close(); return row_id
+
+def db_get_pending_withdrawals() -> list:
+    """Returns [(id, bot_id, owner_id, ton_address, usdt_amount, created_at), ...]"""
+    c = _conn()
+    rows = c.execute(
+        "SELECT id, bot_id, owner_id, ton_address, usdt_amount, created_at "
+        "FROM withdrawal_requests WHERE status='pending' ORDER BY created_at"
+    ).fetchall()
+    c.close(); return rows
+
+def db_get_withdrawal(wr_id: int):
+    """Returns (bot_id, owner_id, ton_address, usdt_amount, status) or None."""
+    c = _conn()
+    row = c.execute(
+        'SELECT bot_id, owner_id, ton_address, usdt_amount, status FROM withdrawal_requests WHERE id=?',
+        (wr_id,)
+    ).fetchone()
+    c.close(); return row
+
+def db_update_withdrawal_status(wr_id: int, status: str):
+    c = _conn()
+    c.execute('UPDATE withdrawal_requests SET status=? WHERE id=?', (status, wr_id))
+    c.commit(); c.close()
+
+# ── Free Coupons ──────────────────────────────────────
+def db_set_free_coupon(user_id: int, days: int):
+    c = _conn()
+    c.execute('INSERT OR REPLACE INTO free_coupons (user_id, days, used) VALUES (?,?,0)',
+              (user_id, days))
+    c.commit(); c.close()
+
+def db_get_free_coupon(user_id: int):
+    """Returns days or None if no unused coupon."""
+    c = _conn()
+    row = c.execute('SELECT days FROM free_coupons WHERE user_id=? AND used=0',
+                    (user_id,)).fetchone()
+    c.close(); return row[0] if row else None
+
+def db_mark_coupon_used(user_id: int):
+    c = _conn()
+    c.execute('UPDATE free_coupons SET used=1 WHERE user_id=?', (user_id,))
+    c.commit(); c.close()
