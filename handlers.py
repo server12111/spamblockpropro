@@ -32,7 +32,8 @@ from keyboards import (start_kb, back_to_start_kb, back_to_payment_kb, cancel_kb
                        broadcast_type_kb, super_admin_kb,
                        start_text, buy_text,
                        PE_FIRE, PE_DIAMOND, PE_STAR, PE_ROCKET, PE_GIFT, PE_CHECK, PE_MONEY,
-                       TE_FIRE, TE_DIAMOND, TE_STAR, TE_MONEY, TE_CHECK, TE_ROCKET, TE_GIFT)
+                       TE_CHAT, TE_DIAMOND, TE_STAR, TE_MONEY, TE_CHECK, TE_ROCKET, TE_GIFT,
+                       TE_FIRE, TE_CROSS, TE_SEND, TE_BLOCK, TE_CARD, TE_DOLLAR, TE_FREE)
 from payments import (cb_create_invoice, cb_check_invoice,
                       get_ton_amount, ton_payment_link, ton_check_transfer)
 from purchased_bot import launch_bot, stop_bot, running_bots, running_bot_ids

@@ -16,7 +16,7 @@ from database import (db_add_user, db_get_bot_users, db_deactivate_bot, DBState,
                       db_get_bot_earnings, db_deduct_bot_earnings,
                       db_create_withdrawal, db_renew_bot,
                       db_return_bot_earnings)
-from keyboards import broadcast_type_kb, PE_MONEY, PE_CHECK, PE_GIFT, PE_FIRE, TE_MONEY, TE_CHECK
+from keyboards import broadcast_type_kb, PE_MONEY, PE_CHECK, PE_GIFT, PE_FIRE, TE_MONEY, TE_CHECK, TE_FIRE, TE_ROCKET, TE_GIFT, TE_CROSS, TE_SEND, TE_BLOCK
 from config import SUPER_ADMIN, WITHDRAWAL_CHANNEL, BOT_USERNAME
 from payments import get_ton_amount
 
