@@ -16,7 +16,7 @@ from database import (db_add_user, db_get_bot_users, db_deactivate_bot, DBState,
                       db_get_bot_earnings, db_deduct_bot_earnings,
                       db_create_withdrawal, db_renew_bot,
                       db_return_bot_earnings)
-from keyboards import broadcast_type_kb, PE_MONEY, PE_CHECK, PE_GIFT, PE_FIRE
+from keyboards import broadcast_type_kb, PE_MONEY, PE_CHECK, PE_GIFT, PE_FIRE, TE_MONEY, TE_CHECK
 from config import SUPER_ADMIN, WITHDRAWAL_CHANNEL, BOT_USERNAME
 from payments import get_ton_amount
 
@@ -826,7 +826,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         kb.add(InlineKeyboardButton('🔙 Назад', callback_data='p_back_admin'))
         ton_text = f"\n💎 Эквивалент: ~<b>{ton_equiv} TON</b>" if ton_equiv else ""
         pbot.edit_message_text(
-            f"{PE_MONEY} <b>Мой баланс</b>\n\n"
+            f"{TE_MONEY} <b>Мой баланс</b>\n\n"
             f"💵 Текущий баланс: <b>{balance:.4f} USDT</b>{ton_text}\n"
             f"📈 Всего заработано: <b>{total:.4f} USDT</b>\n\n"
             f"<i>Баланс пополняется когда пользователи покупают бота через твою кнопку «💎 Купить такого бота» (50% с каждой продажи)</i>",
@@ -918,7 +918,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             except Exception as e:
                 log.warning(f'withdrawal channel notify failed: {e}')
         pbot.send_message(m.chat.id,
-            f"{PE_CHECK} <b>Запрос на вывод создан!</b>\n\n"
+            f"{TE_CHECK} <b>Запрос на вывод создан!</b>\n\n"
             f"Сумма: <b>{amount:.4f} USDT</b>\n"
             f"Адрес: <code>{address}</code>\n\n"
             f"Администратор обработает запрос в ближайшее время.",
@@ -984,7 +984,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         new_exp = db_renew_bot(db_bot_id, days)
         exp_str = str(new_exp)[:10] if new_exp else '—'
         pbot.edit_message_text(
-            f"{PE_CHECK} <b>Бот продлён на {days} дней!</b>\n\n"
+            f"{TE_CHECK} <b>Бот продлён на {days} дней!</b>\n\n"
             f"Списано: <b>{cost:.4f} USDT</b>\n"
             f"Подписка до: <b>{exp_str}</b>",
             cb.message.chat.id, cb.message.message_id,

@@ -1,7 +1,7 @@
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from database import get_price
 
-# ── Emoji константи ────────────────────────────────────
+# ── Emoji для кнопок (plain Unicode) ──────────────────
 PE_FIRE    = '🔥'
 PE_DIAMOND = '💎'
 PE_STAR    = '⭐'
@@ -12,6 +12,21 @@ PE_CROWN   = '👑'
 PE_GIFT    = '🎁'
 PE_CHECK   = '✅'
 PE_BELL    = '🔔'
+
+# ── Преміум анімовані emoji для HTML тексту повідомлень ─
+def _te(emoji_id, fallback):
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+
+TE_FIRE    = _te('5312241539987020022', '🔥')
+TE_DIAMOND = _te('5309958691854754293', '💎')
+TE_STAR    = _te('5235579393115438657', '⭐')
+TE_MONEY   = _te('5350452584119279096', '💰')
+TE_CHECK   = _te('5237699328843200968', '✅')
+TE_TROPHY  = _te('5312315739842026755', '🏆')
+TE_CROWN   = _te('5357107601584693888', '👑')
+TE_ROCKET  = '🚀'
+TE_GIFT    = '🎁'
+TE_BELL    = '🔔'
 
 
 def _btn(text, **kwargs):
@@ -112,16 +127,16 @@ def super_admin_kb():
 
 # ── Тексты ────────────────────────────────────────────
 def start_text(admin_username):
-    return (f"{PE_ROCKET} <b>Привет! Это бот обратной связи с {admin_username}</b>\n\n"
+    return (f"{TE_ROCKET} <b>Привет! Это бот обратной связи с {admin_username}</b>\n\n"
             f"💬 Отправь своё сообщение и он обязательно прочитает, когда будет онлайн")
 
 
 def buy_text():
-    return (f"{PE_DIAMOND} <b>SpamBot — бот обратной связи</b>\n\n"
+    return (f"{TE_DIAMOND} <b>SpamBot — бот обратной связи</b>\n\n"
             f"Что получишь:\n"
             f"• Собственный бот для приёма сообщений\n"
             f"• Ответы пользователям прямо из Telegram\n"
             f"• Панель админа с рассылкой (текст + фото)\n"
             f"• Настройка под ключ\n\n"
-            f"💰 Цена: <b>{get_price()} USDT</b>\n\n"
+            f"{TE_MONEY} Цена: <b>{get_price()} USDT</b>\n\n"
             f"Выбери способ оплаты:")

@@ -31,7 +31,8 @@ from keyboards import (start_kb, back_to_start_kb, back_to_payment_kb, cancel_kb
                        close_kb, reply_kb, payment_kb, cryptobot_kb,
                        broadcast_type_kb, super_admin_kb,
                        start_text, buy_text,
-                       PE_FIRE, PE_DIAMOND, PE_STAR, PE_ROCKET, PE_GIFT, PE_CHECK, PE_MONEY)
+                       PE_FIRE, PE_DIAMOND, PE_STAR, PE_ROCKET, PE_GIFT, PE_CHECK, PE_MONEY,
+                       TE_FIRE, TE_DIAMOND, TE_STAR, TE_MONEY, TE_CHECK, TE_ROCKET, TE_GIFT)
 from payments import (cb_create_invoice, cb_check_invoice,
                       get_ton_amount, ton_payment_link, ton_check_transfer)
 from purchased_bot import launch_bot, stop_bot, running_bots, running_bot_ids
@@ -173,7 +174,7 @@ def register(bot: telebot.TeleBot):
                 owner_id_ref = info[2]
                 try:
                     bot.send_message(owner_id_ref,
-                        f"{PE_MONEY} <b>Новая комиссия!</b>\n\n"
+                        f"{TE_MONEY} <b>Новая комиссия!</b>\n\n"
                         f"Пользователь купил бота через твой бот.\n"
                         f"Начислено: <b>{commission} USDT</b> (50%)\n\n"
                         f"Баланс: смотри в /admin своего бота → 💰 Мой баланс",
@@ -195,14 +196,14 @@ def register(bot: telebot.TeleBot):
             kb = InlineKeyboardMarkup()
             kb.add(InlineKeyboardButton('❌ Закрыть', callback_data='close'))
             bot.edit_message_text(
-                f"{PE_CHECK} <b>Подписка успешно продлена на {renew_days} дней!</b>\n\n"
+                f"{TE_CHECK} <b>Подписка успешно продлена на {renew_days} дней!</b>\n\n"
                 f"Действует до: <b>{exp_str}</b>",
                 chat_id, message_id, parse_mode='HTML', reply_markup=kb)
         else:
             db_mark_paid(uid)
             state[uid] = 'await_bot_token'
             bot.edit_message_text(
-                f"{PE_CHECK} <b>Оплата получена!\n\n"
+                f"{TE_CHECK} <b>Оплата получена!\n\n"
                 f"🤖 Введи токен своего бота (получи в @BotFather):</b>",
                 chat_id, message_id, parse_mode='HTML', reply_markup=cancel_kb())
 
@@ -386,7 +387,7 @@ def register(bot: telebot.TeleBot):
         if db_is_paid(uid):
             state[uid] = 'await_bot_token'
             bot.edit_message_text(
-                f"{PE_CHECK} <b>Оплата уже получена!\n\n"
+                f"{TE_CHECK} <b>Оплата уже получена!\n\n"
                 "🤖 Введи токен своего бота (получи в @BotFather):</b>",
                 cb.message.chat.id, cb.message.message_id,
                 parse_mode='HTML', reply_markup=cancel_kb())
@@ -1062,7 +1063,7 @@ def register(bot: telebot.TeleBot):
         db_update_withdrawal_status(wr_id, 'approved')
         try:
             bot.send_message(owner_id,
-                f"{PE_CHECK} <b>Запрос на вывод #{wr_id} подтверждён!</b>\n\n"
+                f"{TE_CHECK} <b>Запрос на вывод #{wr_id} подтверждён!</b>\n\n"
                 f"Сумма: <b>{usdt_amount} USDT</b>\n"
                 f"Адрес: <code>{ton_address}</code>\n\n"
                 f"Средства переведены. Спасибо!",
