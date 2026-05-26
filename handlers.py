@@ -112,9 +112,11 @@ def start_subscription_checker(main_bot):
 
 
 def register(bot: telebot.TeleBot):
-    def _exception_handler(exc):
-        log.error(f'Unhandled handler exception: {exc}', exc_info=True)
-    bot.set_exception_handler(_exception_handler)
+    class _EH:
+        def handle(self, e):
+            log.error(f'Handler exception: {e}', exc_info=True)
+            return True
+    bot.exception_handler = _EH()
 
     state = DBState(0)
     _bot_username_cache = [None]
