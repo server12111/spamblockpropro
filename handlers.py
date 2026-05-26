@@ -210,6 +210,7 @@ def register(bot: telebot.TeleBot):
     @bot.message_handler(commands=['start'])
     def cmd_start(m):
         uid = m.from_user.id
+        log.info(f'/start from uid={uid}')
         db_add_user(0, uid)
         payload = m.text.strip().split(' ', 1)[1] if ' ' in m.text else ''
 
@@ -1095,3 +1096,8 @@ def register(bot: telebot.TeleBot):
             pass
         bot.answer_callback_query(cb.id, f"❌ Запрос #{wr_id} отклонён, баланс возвращён", show_alert=True)
         _show_withdrawal_list(cb.message.chat.id, cb.message.message_id)
+
+    # ── Catch-all: диагностика ───────────────────────────
+    @bot.message_handler(func=lambda m: True)
+    def catch_all(m):
+        log.info(f'Catch-all msg: uid={m.from_user.id} type={m.content_type} text={repr(m.text or "")}')
