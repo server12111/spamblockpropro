@@ -1,5 +1,7 @@
 import logging
 import os
+import signal
+import sys
 import telebot
 from config import TOKEN, WEBHOOK_URL, WEBHOOK_PORT, SUPER_ADMIN
 from database import init_db, db_get_all_bots
@@ -61,4 +63,18 @@ if __name__ == '__main__':
             log.info('Webhook cleared.')
         except Exception as e:
             log.warning(f'delete_webhook: {e}')
+
+        def _shutdown(signum, frame):
+            log.info(f'Signal {signum} received, stopping...')
+            bot.stop_polling()
+            for tok, b in list(running_bots.items()):
+                try:
+                    b.stop_polling()
+                except Exception:
+                    pass
+            sys.exit(0)
+
+        signal.signal(signal.SIGTERM, _shutdown)
+        signal.signal(signal.SIGINT, _shutdown)
+
         bot.infinity_polling(skip_pending=True)
