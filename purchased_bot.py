@@ -315,11 +315,11 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         for tid, text in templates:
             preview = text[:30] + '…' if len(text) > 30 else text
             kb.row(
-                InlineKeyboardButton(f'💬 {preview}', callback_data=f'p_noop'),
-                InlineKeyboardButton('🗑', callback_data=f'p_mgdel_tpl_{tid}'),
+                _pbtn(preview, icon='💬', style='primary', callback_data='p_noop'),
+                _pbtn('🗑', style='danger', callback_data=f'p_mgdel_tpl_{tid}'),
             )
-        kb.add(InlineKeyboardButton('➕ Добавить шаблон', callback_data='p_mgadd_tpl'))
-        kb.add(InlineKeyboardButton('🔙 Назад', callback_data='p_back_admin'))
+        kb.add(_pbtn('Добавить шаблон', style='success', callback_data='p_mgadd_tpl'))
+        kb.add(_pbtn('Назад', icon='🔙', callback_data='p_back_admin'))
         return kb, templates
 
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_admin_templates')
@@ -335,7 +335,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if not is_admin(cb.from_user.id): return
         pstate[cb.from_user.id] = 'mgadd_tpl'
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton('❌ Отмена', callback_data='p_admin_templates'))
+        kb.add(_pbtn('Отмена', icon='❌', style='danger', callback_data='p_admin_templates'))
         pbot.edit_message_text("<b>➕ Введи текст нового шаблона:</b>",
             cb.message.chat.id, cb.message.message_id, parse_mode='HTML', reply_markup=kb)
 
@@ -564,8 +564,8 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         kb = InlineKeyboardMarkup()
         for tid, text in templates:
             preview = text[:35] + '…' if len(text) > 35 else text
-            kb.add(InlineKeyboardButton(f"❌ {preview}", callback_data=f'p_del_tpl_{target}_{tid}'))
-        kb.add(InlineKeyboardButton('🔙 Назад', callback_data=f'p_templates_{target}'))
+            kb.add(_pbtn(preview, icon='❌', style='danger', callback_data=f'p_del_tpl_{target}_{tid}'))
+        kb.add(_pbtn('Назад', icon='🔙', callback_data=f'p_templates_{target}'))
         pbot.edit_message_text("<b>🗑 Обери шаблон для видалення:</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=kb)
@@ -583,8 +583,8 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         kb = InlineKeyboardMarkup()
         for t_id, text in templates:
             preview = text[:35] + '…' if len(text) > 35 else text
-            kb.add(InlineKeyboardButton(f"❌ {preview}", callback_data=f'p_del_tpl_{target}_{t_id}'))
-        kb.add(InlineKeyboardButton('🔙 Назад', callback_data=f'p_templates_{target}'))
+            kb.add(_pbtn(preview, icon='❌', style='danger', callback_data=f'p_del_tpl_{target}_{t_id}'))
+        kb.add(_pbtn('Назад', icon='🔙', callback_data=f'p_templates_{target}'))
         try:
             pbot.edit_message_reply_markup(cb.message.chat.id, cb.message.message_id, reply_markup=kb)
         except Exception as e:
@@ -827,10 +827,10 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         kb = InlineKeyboardMarkup()
         if balance > 0:
             kb.row(
-                InlineKeyboardButton('💸 Вывести TON',   callback_data='p_withdraw'),
-                InlineKeyboardButton('⏰ Продлить бота', callback_data='p_renew_balance'),
+                _pbtn('Вывести TON',   icon='💲', style='primary',  callback_data='p_withdraw'),
+                _pbtn('Продлить бота', style='success', callback_data='p_renew_balance'),
             )
-        kb.add(InlineKeyboardButton('🔙 Назад', callback_data='p_back_admin'))
+        kb.add(_pbtn('Назад', icon='🔙', callback_data='p_back_admin'))
         ton_text = f"\n💎 Эквивалент: ~<b>{ton_equiv} TON</b>" if ton_equiv else ""
         pbot.edit_message_text(
             f"{TE_MONEY} <b>Мой баланс</b>\n\n"
@@ -909,8 +909,8 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             try:
                 kb_admin = InlineKeyboardMarkup()
                 kb_admin.row(
-                    InlineKeyboardButton(f'✅ Подтвердить #{wr_id}', callback_data=f'wr_confirm_{wr_id}'),
-                    InlineKeyboardButton(f'❌ Отклонить #{wr_id}',   callback_data=f'wr_reject_{wr_id}'),
+                    _pbtn(f'Подтвердить #{wr_id}', style='success', callback_data=f'wr_confirm_{wr_id}'),
+                    _pbtn(f'Отклонить #{wr_id}',   style='danger',  callback_data=f'wr_reject_{wr_id}'),
                 )
                 from database import get_price as _get_price
                 ton_rate = get_ton_amount()
@@ -946,20 +946,23 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         for days_opt in [30, 90, 180]:
             cost = round(price * days_opt / 30, 4)
             if balance >= cost:
-                kb.add(InlineKeyboardButton(
-                    f'⏰ {days_opt} дней ({cost} USDT)',
+                kb.add(_pbtn(
+                    f'{days_opt} дней ({cost} USDT)',
+                    style='success',
                     callback_data=f'p_renew_bal_{days_opt}'))
                 options.append(days_opt)
         if balance > 0 and max_days_full > 0:
-            kb.add(InlineKeyboardButton(
-                f'💰 На весь баланс (~{max_days_full} дней)',
+            kb.add(_pbtn(
+                f'На весь баланс (~{max_days_full} дней)',
+                icon='💰',
+                style='success',
                 callback_data='p_renew_bal_all'))
         if not options and max_days_full == 0:
             pbot.answer_callback_query(cb.id,
                 f"❌ Баланса ({balance:.4f} USDT) недостаточно даже на 30 дней ({round(price,4)} USDT)",
                 show_alert=True)
             return
-        kb.add(InlineKeyboardButton('🔙 Назад', callback_data='p_balance'))
+        kb.add(_pbtn('Назад', icon='🔙', callback_data='p_balance'))
         pbot.edit_message_text(
             f"<b>⏰ Продление через баланс</b>\n\n"
             f"Баланс: <b>{balance:.4f} USDT</b>\n"

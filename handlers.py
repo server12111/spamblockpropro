@@ -29,7 +29,7 @@ from database import (DB_PATH,
                        DBState)
 from keyboards import (start_kb, back_to_start_kb, back_to_payment_kb, cancel_kb,
                        close_kb, reply_kb, payment_kb, cryptobot_kb,
-                       broadcast_type_kb, super_admin_kb,
+                       broadcast_type_kb, super_admin_kb, _btn,
                        start_text, buy_text,
                        PE_FIRE, PE_DIAMOND, PE_STAR, PE_ROCKET, PE_GIFT, PE_CHECK, PE_MONEY,
                        TE_CHAT, TE_DIAMOND, TE_STAR, TE_MONEY, TE_CHECK, TE_ROCKET, TE_GIFT,
@@ -82,7 +82,7 @@ def start_subscription_checker(main_bot):
                         db_set_bot_setting(bot_id, 'reminded_3d', '1')
                         try:
                             kb = InlineKeyboardMarkup()
-                            kb.add(InlineKeyboardButton('🔄 Продлить сейчас', callback_data=f'renew_bot_{bot_id}'))
+                            kb.add(_btn('Продлить сейчас', style='success', callback_data=f'renew_bot_{bot_id}'))
                             main_bot.send_message(owner_id,
                                 f"⚠️ <b>Подписка истекает через 3 дня!</b>\n\n"
                                 f"Продли через «🛒 Купить бота» в главном меню или нажми кнопку ниже.",
@@ -94,7 +94,7 @@ def start_subscription_checker(main_bot):
                         db_set_bot_setting(bot_id, 'reminded_1d', '1')
                         try:
                             kb = InlineKeyboardMarkup()
-                            kb.add(InlineKeyboardButton('🔄 Продлить срочно', callback_data=f'renew_bot_{bot_id}'))
+                            kb.add(_btn('Продлить срочно', style='danger', callback_data=f'renew_bot_{bot_id}'))
                             main_bot.send_message(owner_id,
                                 "🚨 <b>Подписка истекает завтра!</b>\n\n"
                                 "Срочно продли через «🛒 Купить бота».",
@@ -194,12 +194,10 @@ def register(bot: telebot.TeleBot):
                 if token not in running_bots:
                     launch_bot(bot_id, token, admin_id_val, bot)
             exp_str = str(new_exp)[:10] if new_exp else '—'
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton('❌ Закрыть', callback_data='close'))
             bot.edit_message_text(
                 f"{TE_CHECK} <b>Подписка успешно продлена на {renew_days} дней!</b>\n\n"
                 f"Действует до: <b>{exp_str}</b>",
-                chat_id, message_id, parse_mode='HTML', reply_markup=kb)
+                chat_id, message_id, parse_mode='HTML', reply_markup=close_kb())
         else:
             db_mark_paid(uid)
             state[uid] = 'await_bot_token'
@@ -378,7 +376,7 @@ def register(bot: telebot.TeleBot):
             db_mark_paid(uid)
             state[uid] = {'step': 'await_bot_token_free', 'days': coupon_days}
             bot.edit_message_text(
-                f"{PE_GIFT} <b>У тебя есть бесплатный купон на {coupon_days} дней!</b>\n\n"
+                f"{TE_GIFT} <b>У тебя есть бесплатный купон на {coupon_days} дней!</b>\n\n"
                 f"🤖 Введи токен своего бота (получи в @BotFather):",
                 cb.message.chat.id, cb.message.message_id,
                 parse_mode='HTML', reply_markup=cancel_kb())
@@ -413,10 +411,9 @@ def register(bot: telebot.TeleBot):
                 else:
                     exp_str = "—"
                 lines.append(f"{status} {name} — {exp_str}")
-                kb.add(InlineKeyboardButton(f"🔄 Продлить {name} (+30д.)",
-                                            callback_data=f'renew_bot_{bot_id}'))
-            kb.add(InlineKeyboardButton('🆕 Купить новый бот', callback_data='buy_new_bot'))
-            kb.add(InlineKeyboardButton('🔙 Назад',            callback_data='back_to_start'))
+                kb.add(_btn(f"Продлить {name} (+30д.)", style='success', callback_data=f'renew_bot_{bot_id}'))
+            kb.add(_btn('Купить новый бот', style='primary', callback_data='buy_new_bot'))
+            kb.add(_btn('Назад', icon='🔙', callback_data='back_to_start'))
             bot.edit_message_text("\n".join(lines),
                 cb.message.chat.id, cb.message.message_id,
                 parse_mode='HTML', reply_markup=kb)
@@ -462,15 +459,13 @@ def register(bot: telebot.TeleBot):
         disc = db_get_discount_count(uid)
         username = _get_bot_username()
         ref_link = f"https://t.me/{username}?start=ref_{uid}" if username else f"start=ref_{uid}"
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton('❌ Закрыть', callback_data='close'))
         bot.send_message(uid,
             f"🔗 <b>Твоя реферальная ссылка:</b>\n"
             f"<code>{ref_link}</code>\n\n"
             f"За каждого приведённого клиента, который оплатит подписку, "
             f"ты получишь 1 бесплатное продление на 10 дней.\n\n"
             f"💎 Накоплено скидок: <b>{disc}</b>",
-            parse_mode='HTML', reply_markup=kb)
+            parse_mode='HTML', reply_markup=close_kb())
         bot.answer_callback_query(cb.id)
 
     # ── Пробный период ───────────────────────────────────
@@ -485,7 +480,7 @@ def register(bot: telebot.TeleBot):
         db_mark_paid(uid)
         state[uid] = 'await_bot_token_trial'
         bot.edit_message_text(
-            f"{PE_GIFT} <b>Бесплатный пробный период (3 дня) активирован!\n\n"
+            f"{TE_GIFT} <b>Бесплатный пробный период (3 дня) активирован!\n\n"
             "🤖 Введи токен своего бота (получи в @BotFather):</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=cancel_kb())
@@ -548,9 +543,9 @@ def register(bot: telebot.TeleBot):
                 new_state['via_bot_id'] = cur['via_bot_id']
         state[cb.from_user.id] = new_state
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton('💎 Открыть TON Keeper и оплатить', url=link))
-        kb.add(InlineKeyboardButton('✅ Я оплатил — проверить',         callback_data='ton_check_auto'))
-        kb.add(InlineKeyboardButton('🔙 Назад',                          callback_data='back_to_payment'))
+        kb.add(_btn('Открыть TON Keeper и оплатить', icon='💎', style='primary', url=link))
+        kb.add(_btn('Я оплатил — проверить', icon='✔️', style='success', callback_data='ton_check_auto'))
+        kb.add(_btn('Назад', icon='🔙', callback_data='back_to_payment'))
         bot.edit_message_text(
             f"<b>💎 Оплата через TON Keeper</b>\n\n"
             f"Сумма: <b>{ton_amount} TON</b> (~${get_price()})\n\n"
@@ -592,9 +587,9 @@ def register(bot: telebot.TeleBot):
         else:
             link = ton_payment_link(ton_amount, payment_code)
             kb   = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton('💎 Открыть TON Keeper', url=link))
-            kb.add(InlineKeyboardButton('🔄 Проверить снова',    callback_data='ton_check_auto'))
-            kb.add(InlineKeyboardButton('🔙 Назад',              callback_data='back_to_payment'))
+            kb.add(_btn('Открыть TON Keeper', icon='💎', style='primary', url=link))
+            kb.add(_btn('Проверить снова', style='primary', callback_data='ton_check_auto'))
+            kb.add(_btn('Назад', icon='🔙', callback_data='back_to_payment'))
             bot.edit_message_text(
                 f"<b>❌ Оплата не найдена</b>\n\n"
                 f"Убедись что:\n"
@@ -665,10 +660,10 @@ def register(bot: telebot.TeleBot):
             db_clear_paid(m.from_user.id)
             kb = InlineKeyboardMarkup()
             if uname:
-                kb.add(InlineKeyboardButton(f'🤖 Перейти к @{uname}', url=f'https://t.me/{uname}'))
-            kb.add(InlineKeyboardButton('❌ Закрыть', callback_data='close'))
+                kb.add(_btn(f'Перейти к @{uname}', style='success', url=f'https://t.me/{uname}'))
+            kb.add(_btn('Закрыть', icon='❌', style='danger', callback_data='close'))
             bot.send_message(m.chat.id,
-                f"{PE_ROCKET} <b>Бот успешно запущен!\n\n"
+                f"{TE_ROCKET} <b>Бот успешно запущен!\n\n"
                 f"Управляй через /admin в своём боте.\n"
                 f"Статистика: /status в своём боте.</b>",
                 parse_mode='HTML', reply_markup=kb)
@@ -764,13 +759,11 @@ def register(bot: telebot.TeleBot):
     def _show_bots_list(chat_id, message_id=None):
         bots_list = db_get_active_bots_list()
         if not bots_list:
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton('❌ Закрыть', callback_data='close'))
             text = "<b>🤖 Нет активных ботов</b>"
             if message_id:
-                bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
+                bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=close_kb())
             else:
-                bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=kb)
+                bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=close_kb())
             return
         lines = []
         kb    = InlineKeyboardMarkup()
@@ -790,10 +783,10 @@ def register(bot: telebot.TeleBot):
                 f"{users_cnt} польз. | 📅 {date} | ⏳ {exp}"
             )
             kb.row(
-                InlineKeyboardButton(f"⏹ #{bot_id}",  callback_data=f'bot_stop_{bot_id}'),
-                InlineKeyboardButton(f"🔄 #{bot_id}",  callback_data=f'bot_restart_{bot_id}'),
+                _btn(f"⏹ #{bot_id}", style='danger',  callback_data=f'bot_stop_{bot_id}'),
+                _btn(f"🔄 #{bot_id}", style='primary', callback_data=f'bot_restart_{bot_id}'),
             )
-        kb.add(InlineKeyboardButton('❌ Закрыть', callback_data='close'))
+        kb.add(_btn('Закрыть', icon='❌', style='danger', callback_data='close'))
         text = "<b>🤖 Управление ботами</b>\n\n" + "\n".join(lines)
         if message_id:
             bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
@@ -865,7 +858,7 @@ def register(bot: telebot.TeleBot):
         if not bots_list:
             text = "<b>🛒 Нет активных ботов для маркетплейса</b>"
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton('🔙 Назад', callback_data='back_admin_panel'))
+            kb.add(_btn('Назад', icon='🔙', callback_data='back_admin_panel'))
             if message_id:
                 bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
             else:
@@ -884,10 +877,10 @@ def register(bot: telebot.TeleBot):
             label = f"{status_icon} Bot #{bot_id} (owner {owner_id})"
             toggle_label = '⚫ Выключить' if enabled else '🟢 Включить'
             kb.row(
-                InlineKeyboardButton(label, callback_data='noop'),
-                InlineKeyboardButton(toggle_label, callback_data=f'mp_toggle_{bot_id}'),
+                _btn(label, callback_data='noop'),
+                _btn(toggle_label, style='danger' if enabled else 'success', callback_data=f'mp_toggle_{bot_id}'),
             )
-        kb.add(InlineKeyboardButton('🔙 Назад', callback_data='back_admin_panel'))
+        kb.add(_btn('Назад', icon='🔙', callback_data='back_admin_panel'))
         text = "\n".join(lines)
         if message_id:
             bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
@@ -920,11 +913,11 @@ def register(bot: telebot.TeleBot):
     def free_give_cb(cb):
         if cb.from_user.id != SUPER_ADMIN: return
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton('🆕 Купон для нового бота',     callback_data='free_coupon'))
-        kb.add(InlineKeyboardButton('🔄 Продлить существующий бот', callback_data='free_renew'))
-        kb.add(InlineKeyboardButton('🔙 Назад',                     callback_data='back_admin_panel'))
+        kb.add(_btn('Купон для нового бота',     icon='🎁', style='success', callback_data='free_coupon'))
+        kb.add(_btn('Продлить существующий бот', style='primary', callback_data='free_renew'))
+        kb.add(_btn('Назад', icon='🔙', callback_data='back_admin_panel'))
         bot.edit_message_text(
-            f"{PE_GIFT} <b>Бесплатная выдача</b>\n\n"
+            f"{TE_GIFT} <b>Бесплатная выдача</b>\n\n"
             "Выбери тип:",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=kb)
@@ -960,7 +953,7 @@ def register(bot: telebot.TeleBot):
         db_set_free_coupon(target_uid, days)
         try:
             bot.send_message(target_uid,
-                f"{PE_GIFT} <b>Тебе выдан бесплатный купон на {days} дней!</b>\n\n"
+                f"{TE_GIFT} <b>Тебе выдан бесплатный купон на {days} дней!</b>\n\n"
                 f"Нажми «🛒 Купить бота» в главном меню — купон применится автоматически.",
                 parse_mode='HTML')
         except Exception:
@@ -1006,7 +999,7 @@ def register(bot: telebot.TeleBot):
         exp_str  = str(new_exp)[:10] if new_exp else '—'
         try:
             bot.send_message(owner_id,
-                f"{PE_GIFT} <b>Твой бот продлён бесплатно на {days} дней!</b>\n\n"
+                f"{TE_GIFT} <b>Твой бот продлён бесплатно на {days} дней!</b>\n\n"
                 f"Подписка действует до: <b>{exp_str}</b>",
                 parse_mode='HTML')
         except Exception:
@@ -1026,7 +1019,7 @@ def register(bot: telebot.TeleBot):
         if not pending:
             text = "<b>💸 Нет ожидающих запросов на вывод</b>"
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton('🔙 Назад', callback_data='back_admin_panel'))
+            kb.add(_btn('Назад', icon='🔙', callback_data='back_admin_panel'))
             if message_id:
                 bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
             else:
@@ -1040,10 +1033,10 @@ def register(bot: telebot.TeleBot):
                      f"Адрес: <code>{ton_address}</code>\n"
                      f"Сумма: <b>{usdt_amount} USDT</b> | {date}\n\n")
             kb.row(
-                InlineKeyboardButton(f"✅ #{wr_id}", callback_data=f'wr_confirm_{wr_id}'),
-                InlineKeyboardButton(f"❌ #{wr_id}", callback_data=f'wr_reject_{wr_id}'),
+                _btn(f"✅ #{wr_id}", style='success', callback_data=f'wr_confirm_{wr_id}'),
+                _btn(f"❌ #{wr_id}", style='danger',  callback_data=f'wr_reject_{wr_id}'),
             )
-        kb.add(InlineKeyboardButton('🔙 Назад', callback_data='back_admin_panel'))
+        kb.add(_btn('Назад', icon='🔙', callback_data='back_admin_panel'))
         if message_id:
             bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
         else:
