@@ -696,28 +696,8 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         pbot.edit_message_text("\n".join(lines), chat_id, message_id,
             parse_mode='HTML', reply_markup=kb)
 
-    # hack: нам нужен chat_id для _show_admins, передаём через замыкание
-    _last_admins_msg = {}
-
-    @pbot.callback_query_handler(func=lambda c: c.data == 'p_admins')
     def p_admins_open(cb):
-        if not is_primary_admin(cb.from_user.id): return
-        _last_admins_msg[cb.from_user.id] = (cb.message.chat.id, cb.message.message_id)
-        admins   = db_get_bot_admins(db_bot_id)
-        info     = db_get_bot_info(db_bot_id)
-        primary  = info[1] if info else None
-        lines    = ["<b>👤 Администраторы бота:</b>\n"]
-        kb       = InlineKeyboardMarkup()
-        for aid in admins:
-            tag = " 👑 (главный)" if aid == primary else ""
-            lines.append(f"• <code>{aid}</code>{tag}")
-            if aid != primary:
-                kb.add(InlineKeyboardButton(f"❌ Убрать {aid}", callback_data=f'p_rm_admin_{aid}'))
-        kb.add(InlineKeyboardButton('➕ Добавить',       callback_data='p_add_admin'))
-        kb.add(InlineKeyboardButton('🔄 Сменить главного', callback_data='p_change_primary'))
-        kb.add(InlineKeyboardButton('🔙 Назад',          callback_data='p_back_admin'))
-        pbot.edit_message_text("\n".join(lines), cb.message.chat.id, cb.message.message_id,
-            parse_mode='HTML', reply_markup=kb)
+        _show_admins(cb.message.chat.id, cb.message.message_id)
 
     @pbot.callback_query_handler(func=lambda c: c.data.startswith('p_rm_admin_'))
     def p_rm_admin(cb):
@@ -1009,25 +989,6 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             f"Подписка до: <b>{exp_str}</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_close())
-
-    @pbot.callback_query_handler(func=lambda c: c.data == 'p_balance')
-    def p_balance_redirect(cb):
-        if not is_admin(cb.from_user.id): return
-        balance, total = db_get_bot_earnings(db_bot_id)
-        kb = InlineKeyboardMarkup()
-        if balance > 0:
-            kb.row(
-                InlineKeyboardButton('💸 Вывести TON',   callback_data='p_withdraw'),
-                InlineKeyboardButton('⏰ Продлить бота', callback_data='p_renew_balance'),
-            )
-        kb.add(InlineKeyboardButton('🔙 Назад', callback_data='p_back_admin'))
-        pbot.edit_message_text(
-            f"{PE_MONEY} <b>Мой баланс</b>\n\n"
-            f"💵 Текущий баланс: <b>{balance:.4f} USDT</b>\n"
-            f"📈 Всего заработано: <b>{total:.4f} USDT</b>\n\n"
-            f"<i>Баланс пополняется когда пользователи покупают бота через кнопку «💎 Купить такого бота»</i>",
-            cb.message.chat.id, cb.message.message_id,
-            parse_mode='HTML', reply_markup=kb)
 
     # ── Рассылка ───────────────────────────────────────
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_broadcast')

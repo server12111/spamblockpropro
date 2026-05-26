@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 bot = telebot.TeleBot(TOKEN)
 
 if __name__ == '__main__':
+    log.info(f'Config: TOKEN={TOKEN[:10]}... SUPER_ADMIN={SUPER_ADMIN} DATA_DIR={_data_dir}')
     init_db()
     register(bot)
     for db_bot_id, token, admin_id, owner_id in db_get_all_bots():
@@ -55,4 +56,9 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=WEBHOOK_PORT, threaded=True)
     else:
         log.info('Running in polling mode.')
+        try:
+            bot.delete_webhook(drop_pending_updates=True)
+            log.info('Webhook cleared.')
+        except Exception as e:
+            log.warning(f'delete_webhook: {e}')
         bot.infinity_polling(skip_pending=True)

@@ -6,7 +6,8 @@ import logging
 from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import SUPER_ADMIN, ADMIN_USERNAME, TON_WALLET, WITHDRAWAL_CHANNEL, BOT_USERNAME
-from database import (db_add_user, db_get_owner_bots, db_add_bot,
+from database import (DB_PATH,
+                       db_add_user, db_get_owner_bots, db_add_bot,
                        db_get_all_users, db_get_bot_users, db_get_stats,
                        db_get_active_bots_list, db_get_bot_info,
                        db_get_all_bots_for_checker,
@@ -111,6 +112,10 @@ def start_subscription_checker(main_bot):
 
 
 def register(bot: telebot.TeleBot):
+    def _exception_handler(exc):
+        log.error(f'Unhandled handler exception: {exc}', exc_info=True)
+    bot.set_exception_handler(_exception_handler)
+
     state = DBState(0)
     _bot_username_cache = [None]
 
@@ -240,15 +245,47 @@ def register(bot: telebot.TeleBot):
     @bot.message_handler(commands=['backup'])
     def cmd_backup(m):
         if m.from_user.id != SUPER_ADMIN: return
-        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'spambots.db')
         try:
-            with open(db_path, 'rb') as f:
+            with open(DB_PATH, 'rb') as f:
                 bot.send_document(m.chat.id, f,
                     caption=f"💾 Backup <code>spambots.db</code>\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
                     parse_mode='HTML')
         except Exception as e:
             log.error(f'backup error: {e}')
             bot.send_message(m.chat.id, f"<b>❌ Ошибка бэкапа: {e}</b>", parse_mode='HTML')
+
+    @bot.message_handler(commands=['restore_db'])
+    def cmd_restore_db(m):
+        if m.from_user.id != SUPER_ADMIN: return
+        state[m.from_user.id] = 'await_db_file'
+        bot.send_message(m.chat.id,
+            "<b>📂 Восстановление базы данных</b>\n\n"
+            "Отправь файл <code>spambots.db</code> как документ.\n"
+            "⚠️ Текущая база будет заменена!",
+            parse_mode='HTML', reply_markup=cancel_kb())
+
+    @bot.message_handler(content_types=['document'],
+                         func=lambda m: state.get(m.from_user.id) == 'await_db_file')
+    def handle_db_restore(m):
+        if m.from_user.id != SUPER_ADMIN: return
+        state.pop(m.from_user.id, None)
+        doc = m.document
+        if not doc.file_name.endswith('.db'):
+            bot.send_message(m.chat.id, "<b>❌ Нужен файл с расширением .db</b>", parse_mode='HTML')
+            return
+        try:
+            file_info = bot.get_file(doc.file_id)
+            downloaded = bot.download_file(file_info.file_path)
+            with open(DB_PATH, 'wb') as f:
+                f.write(downloaded)
+            bot.send_message(m.chat.id,
+                f"<b>✅ База данных восстановлена!</b>\n\n"
+                f"Перезапусти бота на BotHost чтобы загрузились все purchased-боты.",
+                parse_mode='HTML', reply_markup=close_kb())
+            log.info(f'DB restored from upload by SUPER_ADMIN, size={len(downloaded)} bytes')
+        except Exception as e:
+            log.error(f'DB restore error: {e}')
+            bot.send_message(m.chat.id, f"<b>❌ Ошибка восстановления: {e}</b>", parse_mode='HTML')
 
     # ── Навигация ────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'back_to_start')
