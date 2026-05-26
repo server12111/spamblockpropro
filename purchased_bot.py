@@ -4,6 +4,15 @@ import time
 import logging
 from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from keyboards import _ICON
+
+def _pbtn(text, icon=None, style=None, **kwargs):
+    extra = {}
+    if icon and icon in _ICON:
+        extra['icon_custom_emoji_id'] = _ICON[icon]
+    if style:
+        extra['style'] = style
+    return InlineKeyboardButton(text, **extra, **kwargs)
 from database import (db_add_user, db_get_bot_users, db_deactivate_bot, DBState,
                       db_get_bot_info, db_get_bot_expires, db_update_bot_username,
                       db_block_user, db_unblock_user, db_is_blocked, db_get_blocked_list,
@@ -147,26 +156,24 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     # ── Клавиатуры ─────────────────────────────────────
     def pk_start(show_admin: bool = False):
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton('📤 Отправить сообщение', callback_data='p_send'))
+        kb.add(_pbtn('Отправить сообщение', icon='📤', style='primary', callback_data='p_send'))
         if show_admin:
-            kb.add(InlineKeyboardButton('⚙️ Панель админа', callback_data='p_open_admin'))
+            kb.add(_pbtn('Панель админа', style='primary', callback_data='p_open_admin'))
         if db_is_marketplace_enabled(db_bot_id) and BOT_USERNAME:
-            kb.add(InlineKeyboardButton(
-                '💎 Купить такого бота',
-                url=f'https://t.me/{BOT_USERNAME}?start=via_{db_bot_id}'
-            ))
+            kb.add(_pbtn('Купить такого бота', icon='💎', style='success',
+                         url=f'https://t.me/{BOT_USERNAME}?start=via_{db_bot_id}'))
         return kb
 
     def pk_back():
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton('🔙 Назад', callback_data='p_cancel'))
+        kb.add(_pbtn('Назад', icon='🔙', callback_data='p_cancel'))
         return kb
 
     def pk_reply_input_with_templates(target_id):
         kb = InlineKeyboardMarkup()
         kb.row(
-            InlineKeyboardButton('🔙 Назад',    callback_data=f'p_back_reply_{target_id}'),
-            InlineKeyboardButton('📋 Шаблони', callback_data=f'p_templates_{target_id}'),
+            _pbtn('Назад',    icon='🔙',                callback_data=f'p_back_reply_{target_id}'),
+            _pbtn('Шаблони', style='primary',           callback_data=f'p_templates_{target_id}'),
         )
         return kb
 
@@ -175,52 +182,52 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         kb = InlineKeyboardMarkup()
         for tid, text in templates:
             preview = text[:35] + '…' if len(text) > 35 else text
-            kb.add(InlineKeyboardButton(f'💬 {preview}', callback_data=f'p_use_tpl_{target_id}_{tid}'))
-        kb.add(InlineKeyboardButton('➕ Додати шаблон', callback_data=f'p_add_tpl_{target_id}'))
+            kb.add(_pbtn(preview, icon='💬', style='primary', callback_data=f'p_use_tpl_{target_id}_{tid}'))
+        kb.add(_pbtn('Додати шаблон', style='success', callback_data=f'p_add_tpl_{target_id}'))
         if templates:
-            kb.add(InlineKeyboardButton('🗑 Видалити',   callback_data=f'p_del_tpl_menu_{target_id}'))
-        kb.add(InlineKeyboardButton('🔙 Назад',          callback_data=f'p_back_reply_{target_id}'))
+            kb.add(_pbtn('Видалити',  style='danger',  callback_data=f'p_del_tpl_menu_{target_id}'))
+        kb.add(_pbtn('Назад', icon='🔙', callback_data=f'p_back_reply_{target_id}'))
         return kb
 
     def pk_close():
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton('❌ Закрыть', callback_data='p_close'))
+        kb.add(_pbtn('Закрыть', icon='❌', style='danger', callback_data='p_close'))
         return kb
 
     def pk_back_admin():
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton('🔙 Назад', callback_data='p_back_admin'))
+        kb.add(_pbtn('Назад', icon='🔙', callback_data='p_back_admin'))
         return kb
 
     def pk_reply(uid):
         kb = InlineKeyboardMarkup()
         kb.row(
-            InlineKeyboardButton('📤 Ответить',      callback_data=f'p_reply_{uid}'),
-            InlineKeyboardButton('🚫 Заблокировать', callback_data=f'p_block_{uid}'),
+            _pbtn('Ответить',      icon='📤', style='primary', callback_data=f'p_reply_{uid}'),
+            _pbtn('Заблокировать', icon='🚫', style='danger',  callback_data=f'p_block_{uid}'),
         )
         return kb
 
     def pk_admin():
         kb = InlineKeyboardMarkup()
         kb.row(
-            InlineKeyboardButton('📊 Статистика',  callback_data='p_stats'),
-            InlineKeyboardButton('💰 Мой баланс', callback_data='p_balance'),
+            _pbtn('Статистика',  style='primary', callback_data='p_stats'),
+            _pbtn('Мой баланс',  style='success', callback_data='p_balance'),
         )
-        kb.add(InlineKeyboardButton('📢 Рассылка', callback_data='p_broadcast'))
+        kb.add(_pbtn('Рассылка', style='primary', callback_data='p_broadcast'))
         kb.row(
-            InlineKeyboardButton('✏️ Приветствие',   callback_data='p_edit_welcome'),
-            InlineKeyboardButton('📋 Шаблоны',       callback_data='p_admin_templates'),
+            _pbtn('Приветствие', style='primary', callback_data='p_edit_welcome'),
+            _pbtn('Шаблоны',     style='primary', callback_data='p_admin_templates'),
         )
-        kb.add(InlineKeyboardButton('👥 Заблокированные',     callback_data='p_blocked_list'))
-        kb.add(InlineKeyboardButton('👤 Управление админами', callback_data='p_admins'))
-        kb.add(InlineKeyboardButton('🗑 Удалить бота',        callback_data='p_delete_bot'))
+        kb.add(_pbtn('Заблокированные',     style='primary', callback_data='p_blocked_list'))
+        kb.add(_pbtn('Управление админами', style='primary', callback_data='p_admins'))
+        kb.add(_pbtn('Удалить бота',        style='danger',  callback_data='p_delete_bot'))
         return kb
 
     def pk_confirm_delete():
         kb = InlineKeyboardMarkup()
         kb.row(
-            InlineKeyboardButton('✅ Да, удалить', callback_data='p_confirm_delete'),
-            InlineKeyboardButton('❌ Отмена',      callback_data='p_cancel_delete'),
+            _pbtn('Да, удалить', icon='✔️', style='danger',  callback_data='p_confirm_delete'),
+            _pbtn('Отмена',      icon='❌', style='primary', callback_data='p_cancel_delete'),
         )
         return kb
 
@@ -625,8 +632,8 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         pbot.answer_callback_query(cb.id, f"🚫 Пользователь {target} заблокирован", show_alert=True)
         kb = InlineKeyboardMarkup()
         kb.row(
-            InlineKeyboardButton('📤 Ответить',       callback_data=f'p_reply_{target}'),
-            InlineKeyboardButton('✅ Разблокировать', callback_data=f'p_unblock_{target}'),
+            _pbtn('Ответить',      icon='📤', style='primary', callback_data=f'p_reply_{target}'),
+            _pbtn('Разблокировать', icon='✔️', style='success', callback_data=f'p_unblock_{target}'),
         )
         try: pbot.edit_message_reply_markup(cb.message.chat.id, cb.message.message_id, reply_markup=kb)
         except Exception as e: log.warning(f'edit_markup: {e}')
@@ -640,8 +647,8 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         pbot.answer_callback_query(cb.id, f"✅ Пользователь {target} разблокирован", show_alert=True)
         kb = InlineKeyboardMarkup()
         kb.row(
-            InlineKeyboardButton('📤 Ответить',       callback_data=f'p_reply_{target}'),
-            InlineKeyboardButton('🚫 Заблокировать', callback_data=f'p_block_{target}'),
+            _pbtn('Ответить',      icon='📤', style='primary', callback_data=f'p_reply_{target}'),
+            _pbtn('Заблокировать', icon='🚫', style='danger',  callback_data=f'p_block_{target}'),
         )
         try: pbot.edit_message_reply_markup(cb.message.chat.id, cb.message.message_id, reply_markup=kb)
         except Exception as e: log.warning(f'edit_markup: {e}')
@@ -659,8 +666,8 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             return
         kb = InlineKeyboardMarkup()
         for uid in blocked:
-            kb.add(InlineKeyboardButton(f"✅ Разблокировать {uid}", callback_data=f'p_unblock_list_{uid}'))
-        kb.add(InlineKeyboardButton('🔙 Назад', callback_data='p_back_admin'))
+            kb.add(_pbtn(f"Разблокировать {uid}", icon='✔️', style='success', callback_data=f'p_unblock_list_{uid}'))
+        kb.add(_pbtn('Назад', icon='🔙', callback_data='p_back_admin'))
         pbot.edit_message_text(f"<b>🚫 Заблокированные ({len(blocked)}):</b>",
             chat_id, message_id, parse_mode='HTML', reply_markup=kb)
 
@@ -688,11 +695,11 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             label = f"👑 {aid} (главный)" if aid == primary_id else f"👤 {aid}"
             lines.append(label)
             if aid != primary_id:
-                kb.add(InlineKeyboardButton(f"❌ Удалить {aid}", callback_data=f'p_rm_admin_{aid}'))
-        kb.add(InlineKeyboardButton('➕ Добавить админа', callback_data='p_add_admin'))
+                kb.add(_pbtn(f"Удалить {aid}", icon='❌', style='danger', callback_data=f'p_rm_admin_{aid}'))
+        kb.add(_pbtn('Добавить админа', style='success', callback_data='p_add_admin'))
         if primary_id and primary_id != cb_from_user_id_placeholder:
-            kb.add(InlineKeyboardButton('🔄 Сменить главного', callback_data='p_change_primary'))
-        kb.add(InlineKeyboardButton('🔙 Назад', callback_data='p_back_admin'))
+            kb.add(_pbtn('Сменить главного', style='primary', callback_data='p_change_primary'))
+        kb.add(_pbtn('Назад', icon='🔙', callback_data='p_back_admin'))
         pbot.edit_message_text("\n".join(lines), chat_id, message_id,
             parse_mode='HTML', reply_markup=kb)
 
