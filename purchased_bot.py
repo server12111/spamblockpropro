@@ -20,7 +20,7 @@ from database import (db_add_user, db_get_bot_users, db_deactivate_bot, DBState,
                       db_get_bot_admins, db_add_bot_admin, db_remove_bot_admin,
                       db_set_primary_admin,
                       db_get_templates, db_add_template, db_del_template, db_get_template,
-                      db_log_message, db_get_bot_msg_stats,
+                      db_log_message, db_get_bot_msg_stats, db_get_last_user_messages,
                       db_is_marketplace_enabled,
                       db_get_bot_earnings, db_deduct_bot_earnings,
                       db_create_withdrawal, db_renew_bot,
@@ -173,7 +173,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         kb = InlineKeyboardMarkup()
         kb.row(
             _pbtn('Назад',    icon='🔙',                callback_data=f'p_back_reply_{target_id}'),
-            _pbtn('Шаблони', style='primary',           callback_data=f'p_templates_{target_id}'),
+            _pbtn('Шаблоны', style='primary',           callback_data=f'p_templates_{target_id}'),
         )
         return kb
 
@@ -183,9 +183,9 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         for tid, text in templates:
             preview = text[:35] + '…' if len(text) > 35 else text
             kb.add(_pbtn(preview, icon='💬', style='primary', callback_data=f'p_use_tpl_{target_id}_{tid}'))
-        kb.add(_pbtn('Додати шаблон', style='success', callback_data=f'p_add_tpl_{target_id}'))
+        kb.add(_pbtn('Добавить шаблон', style='success', callback_data=f'p_add_tpl_{target_id}'))
         if templates:
-            kb.add(_pbtn('Видалити',  style='danger',  callback_data=f'p_del_tpl_menu_{target_id}'))
+            kb.add(_pbtn('Удалить',  style='danger',  callback_data=f'p_del_tpl_menu_{target_id}'))
         kb.add(_pbtn('Назад', icon='🔙', callback_data=f'p_back_reply_{target_id}'))
         return kb
 
@@ -268,10 +268,10 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if not is_admin(m.from_user.id): return
         templates = db_get_templates(db_bot_id)
         if not templates:
-            pbot.send_message(m.chat.id, "<b>📋 Шаблони порожні\n\nВикористай кнопку '📋 Шаблони' при відповіді, щоб додати</b>",
+            pbot.send_message(m.chat.id, "<b>📋 Шаблоны пусты\n\nИспользуй кнопку '📋 Шаблоны' при ответе, чтобы добавить</b>",
                 parse_mode='HTML', reply_markup=pk_close())
             return
-        lines = ["<b>📋 Збережені шаблони:</b>\n"]
+        lines = ["<b>📋 Сохранённые шаблоны:</b>\n"]
         for tid, text in templates:
             lines.append(f"• [{tid}] {text}")
         pbot.send_message(m.chat.id, "\n".join(lines),
@@ -421,7 +421,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if not _user_msg_checks(m): return
         header = _make_header(m)
         send_to_admins(f"{header}\n\n💬 {m.text}", reply_markup=pk_reply(m.from_user.id))
-        db_log_message(db_bot_id, m.from_user.id)
+        db_log_message(db_bot_id, m.from_user.id, m.text or '')
         pbot.send_message(m.chat.id, "<b>✅ Сообщение отправлено</b>",
             parse_mode='HTML', reply_markup=pk_close())
         pstate.pop(m.from_user.id, None)
@@ -434,7 +434,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def p_user_media(m):
         if not _user_msg_checks(m): return
         send_media_to_admins(m, _make_header(m))
-        db_log_message(db_bot_id, m.from_user.id)
+        db_log_message(db_bot_id, m.from_user.id, f'[{m.content_type}]')
         pbot.send_message(m.chat.id, "<b>✅ Сообщение отправлено</b>",
             parse_mode='HTML', reply_markup=pk_close())
         pstate.pop(m.from_user.id, None)
@@ -457,11 +457,11 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                                               'caption': cb.message.html_caption or cb.message.caption or ''}
             pbot.delete_message(cb.message.chat.id, cb.message.message_id)
             pbot.send_message(cb.message.chat.id,
-                "<b>💬 Введи відповідь або надішли фото:</b>",
+                "<b>💬 Введи ответ или отправь фото:</b>",
                 parse_mode='HTML', reply_markup=pk_reply_input_with_templates(target))
         else:
             preply_cache[cb.from_user.id] = {'target_id': target, 'text': original_text, 'media': False}
-            pbot.edit_message_text("<b>💬 Введи відповідь або надішли фото:</b>",
+            pbot.edit_message_text("<b>💬 Введи ответ или отправь фото:</b>",
                 cb.message.chat.id, cb.message.message_id,
                 parse_mode='HTML', reply_markup=pk_reply_input_with_templates(target))
         pstate[cb.from_user.id] = f'await_reply_{target}'
@@ -471,34 +471,27 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if not is_admin(cb.from_user.id): return
         target = int(cb.data.split('_')[-1])
         pstate.pop(cb.from_user.id, None)
-        cached = preply_cache.pop(cb.from_user.id, None)
-        if cached and cached.get('media'):
-            ct = cached.get('content_type', 'photo')
-            file_id = cached.get('file_id', '')
-            cap = cached.get('caption', '')
-            try:
-                if ct == 'photo':
-                    pbot.send_photo(cb.message.chat.id, file_id, caption=cap,
-                                    parse_mode='HTML', reply_markup=pk_reply(target))
-                else:
-                    pbot.send_message(cb.message.chat.id, cap or f"<b>📥 Сообщение от пользователя</b>",
-                                      parse_mode='HTML', reply_markup=pk_reply(target))
-            except Exception as e:
-                log.warning(f'p_back_reply media restore: {e}')
-                pbot.send_message(cb.message.chat.id,
-                    f"<b>📥 Сообщение от пользователя <code>{target}</code></b>",
-                    parse_mode='HTML', reply_markup=pk_reply(target))
+        preply_cache.pop(cb.from_user.id, None)
+
+        # Строим мини-чат: последние 2 сообщения + ID пользователя
+        msgs = db_get_last_user_messages(db_bot_id, target, n=2)
+        if msgs:
+            lines = [f"<b>📥 Сообщения от пользователя</b>\n🆔 ID: <code>{target}</code>\n"]
+            for msg_text, msg_ts in msgs:
+                ts = str(msg_ts)[:16] if msg_ts else ''
+                lines.append(f"💬 <i>{ts}</i>\n{msg_text}")
+            restore_text = '\n\n'.join(lines)
         else:
-            restore_text = (cached['text'] if cached and cached.get('text')
-                            else f"<b>📥 Сообщение от пользователя <code>{target}</code></b>")
-            try:
-                pbot.edit_message_text(restore_text,
-                    cb.message.chat.id, cb.message.message_id,
-                    parse_mode='HTML', reply_markup=pk_reply(target))
-            except Exception as e:
-                log.warning(f'p_back_reply edit failed: {e}')
-                pbot.send_message(cb.message.chat.id, restore_text,
-                    parse_mode='HTML', reply_markup=pk_reply(target))
+            restore_text = f"<b>📥 Сообщение от пользователя <code>{target}</code></b>"
+
+        try:
+            pbot.edit_message_text(restore_text,
+                cb.message.chat.id, cb.message.message_id,
+                parse_mode='HTML', reply_markup=pk_reply(target))
+        except Exception as e:
+            log.warning(f'p_back_reply edit failed: {e}')
+            pbot.send_message(cb.message.chat.id, restore_text,
+                parse_mode='HTML', reply_markup=pk_reply(target))
 
     # ── Шаблони відповідей ──────────────────────────────
     @pbot.callback_query_handler(func=lambda c: c.data.startswith('p_templates_')
@@ -508,9 +501,9 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         target = int(cb.data.split('_')[-1])
         templates = db_get_templates(db_bot_id)
         if not templates:
-            text = "<b>📋 Шаблони порожні</b>\n\nДодай перший шаблон:"
+            text = "<b>📋 Шаблоны пусты</b>\n\nДобавь первый шаблон:"
         else:
-            text = f"<b>📋 Шаблони ({len(templates)}):</b>\n\nОбери або керуй:"
+            text = f"<b>📋 Шаблоны ({len(templates)}):</b>\n\nВыбери или управляй:"
         pbot.edit_message_text(text, cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_templates_list(target))
 
@@ -528,12 +521,12 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             pbot.send_message(target_id, f"<b>📥 Сообщение от администратора\n\n💬 {text}</b>",
                 parse_mode='HTML')
         except Exception:
-            pbot.answer_callback_query(cb.id, "❌ Не вдалося надіслати — користувач недоступний",
+            pbot.answer_callback_query(cb.id, "❌ Не удалось отправить — пользователь недоступен",
                 show_alert=True)
             return
         pstate.pop(cb.from_user.id, None)
         preply_cache.pop(cb.from_user.id, None)
-        pbot.edit_message_text("<b>✅ Відповідь за шаблоном надіслана</b>",
+        pbot.edit_message_text("<b>✅ Ответ по шаблону отправлен</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_close())
 
@@ -541,7 +534,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def p_add_template_start(cb):
         if not is_admin(cb.from_user.id): return
         target = int(cb.data.split('_')[-1])
-        pbot.edit_message_text("<b>➕ Введи текст нового шаблону:</b>",
+        pbot.edit_message_text("<b>➕ Введи текст нового шаблона:</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_reply_input_with_templates(target))
         pstate[cb.from_user.id] = f'await_add_tpl_{target}'
@@ -553,7 +546,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         target = int(pstate[m.from_user.id].split('_')[-1])
         db_add_template(db_bot_id, m.text)
         pstate[m.from_user.id] = f'await_reply_{target}'
-        pbot.send_message(m.chat.id, "<b>✅ Шаблон збережено</b>",
+        pbot.send_message(m.chat.id, "<b>✅ Шаблон сохранён</b>",
             parse_mode='HTML', reply_markup=pk_reply_input_with_templates(target))
 
     @pbot.callback_query_handler(func=lambda c: c.data.startswith('p_del_tpl_menu_'))
@@ -566,7 +559,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             preview = text[:35] + '…' if len(text) > 35 else text
             kb.add(_pbtn(preview, icon='❌', style='danger', callback_data=f'p_del_tpl_{target}_{tid}'))
         kb.add(_pbtn('Назад', icon='🔙', callback_data=f'p_templates_{target}'))
-        pbot.edit_message_text("<b>🗑 Обери шаблон для видалення:</b>",
+        pbot.edit_message_text("<b>🗑 Выбери шаблон для удаления:</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=kb)
 
@@ -616,11 +609,11 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             pbot.send_photo(target_id, m.photo[-1].file_id, caption=cap_text, parse_mode='HTML')
         except Exception as e:
             log.warning(f'p_admin_photo_reply failed: {e}')
-            pbot.send_message(m.chat.id, "<b>❌ Не вдалося надіслати фото</b>", parse_mode='HTML')
+            pbot.send_message(m.chat.id, "<b>❌ Не удалось отправить фото</b>", parse_mode='HTML')
             return
         pstate.pop(m.from_user.id, None)
         preply_cache.pop(m.from_user.id, None)
-        pbot.send_message(m.chat.id, "<b>✅ Фото надіслано</b>",
+        pbot.send_message(m.chat.id, "<b>✅ Фото отправлено</b>",
             parse_mode='HTML', reply_markup=pk_close())
 
     # ── Блокировка ─────────────────────────────────────
