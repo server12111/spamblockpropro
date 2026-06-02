@@ -123,6 +123,7 @@ def init_db():
     for stmt in [
         'ALTER TABLE bots ADD COLUMN username TEXT DEFAULT ""',
         'ALTER TABLE bots ADD COLUMN expires_at TIMESTAMP',
+        "ALTER TABLE bot_messages ADD COLUMN text TEXT DEFAULT ''",
     ]:
         try:
             conn.execute(stmt); conn.commit()
@@ -482,10 +483,23 @@ def db_use_discount(user_id: int):
     c.commit(); c.close()
 
 # ── Bot Message Stats ─────────────────────────────────
-def db_log_message(bot_id: int, user_id: int):
+def db_log_message(bot_id: int, user_id: int, text: str = ''):
     c = _conn()
-    c.execute('INSERT INTO bot_messages (bot_id, user_id) VALUES (?,?)', (bot_id, user_id))
+    c.execute('INSERT INTO bot_messages (bot_id, user_id, text) VALUES (?,?,?)',
+              (bot_id, user_id, text or ''))
     c.commit(); c.close()
+
+def db_get_last_user_messages(bot_id: int, user_id: int, n: int = 2) -> list:
+    """Returns last n non-empty messages from user as [(text, timestamp), ...] oldest-first."""
+    c = _conn()
+    rows = c.execute(
+        "SELECT text, timestamp FROM bot_messages "
+        "WHERE bot_id=? AND user_id=? AND text != '' "
+        "ORDER BY id DESC LIMIT ?",
+        (bot_id, user_id, n)
+    ).fetchall()
+    c.close()
+    return list(reversed(rows))
 
 def db_get_bot_msg_stats(bot_id: int) -> dict:
     c = _conn()
