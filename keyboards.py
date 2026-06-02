@@ -147,6 +147,10 @@ def super_admin_kb():
         _btn('Бесплатная выдача', icon='🎁', style='success', callback_data='free_give'),
         _btn('Запросы на вывод',  icon='💲', style='danger',  callback_data='withdrawal_list'),
     )
+    kb.row(
+        _btn('💾 Скачать БД',      style='primary', callback_data='backup_db'),
+        _btn('📂 Восстановить БД', style='danger',  callback_data='restore_db_btn'),
+    )
     return kb
 
 
