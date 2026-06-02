@@ -290,6 +290,31 @@ def register(bot: telebot.TeleBot):
             log.error(f'DB restore error: {e}')
             bot.send_message(m.chat.id, f"<b>❌ Ошибка восстановления: {e}</b>", parse_mode='HTML')
 
+    # ── Backup / Restore через кнопки ────────────────────
+    @bot.callback_query_handler(func=lambda c: c.data == 'backup_db')
+    def backup_db_cb(cb):
+        if cb.from_user.id != SUPER_ADMIN: return
+        try:
+            with open(DB_PATH, 'rb') as f:
+                bot.send_document(cb.message.chat.id, f,
+                    caption=f"💾 Backup <code>spambots.db</code>\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                    parse_mode='HTML')
+        except Exception as e:
+            bot.answer_callback_query(cb.id, f"❌ Ошибка: {e}", show_alert=True)
+            return
+        bot.answer_callback_query(cb.id)
+
+    @bot.callback_query_handler(func=lambda c: c.data == 'restore_db_btn')
+    def restore_db_btn_cb(cb):
+        if cb.from_user.id != SUPER_ADMIN: return
+        state[cb.from_user.id] = 'await_db_file'
+        bot.answer_callback_query(cb.id)
+        bot.send_message(cb.message.chat.id,
+            "<b>📂 Восстановление базы данных</b>\n\n"
+            "Отправь файл <code>spambots.db</code> как документ.\n"
+            "⚠️ Текущая база будет заменена!",
+            parse_mode='HTML', reply_markup=cancel_kb())
+
     # ── Навигация ────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'back_to_start')
     def back_to_start_cb(cb):
