@@ -59,7 +59,7 @@ if __name__ == '__main__':
     else:
         log.info('Running in polling mode.')
         try:
-            bot.delete_webhook(drop_pending_updates=True)
+            bot.delete_webhook(drop_pending_updates=True, timeout=10)
             log.info('Webhook cleared.')
         except Exception as e:
             log.warning(f'delete_webhook: {e}')
@@ -77,4 +77,4 @@ if __name__ == '__main__':
         signal.signal(signal.SIGTERM, _shutdown)
         signal.signal(signal.SIGINT, _shutdown)
 
-        bot.infinity_polling(skip_pending=False)
+        bot.infinity_polling(skip_pending=False, timeout=60, long_polling_timeout=5)
