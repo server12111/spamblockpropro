@@ -3,8 +3,9 @@ import os
 import signal
 import sys
 import telebot
+from datetime import datetime
 from config import TOKEN, WEBHOOK_URL, WEBHOOK_PORT, SUPER_ADMIN
-from database import init_db, db_get_all_bots
+from database import init_db, db_get_all_bots_for_checker
 from purchased_bot import launch_bot, running_bots
 from handlers import register, start_subscription_checker
 
@@ -27,9 +28,29 @@ if __name__ == '__main__':
     log.info(f'Config: TOKEN={TOKEN[:10]}... SUPER_ADMIN={SUPER_ADMIN} DATA_DIR={_data_dir}')
     init_db()
     register(bot)
-    for db_bot_id, token, admin_id, owner_id in db_get_all_bots():
+
+    # Прогреваем соединение и кэшируем bot.get_me() ДО запуска купленных ботов,
+    # пока их фоновые потоки ещё не заняли сетевые соединения long polling'ом.
+    try:
+        bot.get_me()
+        if not WEBHOOK_URL:
+            bot.delete_webhook(drop_pending_updates=True, timeout=10)
+            log.info('Webhook cleared.')
+    except Exception as e:
+        log.warning(f'Pre-warm (get_me/delete_webhook) failed: {e}')
+
+    now = datetime.now()
+    skipped_expired = 0
+    for db_bot_id, owner_id, token, admin_id, expires_at in db_get_all_bots_for_checker():
+        if expires_at:
+            try:
+                if datetime.fromisoformat(str(expires_at)) <= now:
+                    skipped_expired += 1
+                    continue
+            except Exception:
+                pass
         launch_bot(db_bot_id, token, admin_id, bot)
-    log.info(f'Started. Loaded {len(running_bots)} purchased bot(s).')
+    log.info(f'Started. Loaded {len(running_bots)} purchased bot(s), skipped {skipped_expired} expired.')
 
     start_subscription_checker(bot)
 
@@ -58,11 +79,6 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=WEBHOOK_PORT, threaded=True)
     else:
         log.info('Running in polling mode.')
-        try:
-            bot.delete_webhook(drop_pending_updates=True, timeout=10)
-            log.info('Webhook cleared.')
-        except Exception as e:
-            log.warning(f'delete_webhook: {e}')
 
         def _shutdown(signum, frame):
             log.info(f'Signal {signum} received, stopping...')
