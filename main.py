@@ -77,4 +77,4 @@ if __name__ == '__main__':
         signal.signal(signal.SIGTERM, _shutdown)
         signal.signal(signal.SIGINT, _shutdown)
 
-        bot.infinity_polling(skip_pending=True)
+        bot.infinity_polling(skip_pending=False)
