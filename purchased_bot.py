@@ -1046,6 +1046,10 @@ def launch_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None) -> bool
     try:
         pbot = make_purchased_bot(db_bot_id, token, admin_id, main_bot)
         me   = pbot.get_me()
+        try:
+            pbot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:
+            log.warning(f'Bot #{db_bot_id} delete_webhook failed: {e}')
         db_update_bot_username(db_bot_id, me.username or '')
         running_bots[token]        = pbot
         running_bot_ids[db_bot_id] = token
