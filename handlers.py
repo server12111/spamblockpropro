@@ -26,6 +26,7 @@ from database import (DB_PATH,
                        db_get_withdrawal, db_update_withdrawal_status,
                        db_return_bot_earnings,
                        db_set_free_coupon, db_get_free_coupon, db_mark_coupon_used,
+                       db_deactivate_bot,
                        DBState)
 from keyboards import (start_kb, back_to_start_kb, back_to_payment_kb, cancel_kb,
                        close_kb, reply_kb, payment_kb, cryptobot_kb,
@@ -66,6 +67,13 @@ def start_subscription_checker(main_bot):
                     except Exception:
                         continue
                     days_left = (exp - now).days
+
+                    if days_left <= -30:
+                        if token in running_bots:
+                            stop_bot(token)
+                        db_deactivate_bot(bot_id)
+                        log.info(f'Bot #{bot_id} deactivated (expired {abs(days_left)}d ago).')
+                        continue
 
                     if days_left <= 0 and token in running_bots:
                         stop_bot(token)
@@ -115,8 +123,22 @@ def start_subscription_checker(main_bot):
 
 def register(bot: telebot.TeleBot):
     class _EH:
+        def __init__(self):
+            self._last_401_alert = 0
         def handle(self, e):
             log.error(f'Handler exception: {e}', exc_info=True)
+            if '401' in str(e) or 'Unauthorized' in str(e):
+                now = time.time()
+                if now - self._last_401_alert > 3600:
+                    self._last_401_alert = now
+                    # Токен главного бота невалиден — самим ботом это не отправить
+                    # (тот же мёртвый токен), поэтому кричим в лог максимально громко.
+                    log.critical(
+                        '='*60 + '\n'
+                        'ГЛАВНЫЙ БОТ: ТОКЕН НЕВАЛИДЕН (401 Unauthorized)!\n'
+                        'Проверь BOT_TOKEN в @BotFather и обнови .env / переменные окружения.\n'
+                        + '='*60
+                    )
             return True
     bot.exception_handler = _EH()
 

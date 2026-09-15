@@ -21,6 +21,7 @@ from database import (db_add_user, db_get_bot_users, db_deactivate_bot, DBState,
                       db_set_primary_admin,
                       db_get_templates, db_add_template, db_del_template, db_get_template,
                       db_log_message, db_get_bot_msg_stats, db_get_last_user_messages,
+                      db_get_username,
                       db_is_marketplace_enabled,
                       db_get_bot_earnings, db_deduct_bot_earnings,
                       db_create_withdrawal, db_renew_bot,
@@ -234,7 +235,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     # ── Команды ────────────────────────────────────────
     @pbot.message_handler(commands=['start'])
     def pstart(m):
-        db_add_user(db_bot_id, m.from_user.id)
+        db_add_user(db_bot_id, m.from_user.id, m.from_user.username or '')
         pbot.send_message(m.chat.id, get_welcome(), parse_mode='HTML',
                           reply_markup=pk_start(is_admin(m.from_user.id)))
 
@@ -396,6 +397,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
 
     def _user_msg_checks(m) -> bool:
         """Общие проверки для всех входящих медиа. True = продолжать."""
+        db_add_user(db_bot_id, m.from_user.id, m.from_user.username or '')
         if db_is_blocked(db_bot_id, m.from_user.id):
             pbot.send_message(m.chat.id, "<b>🚫 Вы заблокированы администратором</b>",
                 parse_mode='HTML')
@@ -473,16 +475,18 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         pstate.pop(cb.from_user.id, None)
         preply_cache.pop(cb.from_user.id, None)
 
-        # Строим мини-чат: последние 2 сообщения + ID пользователя
+        # Строим мини-чат: последние 2 сообщения + ID и username пользователя
+        username = db_get_username(db_bot_id, target)
+        user_line = f"🆔 ID: <code>{target}</code>  🔗 @{username}" if username else f"🆔 ID: <code>{target}</code>"
         msgs = db_get_last_user_messages(db_bot_id, target, n=2)
         if msgs:
-            lines = [f"<b>📥 Сообщения от пользователя</b>\n🆔 ID: <code>{target}</code>\n"]
+            lines = [f"<b>📥 Сообщения от пользователя</b>\n{user_line}\n"]
             for msg_text, msg_ts in msgs:
                 ts = str(msg_ts)[:16] if msg_ts else ''
                 lines.append(f"💬 <i>{ts}</i>\n{msg_text}")
             restore_text = '\n\n'.join(lines)
         else:
-            restore_text = f"<b>📥 Сообщение от пользователя <code>{target}</code></b>"
+            restore_text = f"<b>📥 Сообщение от пользователя</b>\n{user_line}"
 
         try:
             pbot.edit_message_text(restore_text,
@@ -1046,6 +1050,8 @@ def launch_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None) -> bool
     try:
         pbot = make_purchased_bot(db_bot_id, token, admin_id, main_bot)
         me   = pbot.get_me()
+        if db_get_bot_setting(db_bot_id, 'notified_401', ''):
+            db_set_bot_setting(db_bot_id, 'notified_401', '')
         try:
             pbot.delete_webhook(drop_pending_updates=True)
         except Exception as e:
@@ -1079,4 +1085,22 @@ def launch_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None) -> bool
         return True
     except Exception as e:
         log.error(f'launch_bot #{db_bot_id} failed: {e}')
+        if ('401' in str(e) or 'Unauthorized' in str(e)) and not db_get_bot_setting(db_bot_id, 'notified_401', ''):
+            db_set_bot_setting(db_bot_id, 'notified_401', '1')
+            if main_bot:
+                try:
+                    info = db_get_bot_info(db_bot_id)
+                    owner_id = info[2] if info else None
+                    if owner_id:
+                        main_bot.send_message(owner_id,
+                            "❌ <b>Токен вашего бота недействителен!</b>\n\n"
+                            "Похоже, токен был отозван или изменён в @BotFather. "
+                            "Бот не работает, пока токен не будет обновлён.",
+                            parse_mode='HTML')
+                    main_bot.send_message(SUPER_ADMIN,
+                        f"⚠️ <b>Bot #{db_bot_id} — невалидный токен (401)</b>\n"
+                        f"Owner: <code>{owner_id}</code>",
+                        parse_mode='HTML')
+                except Exception:
+                    pass
         return False
