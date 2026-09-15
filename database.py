@@ -30,8 +30,9 @@ def init_db():
             PRIMARY KEY (bot_id, admin_id)
         );
         CREATE TABLE IF NOT EXISTS bot_users (
-            bot_id  INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
+            bot_id   INTEGER NOT NULL,
+            user_id  INTEGER NOT NULL,
+            username TEXT DEFAULT '',
             PRIMARY KEY (bot_id, user_id)
         );
         CREATE TABLE IF NOT EXISTS used_txs (
@@ -124,6 +125,7 @@ def init_db():
         'ALTER TABLE bots ADD COLUMN username TEXT DEFAULT ""',
         'ALTER TABLE bots ADD COLUMN expires_at TIMESTAMP',
         "ALTER TABLE bot_messages ADD COLUMN text TEXT DEFAULT ''",
+        "ALTER TABLE bot_users ADD COLUMN username TEXT DEFAULT ''",
     ]:
         try:
             conn.execute(stmt); conn.commit()
@@ -246,15 +248,25 @@ def db_set_primary_admin(bot_id: int, new_admin_id: int):
     c.commit(); c.close()
 
 # ── Users ─────────────────────────────────────────────
-def db_add_user(bot_id, user_id):
+def db_add_user(bot_id, user_id, username=''):
     c = _conn()
-    c.execute('INSERT OR IGNORE INTO bot_users (bot_id, user_id) VALUES (?,?)', (bot_id, user_id))
+    c.execute(
+        'INSERT INTO bot_users (bot_id, user_id, username) VALUES (?,?,?) '
+        'ON CONFLICT(bot_id, user_id) DO UPDATE SET username=excluded.username',
+        (bot_id, user_id, username or '')
+    )
     c.commit(); c.close()
 
 def db_get_bot_users(bot_id):
     c = _conn()
     rows = c.execute('SELECT user_id FROM bot_users WHERE bot_id=?', (bot_id,)).fetchall()
     c.close(); return [r[0] for r in rows]
+
+def db_get_username(bot_id, user_id) -> str:
+    c = _conn()
+    row = c.execute('SELECT username FROM bot_users WHERE bot_id=? AND user_id=?',
+                     (bot_id, user_id)).fetchone()
+    c.close(); return (row[0] if row and row[0] else '')
 
 def db_get_all_users():
     c = _conn()

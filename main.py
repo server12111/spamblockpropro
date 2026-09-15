@@ -2,6 +2,7 @@ import logging
 import os
 import signal
 import sys
+import time
 import telebot
 from datetime import datetime
 from config import TOKEN, WEBHOOK_URL, WEBHOOK_PORT, SUPER_ADMIN
@@ -50,6 +51,7 @@ if __name__ == '__main__':
             except Exception:
                 pass
         launch_bot(db_bot_id, token, admin_id, bot)
+        time.sleep(0.3)  # разносим старты polling-потоков, чтобы не бить залпом
     log.info(f'Started. Loaded {len(running_bots)} purchased bot(s), skipped {skipped_expired} expired.')
 
     start_subscription_checker(bot)
