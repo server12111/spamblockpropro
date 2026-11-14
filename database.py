@@ -21,12 +21,24 @@ _tls = threading.local()
 class _CachedConn:
     """Обёртка: close() не закрывает кэшированное соединение, а откатывает
     незавершённую транзакцию (чтобы чужая транзакция не держала блокировку).
-    При 'disk I/O error' соединение пересоздаётся и запрос повторяется."""
+    При 'disk I/O error' или закрытии извне (restore_db) соединение
+    пересоздаётся, запрос повторяется."""
     __slots__ = ('_c', '_file_sig', '_path')
     def __init__(self, c, path):
         self._c = c
         self._path = path
         self._file_sig = None
+    def _reopen(self):
+        try:
+            self._c.close()
+        except Exception:
+            pass
+        self._c = sqlite3.connect(self._path, timeout=15)
+        try:
+            self._c.execute('PRAGMA busy_timeout=15000')
+        except Exception:
+            pass
+        self._file_sig = _file_signature(self._path)
     def execute(self, *args, **kwargs):
         try:
             return self._c.execute(*args, **kwargs)
@@ -35,16 +47,13 @@ class _CachedConn:
                 raise
             # файл/хранилище моргнуло: пересоздаём соединение и повторяем раз
             log.warning('SQLite disk I/O error — пересоздаю соединение')
-            try:
-                self._c.close()
-            except Exception:
-                pass
-            self._c = sqlite3.connect(self._path, timeout=15)
-            try:
-                self._c.execute('PRAGMA busy_timeout=15000')
-            except Exception:
-                pass
-            self._file_sig = _file_signature(self._path)
+            self._reopen()
+            return self._c.execute(*args, **kwargs)
+        except sqlite3.ProgrammingError as e:
+            if 'closed database' not in str(e).lower():
+                raise
+            # соединение закрыто извне (db_close_all после restore) — переоткрываем
+            self._reopen()
             return self._c.execute(*args, **kwargs)
     def commit(self):
         self._c.commit()
@@ -56,6 +65,20 @@ class _CachedConn:
             pass
     def __getattr__(self, name):
         return getattr(self._c, name)
+
+# Реестр всех соединений: db_close_all() закрывает их перед подменой файла БД
+# (restore_db), иначе на Windows файл не удалить под открытым дескриптором.
+_conns_registry = set()
+
+def db_close_all():
+    """Закрывает ВСЕ кэшированные соединения любых потоков. После вызова
+    кэшированные обёртки переоткрываются автоматически при следующем запросе."""
+    for c in list(_conns_registry):
+        try:
+            c._c.close()
+        except Exception:
+            pass
+    _conns_registry.clear()
 
 def _file_signature(path):
     try:
@@ -87,6 +110,7 @@ def _conn():
         except Exception:
             pass
         c = _CachedConn(raw, path)
+        _conns_registry.add(c)
         c._file_sig = _file_signature(path)
         conns[path] = c
     return c

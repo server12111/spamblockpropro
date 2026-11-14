@@ -317,6 +317,9 @@ def register(bot: telebot.TeleBot):
         try:
             file_info = bot.get_file(doc.file_id)
             downloaded = bot.download_file(file_info.file_path)
+            # закрываем все кэшированные соединения, иначе файл не подменить
+            from database import db_close_all
+            db_close_all()
             with open(DB_PATH, 'wb') as f:
                 f.write(downloaded)
             bot.send_message(m.chat.id,
