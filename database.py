@@ -788,14 +788,23 @@ def db_get_last_user_messages(bot_id: int, user_id: int, n: int = 2) -> list:
     return list(reversed(rows))
 
 def db_get_bot_msg_stats(bot_id: int) -> dict:
+    # границы «сегодня»/«неделя» по часовому поясу статистики (FS_STATS_TZ),
+    # неделя — календарная (с понедельника), как в еженедельных отчётах
+    from config import STATS_TZ_OFFSET
+    now_utc = datetime.utcnow()
+    tz_now = now_utc + timedelta(hours=STATS_TZ_OFFSET)
+    day_start_tz = tz_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start_tz = day_start_tz - timedelta(days=tz_now.weekday())
+    b_today = (day_start_tz - timedelta(hours=STATS_TZ_OFFSET)).strftime('%Y-%m-%d %H:%M:%S')
+    b_week = (week_start_tz - timedelta(hours=STATS_TZ_OFFSET)).strftime('%Y-%m-%d %H:%M:%S')
     c = _conn()
     today = c.execute(
-        "SELECT COUNT(*) FROM bot_messages WHERE bot_id=? AND timestamp >= date('now')",
-        (bot_id,)
+        'SELECT COUNT(*) FROM bot_messages WHERE bot_id=? AND timestamp >= ?',
+        (bot_id, b_today)
     ).fetchone()[0]
     week = c.execute(
-        "SELECT COUNT(*) FROM bot_messages WHERE bot_id=? AND timestamp >= date('now','-7 days')",
-        (bot_id,)
+        'SELECT COUNT(*) FROM bot_messages WHERE bot_id=? AND timestamp >= ?',
+        (bot_id, b_week)
     ).fetchone()[0]
     total_users = c.execute(
         'SELECT COUNT(*) FROM bot_users WHERE bot_id=?', (bot_id,)

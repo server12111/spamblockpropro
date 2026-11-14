@@ -27,10 +27,10 @@ from database import (db_add_user, db_get_bot_users, db_deactivate_bot, DBState,
                       db_get_bot_earnings, db_deduct_bot_earnings,
                       db_create_withdrawal, db_renew_bot,
                       db_return_bot_earnings)
-from keyboards import broadcast_type_kb, PE_MONEY, PE_CHECK, PE_GIFT, PE_FIRE, TE_MONEY, TE_CHECK, TE_FIRE, TE_ROCKET, TE_GIFT, TE_CROSS, TE_SEND, TE_BLOCK, TE_CHAT, TE_LINK, TE_DIAMOND, TE_STATS, TE_ROBOT, TE_HOURGLASS, TE_CALENDAR, TE_CLOCK, TE_CHART, TE_NOTE, TE_USER, TE_INBOX, TE_ANNOUNCE, TE_CROWN, TE_DOLLAR, TE_EXCLAM, TE_GREEN, TE_ID, TE_KEYBOARD, TE_MAIL, TE_MASKS, TE_MIC, TE_PENCIL, TE_PICTURE, TE_PLUS, TE_REFRESH, TE_USERS, TE_VIDEO
+from keyboards import broadcast_type_kb, PE_MONEY, PE_CHECK, PE_GIFT, PE_FIRE
 from config import SUPER_ADMIN, WITHDRAWAL_CHANNEL, BOT_USERNAME
 from payments import get_ton_amount
-from forum_support import register_forum_support, RATE_LIMIT_SEC, rate_limited
+from forum_support import register_forum_support, RATE_LIMIT_SEC, rate_limited, fs_bump_ticket
 
 log = logging.getLogger(__name__)
 
@@ -501,6 +501,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             pstate.pop(m.from_user.id, None)
             return
         db_bump_user_contact(db_bot_id, m.from_user.id)
+        fs_bump_ticket(db_bot_id, m.from_user.id)   # обращение учитывается и без группы
         header = _make_header(m)
         send_to_admins(f"{header}\n\n{TE_CHAT} {html.escape(m.text or '')}", reply_markup=pk_reply(m.from_user.id))
         db_log_message(db_bot_id, m.from_user.id, m.text or '')
@@ -521,6 +522,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             pstate.pop(m.from_user.id, None)
             return
         db_bump_user_contact(db_bot_id, m.from_user.id)
+        fs_bump_ticket(db_bot_id, m.from_user.id)
         send_media_to_admins(m, _make_header(m))
         db_log_message(db_bot_id, m.from_user.id, f'[{m.content_type}]')
         pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Сообщение отправлено</b>",

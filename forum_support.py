@@ -18,6 +18,7 @@ forum_support.py — режим техподдержки через Telegram For
 import hashlib
 import html
 import logging
+import os
 import random
 import sqlite3
 import threading
@@ -26,7 +27,8 @@ from datetime import datetime, timedelta, timezone
 
 from telebot.apihelper import ApiTelegramException
 from telebot.types import (InlineKeyboardMarkup, InlineKeyboardButton,
-                           ReplyParameters, InputMediaPhoto, InputMediaVideo)
+                           ReplyParameters, InputMediaPhoto, InputMediaVideo,
+                           Message)
 
 from database import (DB_PATH, _utc_now_str,
                       db_add_user, db_get_user_info, db_bump_user_contact,
@@ -1101,7 +1103,7 @@ def queue_random_message(pbot, bot_id: int, m) -> None:
                         parse_mode='HTML', reply_markup=kb)
             # если фолбэк создал новое сообщение — обновляем id промпта,
             # чтобы счётчик очереди продолжал работать и после 48 часов
-            if isinstance(res, telebot.types.Message) and res.message_id != prompt_id:
+            if isinstance(res, Message) and res.message_id != prompt_id:
                 fs_set_prompt(bot_id, uid, res.message_id)
             return
         except ApiTelegramException as e:
@@ -1234,6 +1236,7 @@ def _deliver_pending_payload(pbot, bot_id: int, items: list, uid: int) -> bool:
             if ok_all:
                 for it in grp:
                     it['done'] = 1
+                fs_bump_ticket(bot_id, uid)
                 db_log_message(bot_id, uid,
                                grp[0]['type'] if len(grp) == 1
                                else f"[{grp[0]['type']} x{len(grp)}]")
