@@ -79,18 +79,31 @@ if __name__ == '__main__':
         bot.infinity_polling(skip_pending=False, timeout=60, long_polling_timeout=5)
 
     if WEBHOOK_URL:
+        from urllib.parse import urlparse
         from flask import Flask, request, abort
 
         app = Flask(__name__)
         secret = TOKEN.replace(':', '_')
 
-        @app.route(f'/{secret}', methods=['POST'])
-        def webhook():
+        def _telegram_webhook():
             if request.headers.get('content-type') == 'application/json':
                 update = telebot.types.Update.de_json(request.get_data().decode('utf-8'))
                 bot.process_new_updates([update])
                 return ''
             abort(403)
+
+        # Хостинг может проксировать домен с префиксом пути (например
+        # https://host.bothost.tech/webhook -> контейнер). Регистрируем
+        # POST-маршруты: прямой путь и catch-all, путь должен заканчиваться секретом.
+        def _webhook_prefixed(_sub=None):
+            if not (_sub or '').endswith(secret):
+                abort(404)
+            return _telegram_webhook()
+
+        app.add_url_rule(f'/{secret}', 'hook_exact',
+                         lambda: _webhook_prefixed(secret), methods=['POST'])
+        app.add_url_rule('/<path:_sub>', 'hook_prefixed',
+                         _webhook_prefixed, methods=['POST'])
 
         @app.route('/')
         def index():
@@ -98,12 +111,13 @@ if __name__ == '__main__':
 
         # Установка webhook с ретраями: сбой Telegram (502 и т.п.) не должен
         # ронять процесс в crash-loop — при неудаче откатываемся в polling
+        base = WEBHOOK_URL.rstrip('/')
         webhook_ok = False
         for attempt in range(1, 4):
             try:
-                bot.set_webhook(url=f'{WEBHOOK_URL}/{secret}')
+                bot.set_webhook(url=f'{base}/{secret}')
                 webhook_ok = True
-                log.info(f'Webhook set: {WEBHOOK_URL}/{secret}')
+                log.info(f'Webhook set: {base}/{secret}')
                 break
             except Exception as e:
                 log.warning(f'Set webhook attempt {attempt}/3 failed: {e}')
