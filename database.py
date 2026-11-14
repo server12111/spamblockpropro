@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import os
+import threading
 from datetime import datetime, timedelta
 from config import PRICE_USDT
 
@@ -8,11 +9,60 @@ _data_dir = os.getenv('DATA_DIR', '.')
 os.makedirs(_data_dir, exist_ok=True)
 DB_PATH = os.path.join(_data_dir, 'spambots.db')
 
+# ── Пул соединений (thread-local) ─────────────────────────────
+# Каждый поток переиспользует одно соединение: WAL допускает параллельные
+# читатели, busy_timeout ждёт при конфликте записи. Кэш ограничен числом
+# потоков, утечек нет. Ключ кэша — путь к БД (совместимо с подменой в тестах).
+_tls = threading.local()
+
+class _CachedConn:
+    """Обёртка: close() не закрывает кэшированное соединение, а откатывает
+    незавершённую транзакцию (чтобы чужая транзакция не держала блокировку)."""
+    __slots__ = ('_c',)
+    def __init__(self, c):
+        self._c = c
+    def execute(self, *args, **kwargs):
+        return self._c.execute(*args, **kwargs)
+    def commit(self):
+        self._c.commit()
+    def close(self):
+        try:
+            if self._c.in_transaction:
+                self._c.rollback()
+        except Exception:
+            pass
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
 def _conn():
-    return sqlite3.connect(DB_PATH)
+    path = DB_PATH
+    conns = getattr(_tls, 'conns', None)
+    if conns is None:
+        conns = {}
+        _tls.conns = conns
+    c = conns.get(path)
+    if c is None:
+        raw = sqlite3.connect(path, timeout=15)
+        try:
+            raw.execute('PRAGMA busy_timeout=15000')
+            raw.execute('PRAGMA synchronous=NORMAL')
+        except Exception:
+            pass
+        c = _CachedConn(raw)
+        conns[path] = c
+    return c
+
+def _utc_now_str() -> str:
+    """Единый формат UTC-времени для всех новых таблиц (CURRENT_TIMESTAMP тоже UTC)."""
+    return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    try:
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA busy_timeout=15000')
+    except Exception:
+        pass
     conn.executescript('''
         CREATE TABLE IF NOT EXISTS bots (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,14 +168,104 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             used       INTEGER DEFAULT 0
         );
+        -- ── Forum Topics: группы техподдержки ──────────────
+        CREATE TABLE IF NOT EXISTS fs_groups (
+            bot_id       INTEGER PRIMARY KEY,
+            chat_id      INTEGER NOT NULL UNIQUE,
+            title        TEXT DEFAULT '',
+            thread_stats INTEGER,
+            connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        -- Пользовательские темы: 1 пользователь = 1 тема на бота
+        CREATE TABLE IF NOT EXISTS fs_topics (
+            bot_id        INTEGER NOT NULL,
+            user_id       INTEGER NOT NULL,
+            thread_id     INTEGER NOT NULL,
+            title         TEXT DEFAULT '',
+            pinned_msg_id INTEGER,
+            info_hash     TEXT DEFAULT '',
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at    TIMESTAMP,
+            PRIMARY KEY (bot_id, user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_fs_topics_thread ON fs_topics(bot_id, thread_id);
+        -- Соответствие исходных и групповых сообщений (для ответов через Reply)
+        CREATE TABLE IF NOT EXISTS fs_msgs (
+            chat_id      INTEGER NOT NULL,
+            group_msg_id INTEGER NOT NULL,
+            bot_id       INTEGER NOT NULL,
+            user_id      INTEGER NOT NULL,
+            thread_id    INTEGER NOT NULL,
+            src_msg_id   INTEGER,
+            media_group  TEXT DEFAULT '',
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (chat_id, group_msg_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_fs_msgs_user ON fs_msgs(bot_id, user_id);
+        -- История обнаруженных username
+        CREATE TABLE IF NOT EXISTS fs_username_history (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id     INTEGER NOT NULL,
+            user_id    INTEGER NOT NULL,
+            username   TEXT NOT NULL,
+            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (bot_id, user_id, username)
+        );
+        -- Обращения: серия сообщений = 1 обращение (разрыв > TICKET_GAP_HOURS открывает новое)
+        CREATE TABLE IF NOT EXISTS fs_tickets (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id    INTEGER NOT NULL,
+            user_id   INTEGER NOT NULL,
+            opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_at   TIMESTAMP,
+            closed_at TIMESTAMP,
+            msgs      INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_fs_tickets_bot ON fs_tickets(bot_id, opened_at);
+        CREATE INDEX IF NOT EXISTS idx_fs_tickets_user ON fs_tickets(bot_id, user_id, closed_at);
+        -- Сообщения, отправленные админами пользователям (для статистики)
+        CREATE TABLE IF NOT EXISTS fs_admin_msgs (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id    INTEGER NOT NULL,
+            user_id   INTEGER NOT NULL,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_fs_admin_msgs_bot ON fs_admin_msgs(bot_id, timestamp);
+        -- Очередь подтверждения отправки случайных сообщений пользователя
+        CREATE TABLE IF NOT EXISTS fs_pending (
+            bot_id        INTEGER NOT NULL,
+            user_id       INTEGER NOT NULL,
+            payload       TEXT NOT NULL DEFAULT '[]',
+            status        TEXT DEFAULT 'pending',
+            prompt_msg_id INTEGER,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at    TIMESTAMP,
+            PRIMARY KEY (bot_id, user_id)
+        );
+        -- Еженедельные отчёты (защита от дублей по периоду)
+        CREATE TABLE IF NOT EXISTS fs_weekly_reports (
+            bot_id       INTEGER NOT NULL,
+            period_start TEXT NOT NULL,
+            period_end   TEXT NOT NULL,
+            status       TEXT DEFAULT 'queued',
+            message_id   INTEGER,
+            published_at TIMESTAMP,
+            PRIMARY KEY (bot_id, period_start)
+        );
     ''')
     conn.commit()
-    # Миграции для старых схем
+    # Миграции для старых схем (безопасны и повторяемы)
     for stmt in [
         'ALTER TABLE bots ADD COLUMN username TEXT DEFAULT ""',
         'ALTER TABLE bots ADD COLUMN expires_at TIMESTAMP',
         "ALTER TABLE bot_messages ADD COLUMN text TEXT DEFAULT ''",
         "ALTER TABLE bot_users ADD COLUMN username TEXT DEFAULT ''",
+        # Расширение bot_users для forum-режима (старые строки получают NULL = «Неизвестно»)
+        "ALTER TABLE bot_users ADD COLUMN first_name TEXT DEFAULT ''",
+        'ALTER TABLE bot_users ADD COLUMN registered_at TIMESTAMP',
+        'ALTER TABLE bot_users ADD COLUMN first_contact_at TIMESTAMP',
+        'ALTER TABLE bot_users ADD COLUMN contact_count INTEGER DEFAULT 0',
     ]:
         try:
             conn.execute(stmt); conn.commit()
@@ -248,14 +388,73 @@ def db_set_primary_admin(bot_id: int, new_admin_id: int):
     c.commit(); c.close()
 
 # ── Users ─────────────────────────────────────────────
-def db_add_user(bot_id, user_id, username=''):
+def db_add_user(bot_id, user_id, username='', first_name=''):
+    """Создаёт/обновляет пользователя. Дата регистрации ставится только при создании
+    записи (для существующих пользователей остаётся NULL = «Неизвестно»).
+    Возвращает True, если запись создана сейчас."""
     c = _conn()
+    cur = c.execute(
+        'INSERT OR IGNORE INTO bot_users (bot_id, user_id, username, first_name, registered_at) '
+        'VALUES (?,?,?,?,?)',
+        (bot_id, user_id, username or '', first_name or '', _utc_now_str())
+    )
+    is_new = cur.rowcount > 0
     c.execute(
-        'INSERT INTO bot_users (bot_id, user_id, username) VALUES (?,?,?) '
-        'ON CONFLICT(bot_id, user_id) DO UPDATE SET username=excluded.username',
-        (bot_id, user_id, username or '')
+        "UPDATE bot_users SET username=?, "
+        "first_name=CASE WHEN ? != '' THEN ? ELSE first_name END "
+        'WHERE bot_id=? AND user_id=?',
+        (username or '', first_name or '', first_name or '', bot_id, user_id)
     )
     c.commit(); c.close()
+    return is_new
+
+def db_get_user_info(bot_id, user_id) -> dict:
+    """Расширенная информация о пользователе бота."""
+    c = _conn()
+    row = c.execute(
+        'SELECT username, first_name, registered_at, first_contact_at, contact_count '
+        'FROM bot_users WHERE bot_id=? AND user_id=?', (bot_id, user_id)
+    ).fetchone()
+    c.close()
+    if not row:
+        return None
+    return {'username': row[0] or '', 'first_name': row[1] or '',
+            'registered_at': row[2], 'first_contact_at': row[3],
+            'contact_count': row[4] or 0}
+
+def db_bump_user_contact(bot_id, user_id):
+    """Отмечает обращение пользователя: дата первого обращения + счётчик сообщений."""
+    c = _conn()
+    c.execute(
+        'UPDATE bot_users SET contact_count=contact_count+1, '
+        'first_contact_at=COALESCE(first_contact_at, ?) '
+        'WHERE bot_id=? AND user_id=?',
+        (_utc_now_str(), bot_id, user_id)
+    )
+    c.commit(); c.close()
+
+def db_add_username_history(bot_id, user_id, username):
+    """Запоминает обнаруженный username (с датами первой/последней встречи)."""
+    if not username:
+        return
+    c = _conn()
+    c.execute(
+        'INSERT INTO fs_username_history (bot_id, user_id, username, first_seen, last_seen) '
+        'VALUES (?,?,?,?,?) '
+        'ON CONFLICT(bot_id, user_id, username) DO UPDATE SET last_seen=excluded.last_seen',
+        (bot_id, user_id, username, _utc_now_str(), _utc_now_str())
+    )
+    c.commit(); c.close()
+
+def db_get_username_history(bot_id, user_id) -> list:
+    """Список username в порядке первого обнаружения."""
+    c = _conn()
+    rows = c.execute(
+        'SELECT username FROM fs_username_history WHERE bot_id=? AND user_id=? '
+        'ORDER BY id', (bot_id, user_id)
+    ).fetchall()
+    c.close()
+    return [r[0] for r in rows]
 
 def db_get_bot_users(bot_id):
     c = _conn()
@@ -634,3 +833,42 @@ def db_mark_coupon_used(user_id: int):
     c = _conn()
     c.execute('UPDATE free_coupons SET used=1 WHERE user_id=?', (user_id,))
     c.commit(); c.close()
+
+# ── Forum Support: агрегаты для еженедельных отчётов ──
+# Все метрики считаются точечными запросами по индексам за конкретный
+# период [from_ts, to_ts) (UTC, формат 'YYYY-MM-DD HH:MM:SS'), без полного скана.
+def db_fs_count_range(table: str, bot_id: int, from_ts: str, to_ts: str) -> int:
+    """Количество строк таблицы (bot_messages / fs_tickets / fs_admin_msgs) за период."""
+    if table not in ('bot_messages', 'fs_tickets', 'fs_admin_msgs'):
+        raise ValueError('bad table')
+    col = 'opened_at' if table == 'fs_tickets' else 'timestamp'
+    c = _conn()
+    n = c.execute(
+        f'SELECT COUNT(*) FROM {table} WHERE bot_id=? AND {col}>=? AND {col}<?',
+        (bot_id, from_ts, to_ts)
+    ).fetchone()[0]
+    c.close(); return n
+
+def db_fs_tickets_total(bot_id: int) -> int:
+    c = _conn()
+    n = c.execute('SELECT COUNT(*) FROM fs_tickets WHERE bot_id=?', (bot_id,)).fetchone()[0]
+    c.close(); return n
+
+def db_fs_new_users_range(bot_id: int, from_ts: str, to_ts: str) -> int:
+    c = _conn()
+    n = c.execute(
+        'SELECT COUNT(*) FROM bot_users WHERE bot_id=? AND registered_at>=? AND registered_at<?',
+        (bot_id, from_ts, to_ts)
+    ).fetchone()[0]
+    c.close(); return n
+
+def db_fs_users_total(bot_id: int) -> int:
+    c = _conn()
+    n = c.execute('SELECT COUNT(*) FROM bot_users WHERE bot_id=?', (bot_id,)).fetchone()[0]
+    c.close(); return n
+
+def db_fs_user_tickets_total(bot_id: int, user_id: int) -> int:
+    c = _conn()
+    n = c.execute('SELECT COUNT(*) FROM fs_tickets WHERE bot_id=? AND user_id=?',
+                  (bot_id, user_id)).fetchone()[0]
+    c.close(); return n

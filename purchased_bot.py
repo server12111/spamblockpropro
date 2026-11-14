@@ -21,7 +21,7 @@ from database import (db_add_user, db_get_bot_users, db_deactivate_bot, DBState,
                       db_set_primary_admin,
                       db_get_templates, db_add_template, db_del_template, db_get_template,
                       db_log_message, db_get_bot_msg_stats, db_get_last_user_messages,
-                      db_get_username,
+                      db_get_username, db_bump_user_contact,
                       db_is_marketplace_enabled,
                       db_get_bot_earnings, db_deduct_bot_earnings,
                       db_create_withdrawal, db_renew_bot,
@@ -29,22 +29,16 @@ from database import (db_add_user, db_get_bot_users, db_deactivate_bot, DBState,
 from keyboards import broadcast_type_kb, PE_MONEY, PE_CHECK, PE_GIFT, PE_FIRE, TE_MONEY, TE_CHECK, TE_FIRE, TE_ROCKET, TE_GIFT, TE_CROSS, TE_SEND, TE_BLOCK
 from config import SUPER_ADMIN, WITHDRAWAL_CHANNEL, BOT_USERNAME
 from payments import get_ton_amount
+from forum_support import register_forum_support, RATE_LIMIT_SEC, rate_limited
 
 log = logging.getLogger(__name__)
 
 running_bots    = {}  # {token: TeleBot}
 running_bot_ids = {}  # {db_bot_id: token}
 
-_rate_cache: dict = {}
-RATE_LIMIT_SEC = 15
-
 def _is_rate_limited(bot_id: int, user_id: int) -> bool:
-    key = (bot_id, user_id)
-    now = time.time()
-    if now - _rate_cache.get(key, 0) < RATE_LIMIT_SEC:
-        return True
-    _rate_cache[key] = now
-    return False
+    """Единый rate limit (кэш и логика в forum_support.rate_limited)."""
+    return rate_limited(bot_id, user_id, mark=True)
 
 def _safe_send(b, uid, text):
     try: b.send_message(uid, text, parse_mode='HTML'); return True
@@ -140,6 +134,12 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                     pbot.send_message(aid, header + "\n🎭 Стикер:",
                                       parse_mode='HTML', reply_markup=kb)
                     pbot.send_sticker(aid, m.sticker.file_id)
+                elif ct == 'animation':
+                    pbot.send_animation(aid, m.animation.file_id, caption=caption,
+                                        parse_mode='HTML', reply_markup=kb)
+                else:
+                    # контакты, геолокация, опросы и прочее — пересылка как есть
+                    pbot.forward_message(aid, m.chat.id, m.message_id)
         except Exception as e:
             log.error(f'send_media_to_admins error: {e}')
 
@@ -219,6 +219,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             _pbtn('Приветствие', style='primary', callback_data='p_edit_welcome'),
             _pbtn('Шаблоны',     style='primary', callback_data='p_admin_templates'),
         )
+        kb.add(_pbtn('Группа техподдержки', icon='💬', style='primary', callback_data='fs_group_menu'))
         kb.add(_pbtn('Заблокированные',     style='primary', callback_data='p_blocked_list'))
         kb.add(_pbtn('Управление админами', style='primary', callback_data='p_admins'))
         kb.add(_pbtn('Удалить бота',        style='danger',  callback_data='p_delete_bot'))
@@ -384,6 +385,10 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         pstate.pop(cb.from_user.id, None)
 
     # ── Отправить сообщение ────────────────────────────
+    # fs_route назначается в конце make_purchased_bot после регистрации
+    # обработчиков форум-режима; до этого обращения идут по стандартному пути.
+    fs_route = None
+
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_send')
     def p_user_send(cb):
         if db_is_blocked(db_bot_id, cb.from_user.id):
@@ -395,6 +400,29 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             parse_mode='HTML', reply_markup=pk_back())
         pstate[cb.from_user.id] = 'await_msg'
 
+    _seen_mg: dict = {}
+    _seen_mg_lock = threading.Lock()
+
+    def _mg_first_item(m) -> bool:
+        """True для любого не-альбомного сообщения и для ПЕРВОГО элемента альбома.
+        Элементы одного media_group приходят отдельными апдейтами — rate limit
+        применяется один раз на альбом, иначе альбом разрывается лимитом."""
+        mg = getattr(m, 'media_group_id', None)
+        if not mg:
+            return True
+        key = (db_bot_id, m.from_user.id, mg)
+        now = time.time()
+        with _seen_mg_lock:
+            if key in _seen_mg:
+                return False
+            _seen_mg[key] = now
+            if len(_seen_mg) > 500:
+                for k in [k for k, ts in _seen_mg.items() if now - ts > 120]:
+                    _seen_mg.pop(k, None)
+                if len(_seen_mg) > 500:
+                    _seen_mg.clear()
+            return True
+
     def _user_msg_checks(m) -> bool:
         """Общие проверки для всех входящих медиа. True = продолжать."""
         db_add_user(db_bot_id, m.from_user.id, m.from_user.username or '')
@@ -403,7 +431,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                 parse_mode='HTML')
             pstate.pop(m.from_user.id, None)
             return False
-        if _is_rate_limited(db_bot_id, m.from_user.id):
+        if _mg_first_item(m) and _is_rate_limited(db_bot_id, m.from_user.id):
             pbot.send_message(m.chat.id,
                 f"<b>⏳ Подожди {RATE_LIMIT_SEC} секунд перед следующим сообщением</b>",
                 parse_mode='HTML')
@@ -421,6 +449,11 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     @pbot.message_handler(func=lambda m: pstate.get(m.from_user.id) == 'await_msg')
     def p_user_text(m):
         if not _user_msg_checks(m): return
+        # Форум-режим: группа подключена → сообщение уходит в тему пользователя
+        if fs_route and fs_route(m):
+            pstate.pop(m.from_user.id, None)
+            return
+        db_bump_user_contact(db_bot_id, m.from_user.id)
         header = _make_header(m)
         send_to_admins(f"{header}\n\n💬 {m.text}", reply_markup=pk_reply(m.from_user.id))
         db_log_message(db_bot_id, m.from_user.id, m.text or '')
@@ -430,11 +463,17 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
 
     # ── Медиа ──────────────────────────────────────────
     @pbot.message_handler(
-        content_types=['photo', 'video', 'document', 'audio', 'voice', 'video_note', 'sticker'],
+        content_types=['photo', 'video', 'document', 'audio', 'voice',
+                       'video_note', 'sticker', 'animation', 'contact',
+                       'location', 'venue', 'poll', 'dice'],
         func=lambda m: pstate.get(m.from_user.id) == 'await_msg'
     )
     def p_user_media(m):
         if not _user_msg_checks(m): return
+        if fs_route and fs_route(m):
+            pstate.pop(m.from_user.id, None)
+            return
+        db_bump_user_contact(db_bot_id, m.from_user.id)
         send_media_to_admins(m, _make_header(m))
         db_log_message(db_bot_id, m.from_user.id, f'[{m.content_type}]')
         pbot.send_message(m.chat.id, "<b>✅ Сообщение отправлено</b>",
@@ -1037,6 +1076,12 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         sent    = sum(1 for uid in users if _safe_photo(pbot, uid, photo, caption))
         pbot.send_message(m.chat.id, f"<b>✅ Рассылка завершена: {sent}/{len(users)}</b>",
             parse_mode='HTML', reply_markup=pk_close())
+
+    # ── Forum Topics: техподдержка через группу с темами ─────────
+    # Регистрируется последним: все обработчики состояний выше имеют приоритет,
+    # форум-обработчики ловят только то, что не перехватили они.
+    fs_route = register_forum_support(pbot, db_bot_id, pstate, is_admin,
+                                      confirm_kb=pk_close)
 
     return pbot
 

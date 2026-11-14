@@ -9,6 +9,7 @@ from config import TOKEN, WEBHOOK_URL, WEBHOOK_PORT, SUPER_ADMIN
 from database import init_db, db_get_all_bots_for_checker
 from purchased_bot import launch_bot, running_bots
 from handlers import register, start_subscription_checker
+from forum_support import start_weekly_scheduler
 
 # ── Логування ────────────────────────────────────────
 _data_dir = os.getenv('DATA_DIR', '.')
@@ -55,6 +56,9 @@ if __name__ == '__main__':
     log.info(f'Started. Loaded {len(running_bots)} purchased bot(s), skipped {skipped_expired} expired.')
 
     start_subscription_checker(bot)
+
+    # Единый планировщик еженедельной статистики форум-групп (один поток на все боты)
+    start_weekly_scheduler()
 
     if WEBHOOK_URL:
         from flask import Flask, request, abort

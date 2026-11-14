@@ -17,3 +17,4 @@ WEBHOOK_URL         = os.getenv('WEBHOOK_URL', '')       # https://yourdomain.co
 WEBHOOK_PORT        = int(os.getenv('WEBHOOK_PORT', '8443'))
 WITHDRAWAL_CHANNEL  = int(os.getenv('WITHDRAWAL_CHANNEL', '0'))   # ID канала/чата для запросов на вывод
 BOT_USERNAME        = os.getenv('BOT_USERNAME', '')                # username главного бота (без @)
+STATS_TZ_OFFSET     = int(os.getenv('FS_STATS_TZ', '3'))           # часовой пояс еженедельной статистики (UTC+3)
