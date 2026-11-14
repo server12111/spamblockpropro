@@ -1,9 +1,12 @@
 import sqlite3
 import json
+import logging
 import os
 import threading
 from datetime import datetime, timedelta
 from config import PRICE_USDT
+
+log = logging.getLogger(__name__)
 
 _data_dir = os.getenv('DATA_DIR', '.')
 os.makedirs(_data_dir, exist_ok=True)
@@ -17,13 +20,32 @@ _tls = threading.local()
 
 class _CachedConn:
     """Обёртка: close() не закрывает кэшированное соединение, а откатывает
-    незавершённую транзакцию (чтобы чужая транзакция не держала блокировку)."""
-    __slots__ = ('_c', '_file_sig')
-    def __init__(self, c):
+    незавершённую транзакцию (чтобы чужая транзакция не держала блокировку).
+    При 'disk I/O error' соединение пересоздаётся и запрос повторяется."""
+    __slots__ = ('_c', '_file_sig', '_path')
+    def __init__(self, c, path):
         self._c = c
+        self._path = path
         self._file_sig = None
     def execute(self, *args, **kwargs):
-        return self._c.execute(*args, **kwargs)
+        try:
+            return self._c.execute(*args, **kwargs)
+        except sqlite3.OperationalError as e:
+            if 'disk i/o' not in str(e).lower():
+                raise
+            # файл/хранилище моргнуло: пересоздаём соединение и повторяем раз
+            log.warning('SQLite disk I/O error — пересоздаю соединение')
+            try:
+                self._c.close()
+            except Exception:
+                pass
+            self._c = sqlite3.connect(self._path, timeout=15)
+            try:
+                self._c.execute('PRAGMA busy_timeout=15000')
+            except Exception:
+                pass
+            self._file_sig = _file_signature(self._path)
+            return self._c.execute(*args, **kwargs)
     def commit(self):
         self._c.commit()
     def close(self):
@@ -64,7 +86,7 @@ def _conn():
             raw.execute('PRAGMA synchronous=NORMAL')
         except Exception:
             pass
-        c = _CachedConn(raw)
+        c = _CachedConn(raw, path)
         c._file_sig = _file_signature(path)
         conns[path] = c
     return c
@@ -76,7 +98,9 @@ def _utc_now_str() -> str:
 def init_db():
     conn = sqlite3.connect(DB_PATH, timeout=15)
     try:
-        conn.execute('PRAGMA journal_mode=WAL')
+        # WAL требует mmap (-shm) и на некоторых хостингах даёт 'disk I/O error' —
+        # используем классический journal-режим: надёжно на любом хранилище.
+        conn.execute('PRAGMA journal_mode=DELETE')
         conn.execute('PRAGMA busy_timeout=15000')
     except Exception:
         pass

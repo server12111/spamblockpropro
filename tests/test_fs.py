@@ -289,7 +289,7 @@ cols = {r[1] for r in c.execute('PRAGMA table_info(bot_users)').fetchall()}
 check('bot_users расширен', {'first_name', 'registered_at', 'first_contact_at',
                              'contact_count'} <= cols)
 mode = c.execute('PRAGMA journal_mode').fetchone()[0]
-check('WAL включён', mode.lower() == 'wal', mode)
+check('journal mode DELETE (надёжнее WAL на хостингах)', mode.lower() == 'delete', mode)
 idx = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
 check('индексы созданы', {'idx_fs_topics_thread', 'idx_fs_msgs_user',
                           'idx_fs_tickets_bot'} <= idx)
