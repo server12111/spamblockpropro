@@ -1097,6 +1097,16 @@ try:
     check('старый режим: админ получил ЛС с заголовком (сообщение ушло)', len(dm31) >= 1)
     check('старый режим: в группу ничего не ушло от пользователя 4003',
           not any(c[0] == 'copy_message' and c[1] and c[1][0] == -1001212121212
+    # регресс: DM-режим тоже учитывает обращения (fs_bump_ticket)
+    import sqlite3 as _sq
+    _c22 = _sq.connect(db.DB_PATH)
+    _tickets_4003 = _c22.execute('SELECT COUNT(*) FROM fs_tickets WHERE bot_id=31 AND user_id=4003').fetchone()[0]
+    _c22.close()
+    check('старый режим: обращение учтено в fs_tickets', _tickets_4003 >= 1)
+    # регресс: границы сегодня/неделя по таймзоне статистики
+    _s31 = db.db_get_bot_msg_stats(31)
+    check('статистика: границы сегодня/неделя по FS_STATS_TZ',
+          isinstance(_s31['today'], int) and isinstance(_s31['week'], int))
                   and str(c[1][1]) == '4003' for c in _api_log))
 finally:
     telebot.TeleBot.get_me = _orig_TeleBot_get_me
