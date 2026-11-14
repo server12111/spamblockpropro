@@ -60,6 +60,24 @@ if __name__ == '__main__':
     # Единый планировщик еженедельной статистики форум-групп (один поток на все боты)
     start_weekly_scheduler()
 
+    def _run_polling():
+        log.info('Running in polling mode.')
+
+        def _shutdown(signum, frame):
+            log.info(f'Signal {signum} received, stopping...')
+            bot.stop_polling()
+            for tok, b in list(running_bots.items()):
+                try:
+                    b.stop_polling()
+                except Exception:
+                    pass
+            sys.exit(0)
+
+        signal.signal(signal.SIGTERM, _shutdown)
+        signal.signal(signal.SIGINT, _shutdown)
+
+        bot.infinity_polling(skip_pending=False, timeout=60, long_polling_timeout=5)
+
     if WEBHOOK_URL:
         from flask import Flask, request, abort
 
@@ -78,25 +96,24 @@ if __name__ == '__main__':
         def index():
             return 'OK'
 
-        bot.remove_webhook()
-        bot.set_webhook(url=f'{WEBHOOK_URL}/{secret}')
-        log.info(f'Webhook set: {WEBHOOK_URL}/{secret}')
+        # Установка webhook с ретраями: сбой Telegram (502 и т.п.) не должен
+        # ронять процесс в crash-loop — при неудаче откатываемся в polling
+        webhook_ok = False
+        for attempt in range(1, 4):
+            try:
+                bot.set_webhook(url=f'{WEBHOOK_URL}/{secret}')
+                webhook_ok = True
+                log.info(f'Webhook set: {WEBHOOK_URL}/{secret}')
+                break
+            except Exception as e:
+                log.warning(f'Set webhook attempt {attempt}/3 failed: {e}')
+                time.sleep(5)
 
-        app.run(host='0.0.0.0', port=WEBHOOK_PORT, threaded=True)
+        if webhook_ok:
+            app.run(host='0.0.0.0', port=WEBHOOK_PORT, threaded=True)
+        else:
+            log.error('Webhook не установлен — переключаюсь в polling mode '
+                      '(webhook можно включить перезапуском позже).')
+            _run_polling()
     else:
-        log.info('Running in polling mode.')
-
-        def _shutdown(signum, frame):
-            log.info(f'Signal {signum} received, stopping...')
-            bot.stop_polling()
-            for tok, b in list(running_bots.items()):
-                try:
-                    b.stop_polling()
-                except Exception:
-                    pass
-            sys.exit(0)
-
-        signal.signal(signal.SIGTERM, _shutdown)
-        signal.signal(signal.SIGINT, _shutdown)
-
-        bot.infinity_polling(skip_pending=False, timeout=60, long_polling_timeout=5)
+        _run_polling()
