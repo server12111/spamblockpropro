@@ -18,9 +18,10 @@ _tls = threading.local()
 class _CachedConn:
     """Обёртка: close() не закрывает кэшированное соединение, а откатывает
     незавершённую транзакцию (чтобы чужая транзакция не держала блокировку)."""
-    __slots__ = ('_c',)
+    __slots__ = ('_c', '_file_sig')
     def __init__(self, c):
         self._c = c
+        self._file_sig = None
     def execute(self, *args, **kwargs):
         return self._c.execute(*args, **kwargs)
     def commit(self):
@@ -34,6 +35,13 @@ class _CachedConn:
     def __getattr__(self, name):
         return getattr(self._c, name)
 
+def _file_signature(path):
+    try:
+        st = os.stat(path)
+        return (st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
 def _conn():
     path = DB_PATH
     conns = getattr(_tls, 'conns', None)
@@ -41,6 +49,14 @@ def _conn():
         conns = {}
         _tls.conns = conns
     c = conns.get(path)
+    if c is not None:
+        # файл подменили (restore_db/бэкап)? — пересоздаём соединение
+        if _file_signature(path) != c._file_sig:
+            try:
+                c._c.close()
+            except Exception:
+                pass
+            c = None
     if c is None:
         raw = sqlite3.connect(path, timeout=15)
         try:
@@ -49,6 +65,7 @@ def _conn():
         except Exception:
             pass
         c = _CachedConn(raw)
+        c._file_sig = _file_signature(path)
         conns[path] = c
     return c
 

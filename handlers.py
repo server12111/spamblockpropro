@@ -1,11 +1,12 @@
 import os
+import html
 import telebot
 import time
 import threading
 import logging
 from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from config import SUPER_ADMIN, ADMIN_USERNAME, TON_WALLET, WITHDRAWAL_CHANNEL, BOT_USERNAME
+from config import SUPER_ADMIN, TON_WALLET, WITHDRAWAL_CHANNEL, BOT_USERNAME
 from database import (DB_PATH,
                        db_add_user, db_get_owner_bots, db_add_bot,
                        db_get_all_users, db_get_bot_users, db_get_stats,
@@ -272,7 +273,7 @@ def register(bot: telebot.TeleBot):
             except (ValueError, Exception):
                 pass
 
-        bot.send_message(m.chat.id, start_text(ADMIN_USERNAME),
+        bot.send_message(m.chat.id, start_text(),
             parse_mode='HTML', reply_markup=start_kb())
 
     # ── /admin ───────────────────────────────────────────
@@ -358,7 +359,7 @@ def register(bot: telebot.TeleBot):
     def back_to_start_cb(cb):
         state.pop(cb.from_user.id, None)
         db_del_pending(cb.from_user.id)
-        bot.edit_message_text(start_text(ADMIN_USERNAME),
+        bot.edit_message_text(start_text(),
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=start_kb())
 
@@ -408,10 +409,10 @@ def register(bot: telebot.TeleBot):
             return
         username = f"@{m.from_user.username}" if m.from_user.username else "нет"
         text = (f"<b>📥 Сообщение от:</b>\n"
-                f"👤 Имя: <b>{m.from_user.full_name}</b>\n"
-                f"🔗 Username: {username}\n"
+                f"👤 Имя: <b>{html.escape(m.from_user.full_name)}</b>\n"
+                f"🔗 Username: {html.escape(username)}\n"
                 f"🆔 ID: <code>{m.from_user.id}</code>\n\n"
-                f"💬 {m.text}")
+                f"💬 {html.escape(m.text or '')}")
         bot.send_message(SUPER_ADMIN, text, parse_mode='HTML', reply_markup=reply_kb(m.from_user.id))
         bot.send_message(m.chat.id, "<b>✅ Сообщение отправлено</b>",
             parse_mode='HTML', reply_markup=close_kb())
@@ -660,7 +661,7 @@ def register(bot: telebot.TeleBot):
                 f"• Указал комментарий: <code>{payment_code}</code>\n"
                 f"• Транзакция прошла подтверждение\n"
                 f"• Оплата не старше 2 часов\n\n"
-                f"Попробуй ещё раз через минуту или напиши {ADMIN_USERNAME}.",
+                f"Попробуй ещё раз через минуту. Если не получается — напиши прямо сюда, админ увидит.",
                 cb.message.chat.id, cb.message.message_id,
                 parse_mode='HTML', reply_markup=kb)
 
@@ -736,7 +737,7 @@ def register(bot: telebot.TeleBot):
                 parse_mode='HTML')
         else:
             bot.send_message(m.chat.id,
-                f"<b>❌ Ошибка запуска. Свяжись с {ADMIN_USERNAME}.</b>", parse_mode='HTML')
+                f"<b>❌ Ошибка запуска. Попробуй позже или напиши сюда — админ увидит.</b>", parse_mode='HTML')
 
     # ── Рассылка ─────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'broadcast')
@@ -1148,7 +1149,7 @@ def register(bot: telebot.TeleBot):
             bot.send_message(owner_id,
                 f"❌ <b>Запрос на вывод #{wr_id} отклонён.</b>\n\n"
                 f"Сумма <b>{usdt_amount} USDT</b> возвращена на твой баланс.\n"
-                f"Свяжись с {ADMIN_USERNAME} для уточнения.",
+                f"Свяжись с поддержкой через этого бота для уточнения.",
                 parse_mode='HTML')
         except Exception:
             pass

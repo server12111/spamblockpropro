@@ -1,3 +1,4 @@
+import html
 import telebot
 import threading
 import time
@@ -467,8 +468,8 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def _make_header(m) -> str:
         username = f"@{m.from_user.username}" if m.from_user.username else "нет"
         return (f"<b>📥 Сообщение от:</b>\n"
-                f"👤 Имя: <b>{m.from_user.full_name}</b>\n"
-                f"🔗 Username: {username}\n"
+                f"👤 Имя: <b>{html.escape(m.from_user.full_name)}</b>\n"
+                f"🔗 Username: {html.escape(username)}\n"
                 f"🆔 ID: <code>{m.from_user.id}</code>")
 
     # ── Текст ──────────────────────────────────────────
@@ -481,7 +482,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             return
         db_bump_user_contact(db_bot_id, m.from_user.id)
         header = _make_header(m)
-        send_to_admins(f"{header}\n\n💬 {m.text}", reply_markup=pk_reply(m.from_user.id))
+        send_to_admins(f"{header}\n\n💬 {html.escape(m.text or '')}", reply_markup=pk_reply(m.from_user.id))
         db_log_message(db_bot_id, m.from_user.id, m.text or '')
         pbot.send_message(m.chat.id, "<b>✅ Сообщение отправлено</b>",
             parse_mode='HTML', reply_markup=pk_close())
