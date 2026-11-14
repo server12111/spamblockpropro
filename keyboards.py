@@ -98,6 +98,8 @@ _ICON = {
     '👤': '5373012449597335010',
     '📥': '5433811242135331842',
     '📨': '5406631276042002796',
+    '📁': '5433653135799228968',
+    '📂': '5431721976769027887',
     '⌨️': '5472111548572900003',
     '🖼': '5375074927252621134',
     '📣': '5469903029144657419',
@@ -222,8 +224,8 @@ def super_admin_kb():
         _btn('Запросы на вывод',  icon='💲', style='danger',  callback_data='withdrawal_list'),
     )
     kb.row(
-        _btn('💾 Скачать БД',      style='primary', callback_data='backup_db'),
-        _btn('📂 Восстановить БД', style='danger',  callback_data='restore_db_btn'),
+        _btn('Скачать БД', icon='📁',      style='primary', callback_data='backup_db'),
+        _btn('Восстановить БД', icon='📂', style='danger',  callback_data='restore_db_btn'),
     )
     return kb
 
@@ -232,7 +234,7 @@ def super_admin_kb():
 def start_text():
     return (f"{TE_STAR} <b>Привет! Это бот для создания собственных ботов техподдержки</b>\n\n"
             f"{TE_CHAT} Купи подписку и получи своего бота для приёма обращений\n\n"
-            f"✉️ Также можешь просто написать сообщение — админ обязательно его увидит")
+            f"{TE_MAIL} Также можешь просто написать сообщение — админ обязательно его увидит")
 
 
 def buy_text():
