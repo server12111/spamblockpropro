@@ -10,3 +10,6 @@ __pycache__/
 .venv/
 venv/
 .claude/
+_animated_emoji_map.json
+_emoji_dump.txt
+_found_candidates.json
