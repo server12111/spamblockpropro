@@ -72,6 +72,28 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     pstate = DBState(db_bot_id)
     preply_cache = {}  # {admin_id: {'target_id': int, 'text': str}}
 
+    # Временные сбои Telegram (502/503/504, сеть) не должны засорять логи
+    # ERROR-трейсбеками: infinity_polling повторяет сам, пишем WARNING раз в 5 минут
+    _child_transient = [0]
+    def _child_exc_handler(e):
+        err_code = getattr(e, 'error_code', None)
+        s = str(e)
+        if (err_code in (502, 503, 504) or 'Bad Gateway' in s
+                or 'Read timed out' in s or 'Connection aborted' in s
+                or 'Max retries exceeded' in s):
+            now = time.time()
+            if now - _child_transient[0] > 300:
+                _child_transient[0] = now
+                log.warning(f'Bot #{db_bot_id}: Telegram API временно недоступен — '
+                            'polling продолжается автоматически')
+            return True
+        if '401' in s or 'Unauthorized' in s:
+            log.error(f'Bot #{db_bot_id} handler exception: {e}')
+            return True
+        log.error(f'Bot #{db_bot_id} handler exception: {e}', exc_info=True)
+        return True
+    pbot.exception_handler = _child_exc_handler
+
     def get_welcome():
         return db_get_bot_setting(db_bot_id, 'welcome', DEFAULT_WELCOME)
 

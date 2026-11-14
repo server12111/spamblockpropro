@@ -125,9 +125,23 @@ def register(bot: telebot.TeleBot):
     class _EH:
         def __init__(self):
             self._last_401_alert = 0
+            self._last_transient_log = 0
         def handle(self, e):
-            log.error(f'Handler exception: {e}', exc_info=True)
-            if '401' in str(e) or 'Unauthorized' in str(e):
+            err_code = getattr(e, 'error_code', None)
+            s = str(e)
+            # Временные сбои Telegram/сети: infinity_polling повторит сам —
+            # не спамим ERROR-трейсбеками, просто короткий WARNING раз в 5 минут
+            if (err_code in (502, 503, 504) or 'Bad Gateway' in s
+                    or 'Read timed out' in s or 'Connection aborted' in s
+                    or 'Max retries exceeded' in s):
+                now = time.time()
+                if now - self._last_transient_log > 300:
+                    self._last_transient_log = now
+                    log.warning('Telegram API временно недоступен (%s) — '
+                                'polling продолжается автоматически', s[:120])
+                return True
+            if '401' in s or 'Unauthorized' in s:
+                log.error(f'Handler exception: {e}')
                 now = time.time()
                 if now - self._last_401_alert > 3600:
                     self._last_401_alert = now
@@ -139,6 +153,8 @@ def register(bot: telebot.TeleBot):
                         'Проверь BOT_TOKEN в @BotFather и обнови .env / переменные окружения.\n'
                         + '='*60
                     )
+                return True
+            log.error(f'Handler exception: {e}', exc_info=True)
             return True
     bot.exception_handler = _EH()
 
