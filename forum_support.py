@@ -1101,7 +1101,7 @@ def queue_random_message(pbot, bot_id: int, m) -> None:
                         parse_mode='HTML', reply_markup=kb)
             # если фолбэк создал новое сообщение — обновляем id промпта,
             # чтобы счётчик очереди продолжал работать и после 48 часов
-            if isinstance(res, t.Message) and res.message_id != prompt_id:
+            if isinstance(res, telebot.types.Message) and res.message_id != prompt_id:
                 fs_set_prompt(bot_id, uid, res.message_id)
             return
         except ApiTelegramException as e:
