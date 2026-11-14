@@ -38,9 +38,7 @@ from database import (DB_PATH, _utc_now_str,
                       db_fs_new_users_range, db_fs_users_total,
                       db_fs_user_tickets_total)
 from config import STATS_TZ_OFFSET, RATE_LIMIT_SEC
-from keyboards import (_ICON, TE_BLOCK, TE_CHAT, TE_CHECK, TE_CROSS,
-                       TE_LINK, TE_SEND, TE_STATS, TE_USER, TE_NOTE,
-                       TE_CALENDAR)
+from keyboards import (_ICON, TE_BLOCK, TE_CALENDAR, TE_CHAT, TE_CHECK, TE_CLIP, TE_CLOCK, TE_CROSS, TE_EXCLAM, TE_ID, TE_LINK, TE_NOTE, TE_REFRESH, TE_SEND, TE_STATS, TE_USER)
 
 log = logging.getLogger(__name__)
 
@@ -453,8 +451,8 @@ def fs_info_text(bot_id: int, u) -> str:
     return (f"<b>{TE_USER} Информация о пользователе</b>\n\n"
             f"{TE_USER} Имя: <b>{esc(_full_name(u))}</b>\n"
             f"{TE_LINK} Username: {esc(username)}\n"
-            f"🆔 Telegram ID: <code>{uid}</code>\n\n"
-            f"📋 Ранее известные username:\n{hist_block}\n\n"
+            f"{TE_ID} Telegram ID: <code>{uid}</code>\n\n"
+            f"{TE_NOTE} Ранее известные username:\n{hist_block}\n\n"
             f"{TE_CALENDAR} Зарегистрирован в боте: {reg}\n"
             f"{TE_SEND} Первое обращение: {first}\n"
             f"{TE_STATS} Всего обращений: {_fmt_num(tickets)}\n"
@@ -897,7 +895,7 @@ def _notify_owner_error(pbot, bot_id: int, text: str, err):
         if owner and pbot:
             pbot.send_message(
                 owner,
-                f"⚠️ <b>Группа техподдержки</b>\n\n{text}\n\n"
+                f"{TE_EXCLAM} <b>Группа техподдержки</b>\n\n{text}\n\n"
                 f"<code>{html.escape(str(err)[:300])}</code>\n\n"
                 f"Проверь группу в /admin → {TE_CHAT} Группа техподдержки.",
                 parse_mode='HTML')
@@ -985,14 +983,14 @@ def fs_handle_group_message(pbot, bot_id: int, m, bot_self_id: int, pstate) -> N
             fs_log_admin_msg(bot_id, target_uid)
         else:
             _topic_notice(pbot, m.chat.id, thread,
-                          '⚠️ Не удалось доставить ответ: тип сообщения не поддерживается.')
+                          f'{TE_EXCLAM} Не удалось доставить ответ: тип сообщения не поддерживается.')
     except ApiTelegramException as e:
         if _is_bot_blocked(e):
             _topic_notice(pbot, m.chat.id, thread,
-                          '⚠️ Не удалось доставить ответ: пользователь заблокировал бота.')
+                          f'{TE_EXCLAM} Не удалось доставить ответ: пользователь заблокировал бота.')
         elif _is_chat_not_found(e):
             _topic_notice(pbot, m.chat.id, thread,
-                          '⚠️ Не удалось доставить ответ: пользователь недоступен.')
+                          f'{TE_EXCLAM} Не удалось доставить ответ: пользователь недоступен.')
         else:
             log.warning(f'admin reply bot#{bot_id} → {target_uid}: {e}')
             _topic_notice(pbot, m.chat.id, thread,
@@ -1052,10 +1050,10 @@ def _flush_admin_album(pbot, bot_id: int, key):
     except ApiTelegramException as e:
         if _is_bot_blocked(e):
             _topic_notice(pbot, buf['gid'], thread,
-                          '⚠️ Не удалось доставить ответ: пользователь заблокировал бота.')
+                          f'{TE_EXCLAM} Не удалось доставить ответ: пользователь заблокировал бота.')
         elif _is_chat_not_found(e):
             _topic_notice(pbot, buf['gid'], thread,
-                          '⚠️ Не удалось доставить ответ: пользователь недоступен.')
+                          f'{TE_EXCLAM} Не удалось доставить ответ: пользователь недоступен.')
         else:
             log.warning(f'admin album bot#{bot_id} → {target_uid}: {e}')
     except Exception as e:
@@ -1260,7 +1258,7 @@ def confirm_cancel(pbot, bot_id: int, cb) -> None:
     fs_delete_pending(bot_id, uid)
     pbot.answer_callback_query(cb.id, 'Очередь отменена')
     try:
-        pbot.edit_message_text('<b>🗑 Очередь отменена</b>',
+        pbot.edit_message_text(f'<b>{TE_CROSS} Очередь отменена</b>',
                                cb.message.chat.id, cb.message.message_id,
                                parse_mode='HTML')
     except Exception:
@@ -1356,7 +1354,7 @@ def _finish_connect(pbot, bot_id: int, uid: int, chat_id: int, title: str, pstat
         pbot.send_message(
             uid,
             f'{TE_CHECK} <b>Группа техподдержки подключена!</b>\n\n'
-            f'📌 {html.escape(title or "Группа")} (<code>{chat_id}</code>)\n\n'
+            f'{TE_CLIP} {html.escape(title or "Группа")} (<code>{chat_id}</code>)\n\n'
             'Теперь обращения пользователей создают отдельные темы.\n'
             'Чтобы ответить — просто напиши в теме пользователя '
             '(или через «Ответить» на его сообщение).\n'
@@ -1383,7 +1381,7 @@ def connect_start(pbot, bot_id: int, cb, pstate):
             '   • Перешли в этот чат любое сообщение из группы\n'
             '   • Или отправь в группу этот код (со своего аккаунта):\n'
             f'   <code>{code}</code>\n\n'
-            '⚠️ Группа должна быть супергруппой с включёнными темами.\n'
+            f'{TE_EXCLAM} Группа должна быть супергруппой с включёнными темами.\n'
             '💡 Если бот не видит код в группе — отключи Privacy Mode '
             'у бота в @BotFather (/setprivacy → Disable) и попробуй снова.\n'
             'Один бот = одна группа. Подключённая группа включит форум-режим.',
@@ -1434,7 +1432,7 @@ def menu_text(bot_id: int) -> str:
     g = fs_get_group(bot_id)
     if g:
         connected = (f'{TE_CHAT} <b>Группа техподдержки</b>\n\n'
-                     f'📌 {html.escape(g[2] or "Группа")} (<code>{g[1]}</code>)\n'
+                     f'{TE_CLIP} {html.escape(g[2] or "Группа")} (<code>{g[1]}</code>)\n'
                      f'{TE_CALENDAR} Подключена: {_fmt_dt_utc(g[4]) or "—"}\n\n'
                      'Режим: обращения пользователей создают темы в группе.\n'
                      'Ответы: любое твоё сообщение в теме пользователя уходит ему\n'
@@ -1454,7 +1452,7 @@ def menu_text(bot_id: int) -> str:
 def menu_kb(bot_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     if fs_get_group(bot_id):
-        kb.add(_fbtn('🔄 Сменить группу', callback_data='fs_connect'))
+        kb.add(_fbtn(f'{TE_REFRESH} Сменить группу', callback_data='fs_connect'))
         kb.add(_fbtn('Отключить группу', icon='❌', callback_data='fs_disconnect',
                                     style='danger'))
     else:
@@ -1516,7 +1514,7 @@ def fs_weekly_report_text(bot_id: int, start_tz: datetime, end_tz: datetime) -> 
             f'<b>{TE_CHAT}  Сообщения</b>\n'
             f'• Получено от пользователей: {_fmt_num(msgs_user)}\n'
             f'• Отправлено администраторами: {_fmt_num(msgs_admin)}\n\n'
-            f'🕒 Последнее обновление: {updated}')
+            f'{TE_CLOCK} Последнее обновление: {updated}')
 
 def _publish_period(pbot, bot_id: int, chat_id: int, thread_stats,
                     start_tz: datetime, end_tz: datetime) -> None:
