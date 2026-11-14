@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import threading
+import time
+import weakref
 from datetime import datetime, timedelta
 from config import PRICE_USDT
 
@@ -23,7 +25,7 @@ class _CachedConn:
     незавершённую транзакцию (чтобы чужая транзакция не держала блокировку).
     При 'disk I/O error' или закрытии извне (restore_db) соединение
     пересоздаётся, запрос повторяется."""
-    __slots__ = ('_c', '_file_sig', '_path')
+    __slots__ = ('_c', '_file_sig', '_path', '__weakref__')
     def __init__(self, c, path):
         self._c = c
         self._path = path
@@ -43,12 +45,18 @@ class _CachedConn:
         try:
             return self._c.execute(*args, **kwargs)
         except sqlite3.OperationalError as e:
-            if 'disk i/o' not in str(e).lower():
-                raise
-            # файл/хранилище моргнуло: пересоздаём соединение и повторяем раз
-            log.warning('SQLite disk I/O error — пересоздаю соединение')
-            self._reopen()
-            return self._c.execute(*args, **kwargs)
+            low = str(e).lower()
+            if 'disk i/o' in low:
+                # файл/хранилище моргнуло: пересоздаём соединение и повторяем раз
+                log.warning('SQLite disk I/O error — пересоздаю соединение')
+                self._reopen()
+                return self._c.execute(*args, **kwargs)
+            if 'database is locked' in low:
+                # busy_timeout не помог — открываем заново и пробуем ещё раз
+                time.sleep(0.5)
+                self._reopen()
+                return self._c.execute(*args, **kwargs)
+            raise
         except sqlite3.ProgrammingError as e:
             if 'closed database' not in str(e).lower():
                 raise
@@ -68,7 +76,7 @@ class _CachedConn:
 
 # Реестр всех соединений: db_close_all() закрывает их перед подменой файла БД
 # (restore_db), иначе на Windows файл не удалить под открытым дескриптором.
-_conns_registry = set()
+_conns_registry = weakref.WeakSet()
 
 def db_close_all():
     """Закрывает ВСЕ кэшированные соединения любых потоков. После вызова
@@ -331,6 +339,7 @@ def init_db():
         'ALTER TABLE bot_users ADD COLUMN registered_at TIMESTAMP',
         'ALTER TABLE bot_users ADD COLUMN first_contact_at TIMESTAMP',
         'ALTER TABLE bot_users ADD COLUMN contact_count INTEGER DEFAULT 0',
+        'ALTER TABLE states ADD COLUMN updated_at TIMESTAMP',
     ]:
         try:
             conn.execute(stmt); conn.commit()
@@ -596,8 +605,9 @@ def set_price(price: float):
 # ── Persistent States ─────────────────────────────────
 def db_set_state(bot_id: int, user_id: int, value):
     c = _conn()
-    c.execute('INSERT OR REPLACE INTO states (bot_id, user_id, state) VALUES (?,?,?)',
-              (bot_id, user_id, json.dumps(value, ensure_ascii=False)))
+    c.execute('INSERT OR REPLACE INTO states (bot_id, user_id, state, updated_at) '
+              'VALUES (?,?,?,?)',
+              (bot_id, user_id, json.dumps(value, ensure_ascii=False), _utc_now_str()))
     c.commit(); c.close()
 
 def db_get_state(bot_id: int, user_id: int):
@@ -937,3 +947,56 @@ def db_fs_user_tickets_total(bot_id: int, user_id: int) -> int:
     n = c.execute('SELECT COUNT(*) FROM fs_tickets WHERE bot_id=? AND user_id=?',
                   (bot_id, user_id)).fetchone()[0]
     c.close(); return n
+
+
+# ── Еженедельное обслуживание БД (долгий срок) ────────────────
+BACKUPS_TO_KEEP = 4
+
+def db_maintenance():
+    """Чистка служебных таблиц, которые иначе растут месяцами:
+    - fs_msgs (соответствия сообщений) старше 90 дней;
+    - fs_admin_msgs (статистика ответов) старше 180 дней;
+    - fs_pending (несоотв. очереди) старше 7 дней;
+    - states (состояния пользователей) старше 30 дней.
+    Пользовательские данные (bot_users, bot_messages, fs_tickets,
+    fs_username_history, fs_weekly_reports) НЕ трогаются."""
+    cutoff90 = (datetime.utcnow() - timedelta(days=90)).strftime('%Y-%m-%d %H:%M:%S')
+    cutoff180 = (datetime.utcnow() - timedelta(days=180)).strftime('%Y-%m-%d %H:%M:%S')
+    cutoff7 = (datetime.utcnow() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+    cutoff30 = (datetime.utcnow() - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+    c = _conn()
+    try:
+        c.execute('DELETE FROM fs_msgs WHERE created_at < ?', (cutoff90,))
+        c.execute('DELETE FROM fs_admin_msgs WHERE timestamp < ?', (cutoff180,))
+        c.execute("DELETE FROM fs_pending WHERE created_at < ? AND status='pending'", (cutoff7,))
+        c.execute('DELETE FROM states WHERE updated_at IS NOT NULL AND updated_at < ?', (cutoff30,))
+        c.commit()
+        log.info('db_maintenance: служебные таблицы почищены')
+    except Exception as e:
+        log.warning(f'db_maintenance: {e}')
+    finally:
+        c.close()
+
+def db_backup(dest_dir: str) -> str:
+    """Онлайн-бэкап через sqlite3 backup API (безопасен при живых соединениях).
+    Возвращает путь к файлу. Старые бэкапы: остаются BACKUPS_TO_KEEP шт."""
+    import glob as _glob
+    os.makedirs(dest_dir, exist_ok=True)
+    stamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    dest_path = os.path.join(dest_dir, f'spambots_{stamp}.db')
+    src = sqlite3.connect(DB_PATH, timeout=15)
+    dst = sqlite3.connect(dest_path)
+    try:
+        src.backup(dst)   # копирует согласованное состояние, не блокируя надолго
+        dst.close()
+        log.info(f'Бэкап БД создан: {dest_path}')
+    finally:
+        src.close()
+    # ротация: оставляем последние BACKUPS_TO_KEEP
+    backups = sorted(_glob.glob(os.path.join(dest_dir, 'spambots_*.db')))
+    for old in backups[:-BACKUPS_TO_KEEP]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    return dest_path

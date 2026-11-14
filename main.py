@@ -1,24 +1,28 @@
 import logging
+import logging.handlers
 import os
 import signal
 import sys
 import time
+import threading
 import telebot
 from datetime import datetime
 from config import TOKEN, WEBHOOK_URL, WEBHOOK_PORT, SUPER_ADMIN
-from database import init_db, db_get_all_bots_for_checker
+from database import init_db, db_get_all_bots_for_checker, DB_PATH
 from purchased_bot import launch_bot, running_bots
 from handlers import register, start_subscription_checker
 from forum_support import start_weekly_scheduler
 
-# ── Логування ────────────────────────────────────────
+# ── Логирование с ротацией: без неё bot.log за месяцы забьёт диск ──
 _data_dir = os.getenv('DATA_DIR', '.')
 os.makedirs(_data_dir, exist_ok=True)
+_log_file = os.path.join(_data_dir, 'bot.log')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     handlers=[
-        logging.FileHandler(os.path.join(_data_dir, 'bot.log'), encoding='utf-8'),
+        logging.handlers.RotatingFileHandler(_log_file, maxBytes=5 * 1024 * 1024,
+                                             backupCount=3, encoding='utf-8'),
         logging.StreamHandler(),
     ]
 )
@@ -59,6 +63,46 @@ if __name__ == '__main__':
 
     # Единый планировщик еженедельной статистики форум-групп (один поток на все боты)
     start_weekly_scheduler()
+
+    # ── Watchdog: мёртвый выключатель для долгой автономной работы ──
+    # Каждые 30 минут проверяет доступность БД свежим (некэшированным)
+    # соединением. 3 неудачи подряд -> жёсткий выход: хостинг перезапустит
+    # контейнер. Так "зависший" процесс не молчит неделями, а перезапускается.
+    def _start_watchdog():
+        import sqlite3 as _sq
+
+        def _probe():
+            c = _sq.connect(DB_PATH, timeout=5)
+            try:
+                c.execute('SELECT 1')
+            finally:
+                c.close()
+
+        def _loop():
+            fails = 0
+            heartbeat = os.path.join(_data_dir, 'heartbeat.txt')
+            while True:
+                time.sleep(1800)
+                try:
+                    _probe()
+                    fails = 0
+                    try:
+                        with open(heartbeat, 'w') as f:
+                            f.write(str(int(time.time())))
+                    except Exception:
+                        pass
+                except Exception as e:
+                    fails += 1
+                    log.warning(f'Watchdog: проба БД не прошла ({fails}/3): {e}')
+                    if fails >= 3:
+                        log.critical('Watchdog: БД недоступна 3 пробы подряд — '
+                                     'аварийный перезапуск процесса')
+                        os._exit(1)
+
+        threading.Thread(target=_loop, name='fs-watchdog', daemon=True).start()
+        log.info('Watchdog запущен (проба БД каждые 30 минут).')
+
+    _start_watchdog()
 
     def _run_polling():
         log.info('Running in polling mode.')
@@ -117,14 +161,25 @@ if __name__ == '__main__':
             try:
                 bot.set_webhook(url=f'{base}/{secret}')
                 webhook_ok = True
-                log.info(f'Webhook set: {base}/{secret}')
+                # секрет (производный от токена) в лог не пишем
+                log.info(f'Webhook set: {base}/***')
                 break
             except Exception as e:
                 log.warning(f'Set webhook attempt {attempt}/3 failed: {e}')
                 time.sleep(5)
 
         if webhook_ok:
-            app.run(host='0.0.0.0', port=WEBHOOK_PORT, threaded=True)
+            try:
+                app.run(host='0.0.0.0', port=WEBHOOK_PORT, threaded=True)
+            except OSError as e:
+                # порт занят (зомби-процесс и т.п.) — webhook всё равно не
+                # примет апдейты: снимаем его и уходим в polling, бот живёт
+                log.error(f'Порт {WEBHOOK_PORT} недоступен ({e}) — fallback в polling')
+                try:
+                    bot.delete_webhook()
+                except Exception:
+                    pass
+                _run_polling()
         else:
             log.error('Webhook не установлен — переключаюсь в polling mode '
                       '(webhook можно включить перезапуском позже).')

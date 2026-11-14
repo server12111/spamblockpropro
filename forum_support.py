@@ -1589,6 +1589,13 @@ def _weekly_loop():
         except Exception:
             log.exception('weekly scheduler loop error')
             time.sleep(120)
+        # еженедельное обслуживание БД сразу после публикации отчётов
+        try:
+            from database import db_maintenance, db_backup, DATA_DIR
+            db_maintenance()
+            db_backup(os.path.join(DATA_DIR, 'backups'))
+        except Exception:
+            log.exception('db maintenance failed')
 
 def start_weekly_scheduler():
     """Стартует единый фоновый поток еженедельной статистики (идемпотентно)."""
