@@ -39,7 +39,8 @@ from database import (DB_PATH, _utc_now_str,
                       db_fs_user_tickets_total)
 from config import STATS_TZ_OFFSET, RATE_LIMIT_SEC
 from keyboards import (_ICON, TE_BLOCK, TE_CHAT, TE_CHECK, TE_CROSS,
-                       TE_LINK, TE_SEND)
+                       TE_LINK, TE_SEND, TE_STATS, TE_USER, TE_NOTE,
+                       TE_CALENDAR)
 
 log = logging.getLogger(__name__)
 
@@ -449,14 +450,14 @@ def fs_info_text(bot_id: int, u) -> str:
     tickets = db_fs_user_tickets_total(bot_id, uid)
     msgs_cnt = info.get('contact_count', 0)
 
-    return (f"<b>👤 Информация о пользователе</b>\n\n"
-            f"👤 Имя: <b>{esc(_full_name(u))}</b>\n"
+    return (f"<b>{TE_USER} Информация о пользователе</b>\n\n"
+            f"{TE_USER} Имя: <b>{esc(_full_name(u))}</b>\n"
             f"{TE_LINK} Username: {esc(username)}\n"
             f"🆔 Telegram ID: <code>{uid}</code>\n\n"
             f"📋 Ранее известные username:\n{hist_block}\n\n"
-            f"📅 Зарегистрирован в боте: {reg}\n"
+            f"{TE_CALENDAR} Зарегистрирован в боте: {reg}\n"
             f"{TE_SEND} Первое обращение: {first}\n"
-            f"📊 Всего обращений: {_fmt_num(tickets)}\n"
+            f"{TE_STATS} Всего обращений: {_fmt_num(tickets)}\n"
             f"{TE_CHAT} Сообщений от пользователя: {_fmt_num(msgs_cnt)}")
 
 
@@ -1087,14 +1088,14 @@ def queue_random_message(pbot, bot_id: int, m) -> None:
     if cnt is None:
         try:
             pbot.send_message(m.chat.id,
-                              f'<b>📝 Очередь полна ({PENDING_MAX} сообщений) — '
+                              f'<b>{TE_NOTE} Очередь полна ({PENDING_MAX} сообщений) — '
                               'сначала отправь её администратору.</b>', parse_mode='HTML')
         except Exception:
             pass
         return
     text = f'<b>{TE_CHAT}  Отправить сообщение администратору?</b>'
     if cnt > 1:
-        text += f'\n\n📝 В очереди: <b>{cnt}</b> сообщений'
+        text += f'\n\n{TE_NOTE} В очереди: <b>{cnt}</b> сообщений'
     kb = _confirm_kb()
     if prompt_id:
         try:
@@ -1344,7 +1345,7 @@ def _finish_connect(pbot, bot_id: int, uid: int, chat_id: int, title: str, pstat
         try:
             pbot.send_message(uid,
                               f'{TE_CROSS} Группа подключена, но не удалось создать тему '
-                              '«📊 Статистика». Проверь право бота '
+                              f'«{TE_STATS} Статистика». Проверь право бота '
                               '«управление темами» и попробуй ещё раз.',
                               parse_mode='HTML')
         except Exception:
@@ -1359,7 +1360,7 @@ def _finish_connect(pbot, bot_id: int, uid: int, chat_id: int, title: str, pstat
             'Теперь обращения пользователей создают отдельные темы.\n'
             'Чтобы ответить — просто напиши в теме пользователя '
             '(или через «Ответить» на его сообщение).\n'
-            'Служебная тема «📊 Статистика» будет получать еженедельные отчёты.',
+            f'Служебная тема «{TE_STATS} Статистика» будет получать еженедельные отчёты.',
             parse_mode='HTML')
     except Exception:
         pass
@@ -1434,7 +1435,7 @@ def menu_text(bot_id: int) -> str:
     if g:
         connected = (f'{TE_CHAT} <b>Группа техподдержки</b>\n\n'
                      f'📌 {html.escape(g[2] or "Группа")} (<code>{g[1]}</code>)\n'
-                     f'📅 Подключена: {_fmt_dt_utc(g[4]) or "—"}\n\n'
+                     f'{TE_CALENDAR} Подключена: {_fmt_dt_utc(g[4]) or "—"}\n\n'
                      'Режим: обращения пользователей создают темы в группе.\n'
                      'Ответы: любое твоё сообщение в теме пользователя уходит ему\n'
                      '(и через «Ответить», и обычным сообщением).\n'
@@ -1505,8 +1506,8 @@ def fs_weekly_report_text(bot_id: int, start_tz: datetime, end_tz: datetime) -> 
     msgs_user = db_fs_count_range('bot_messages', bot_id, from_s, to_s)
     msgs_admin = db_fs_count_range('fs_admin_msgs', bot_id, from_s, to_s)
     updated = _now_tz().strftime('%d.%m.%Y %H:%M')
-    return (f'<b>📊 Статистика техподдержки</b>\n\n'
-            f'📅 Период: {disp_start} — {disp_end}\n\n'
+    return (f'<b>{TE_STATS} Статистика техподдержки</b>\n\n'
+            f'{TE_CALENDAR} Период: {disp_start} — {disp_end}\n\n'
             f'<b>{TE_SEND}  Обращения</b>\n'
             f'• За неделю: {_fmt_num(tickets_week)}\n'
             f'• За всё время: {_fmt_num(tickets_total)}\n'

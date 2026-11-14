@@ -37,7 +37,8 @@ from keyboards import (start_kb, back_to_start_kb, back_to_payment_kb, cancel_kb
                        TE_CHAT, TE_DIAMOND, TE_STAR, TE_MONEY, TE_CHECK, TE_ROCKET, TE_GIFT,
                        TE_FIRE, TE_CROSS, TE_SEND, TE_BLOCK, TE_CARD, TE_DOLLAR, TE_FREE,
                        TE_LINK,
-                       TE_LINK)
+                       TE_LINK, TE_STATS, TE_ROBOT, TE_HOURGLASS,
+                       TE_CALENDAR, TE_NOTE, TE_USER, TE_INBOX)
 from payments import (cb_create_invoice, cb_check_invoice,
                       get_ton_amount, ton_payment_link, ton_check_transfer)
 from purchased_bot import launch_bot, stop_bot, running_bots, running_bot_ids
@@ -249,7 +250,7 @@ def register(bot: telebot.TeleBot):
             state[uid] = 'await_bot_token'
             bot.edit_message_text(
                 f"{TE_CHECK} <b>Оплата получена!\n\n"
-                f"🤖 Введи токен своего бота (получи в @BotFather):</b>",
+                f"{TE_ROBOT} Введи токен своего бота (получи в @BotFather):</b>",
                 chat_id, message_id, parse_mode='HTML', reply_markup=cancel_kb())
 
     # ── /start ───────────────────────────────────────────
@@ -297,7 +298,7 @@ def register(bot: telebot.TeleBot):
         try:
             with open(DB_PATH, 'rb') as f:
                 bot.send_document(m.chat.id, f,
-                    caption=f"💾 Backup <code>spambots.db</code>\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                    caption=f"💾 Backup <code>spambots.db</code>\n{TE_CALENDAR} {datetime.now().strftime('%Y-%m-%d %H:%M')}",
                     parse_mode='HTML')
         except Exception as e:
             log.error(f'backup error: {e}')
@@ -343,7 +344,7 @@ def register(bot: telebot.TeleBot):
         try:
             with open(DB_PATH, 'rb') as f:
                 bot.send_document(cb.message.chat.id, f,
-                    caption=f"💾 Backup <code>spambots.db</code>\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                    caption=f"💾 Backup <code>spambots.db</code>\n{TE_CALENDAR} {datetime.now().strftime('%Y-%m-%d %H:%M')}",
                     parse_mode='HTML')
         except Exception as e:
             bot.answer_callback_query(cb.id, f"❌ Ошибка: {e}", show_alert=True)
@@ -411,12 +412,12 @@ def register(bot: telebot.TeleBot):
     def user_text(m):
         if _is_main_rate_limited(m.from_user.id):
             bot.send_message(m.chat.id,
-                f"<b>⏳ Подожди {MAIN_RATE_SEC} секунд перед следующим сообщением</b>",
+                f"<b>{TE_HOURGLASS} Подожди {MAIN_RATE_SEC} секунд перед следующим сообщением</b>",
                 parse_mode='HTML')
             return
         username = f"@{m.from_user.username}" if m.from_user.username else "нет"
-        text = (f"<b>📥 Сообщение от:</b>\n"
-                f"👤 Имя: <b>{html.escape(m.from_user.full_name)}</b>\n"
+        text = (f"<b>{TE_INBOX} Сообщение от:</b>\n"
+                f"{TE_USER} Имя: <b>{html.escape(m.from_user.full_name)}</b>\n"
                 f"{TE_LINK} Username: {html.escape(username)}\n"
                 f"🆔 ID: <code>{m.from_user.id}</code>\n\n"
                 f"{TE_CHAT} {html.escape(m.text or '')}")
@@ -429,7 +430,7 @@ def register(bot: telebot.TeleBot):
                                         and state[m.from_user.id].startswith('await_admin_msg_'))
     def admin_text(m):
         target_id = int(state[m.from_user.id].split('_')[-1])
-        bot.send_message(target_id, f"<b>📥 Сообщение от администратора\n\n{TE_CHAT} {m.text}</b>",
+        bot.send_message(target_id, f"<b>{TE_INBOX} Сообщение от администратора\n\n{TE_CHAT} {m.text}</b>",
             parse_mode='HTML')
         bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Ответ отправлен</b>",
             parse_mode='HTML', reply_markup=close_kb())
@@ -448,7 +449,7 @@ def register(bot: telebot.TeleBot):
             state[uid] = {'step': 'await_bot_token_free', 'days': coupon_days}
             bot.edit_message_text(
                 f"{TE_GIFT} <b>У тебя есть бесплатный купон на {coupon_days} дней!</b>\n\n"
-                f"🤖 Введи токен своего бота (получи в @BotFather):",
+                f"{TE_ROBOT} Введи токен своего бота (получи в @BotFather):",
                 cb.message.chat.id, cb.message.message_id,
                 parse_mode='HTML', reply_markup=cancel_kb())
             return
@@ -458,7 +459,7 @@ def register(bot: telebot.TeleBot):
             state[uid] = 'await_bot_token'
             bot.edit_message_text(
                 f"{TE_CHECK} <b>Оплата уже получена!\n\n"
-                "🤖 Введи токен своего бота (получи в @BotFather):</b>",
+                f"{TE_ROBOT} Введи токен своего бота (получи в @BotFather):</b>",
                 cb.message.chat.id, cb.message.message_id,
                 parse_mode='HTML', reply_markup=cancel_kb())
             return
@@ -552,7 +553,7 @@ def register(bot: telebot.TeleBot):
         state[uid] = 'await_bot_token_trial'
         bot.edit_message_text(
             f"{TE_GIFT} <b>Бесплатный пробный период (3 дня) активирован!\n\n"
-            "🤖 Введи токен своего бота (получи в @BotFather):</b>",
+            f"{TE_ROBOT} Введи токен своего бота (получи в @BotFather):</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=cancel_kb())
 
@@ -698,7 +699,7 @@ def register(bot: telebot.TeleBot):
                                   'trial': is_trial,
                                   'free_days': free_days}
         bot.send_message(m.chat.id,
-            "<b>👤 Теперь введи свой Telegram ID\n"
+            f"<b>{TE_USER} Теперь введи свой Telegram ID\n"
             "(сообщения от пользователей будут приходить именно тебе)\n\n"
             "Узнать свой ID: @userinfobot</b>",
             parse_mode='HTML', reply_markup=cancel_kb())
@@ -767,7 +768,7 @@ def register(bot: telebot.TeleBot):
         parts = cb.data.split('_')
         btype, scope = parts[1], parts[2]
         if btype == 'text':
-            bot.edit_message_text("<b>📝 Введи текст рассылки (HTML):</b>",
+            bot.edit_message_text(f"<b>{TE_NOTE} Введи текст рассылки (HTML):</b>",
                 cb.message.chat.id, cb.message.message_id, parse_mode='HTML')
             state[cb.from_user.id] = f'bcast_text_{scope}'
         else:
@@ -808,9 +809,9 @@ def register(bot: telebot.TeleBot):
             expires_at = row[4] if len(row) > 4 else None
             date = str(created_at)[:10] if created_at else '—'
             exp  = str(expires_at)[:10] if expires_at else '—'
-            lines.append(f"  {i}. Owner <code>{owner}</code> — {users_cnt} польз. | 📅 {date} | ⏳ {exp}")
-        text = (f"<b>📊 Статистика SpamBot</b>\n{'─'*28}\n"
-                f"🤖 Подключённых ботов: <b>{bots_count}</b>\n"
+            lines.append(f"  {i}. Owner <code>{owner}</code> — {users_cnt} польз. | {TE_CALENDAR} {date} | {TE_HOURGLASS} {exp}")
+        text = (f"<b>{TE_STATS} Статистика SpamBot</b>\n{'─'*28}\n"
+                f"{TE_ROBOT} Подключённых ботов: <b>{bots_count}</b>\n"
                 f"{TE_MONEY} Выручка за всё время: <b>~{revenue} USDT</b>\n"
                 f"{'─'*28}\n"
                 f"👥 Пользователей в главном боте: <b>{main_users}</b>\n"
@@ -830,7 +831,7 @@ def register(bot: telebot.TeleBot):
     def _show_bots_list(chat_id, message_id=None):
         bots_list = db_get_active_bots_list()
         if not bots_list:
-            text = "<b>🤖 Нет активных ботов</b>"
+            text = f"<b>{TE_ROBOT} Нет активных ботов</b>"
             if message_id:
                 bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=close_kb())
             else:
@@ -851,7 +852,7 @@ def register(bot: telebot.TeleBot):
             exp        = str(expires_at)[:10] if expires_at else '—'
             lines.append(
                 f"{status} <b>Bot #{bot_id}</b> | Owner: <code>{owner_id}</code> | "
-                f"{users_cnt} польз. | 📅 {date} | ⏳ {exp}"
+                f"{users_cnt} польз. | {TE_CALENDAR} {date} | {TE_HOURGLASS} {exp}"
             )
             kb.row(
                 _btn(f"⏹ #{bot_id}", style='danger',  callback_data=f'bot_stop_{bot_id}'),
@@ -859,7 +860,7 @@ def register(bot: telebot.TeleBot):
                 _btn(f"🗑 #{bot_id}", style='danger',  callback_data=f'bot_delete_{bot_id}'),
             )
         kb.add(_btn('Закрыть', icon='❌', style='danger', callback_data='close'))
-        text = "<b>🤖 Управление ботами</b>\n\n" + "\n".join(lines)
+        text = f"<b>{TE_ROBOT} Управление ботами</b>\n\n" + "\n".join(lines)
         if message_id:
             bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
         else:

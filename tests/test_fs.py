@@ -441,7 +441,7 @@ check('тема пользователя создана', fs.fs_get_topic(1, 555
 # закреплённое инфо-сообщение
 pins = [c for c in fb3.calls if c[0] == 'pin_chat_message']
 check('инфо-сообщение закреплено', len(pins) == 1)
-info_sends = [c for c in fb3.calls if c[0] == 'send_message' and c[1][1].startswith('<b>👤')]
+info_sends = [c for c in fb3.calls if c[0] == 'send_message' and 'Информация о пользователе' in str(c[1])]
 check('инфо-сообщение содержит данные', len(info_sends) == 1)
 check('экранирование: имя в HTML', 'Тест' in info_sends[0][1][1] and '<code>555</code>' in info_sends[0][1][1])
 # повторное обращение → та же тема, без нового пина
