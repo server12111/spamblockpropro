@@ -35,7 +35,9 @@ from keyboards import (start_kb, back_to_start_kb, back_to_payment_kb, cancel_kb
                        start_text, buy_text,
                        PE_FIRE, PE_DIAMOND, PE_STAR, PE_ROCKET, PE_GIFT, PE_CHECK, PE_MONEY,
                        TE_CHAT, TE_DIAMOND, TE_STAR, TE_MONEY, TE_CHECK, TE_ROCKET, TE_GIFT,
-                       TE_FIRE, TE_CROSS, TE_SEND, TE_BLOCK, TE_CARD, TE_DOLLAR, TE_FREE)
+                       TE_FIRE, TE_CROSS, TE_SEND, TE_BLOCK, TE_CARD, TE_DOLLAR, TE_FREE,
+                       TE_LINK,
+                       TE_LINK)
 from payments import (cb_create_invoice, cb_check_invoice,
                       get_ton_amount, ton_payment_link, ton_check_transfer)
 from purchased_bot import launch_bot, stop_bot, running_bots, running_bot_ids
@@ -203,7 +205,7 @@ def register(bot: telebot.TeleBot):
                 disc = db_get_discount_count(referrer)
                 bot.send_message(referrer,
                     f"🎉 <b>Твой реферал оплатил подписку!</b>\n\n"
-                    f"💎 Накоплено скидок: <b>{disc}</b>\n"
+                    f"{TE_DIAMOND} Накоплено скидок: <b>{disc}</b>\n"
                     f"Каждая скидка = 1 бесплатное продление на 10 дней.\n"
                     f"Используй при следующей оплате через кнопку «🛒 Купить бота».",
                     parse_mode='HTML')
@@ -222,7 +224,7 @@ def register(bot: telebot.TeleBot):
                         f"{TE_MONEY} <b>Новая комиссия!</b>\n\n"
                         f"Пользователь купил бота через твой бот.\n"
                         f"Начислено: <b>{commission} USDT</b> (50%)\n\n"
-                        f"Баланс: смотри в /admin своего бота → 💰 Мой баланс",
+                        f"Баланс: смотри в /admin своего бота → {TE_MONEY} Мой баланс",
                         parse_mode='HTML')
                 except Exception:
                     pass
@@ -415,9 +417,9 @@ def register(bot: telebot.TeleBot):
         username = f"@{m.from_user.username}" if m.from_user.username else "нет"
         text = (f"<b>📥 Сообщение от:</b>\n"
                 f"👤 Имя: <b>{html.escape(m.from_user.full_name)}</b>\n"
-                f"🔗 Username: {html.escape(username)}\n"
+                f"{TE_LINK} Username: {html.escape(username)}\n"
                 f"🆔 ID: <code>{m.from_user.id}</code>\n\n"
-                f"💬 {html.escape(m.text or '')}")
+                f"{TE_CHAT} {html.escape(m.text or '')}")
         bot.send_message(SUPER_ADMIN, text, parse_mode='HTML', reply_markup=reply_kb(m.from_user.id))
         bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Сообщение отправлено</b>",
             parse_mode='HTML', reply_markup=close_kb())
@@ -427,7 +429,7 @@ def register(bot: telebot.TeleBot):
                                         and state[m.from_user.id].startswith('await_admin_msg_'))
     def admin_text(m):
         target_id = int(state[m.from_user.id].split('_')[-1])
-        bot.send_message(target_id, f"<b>📥 Сообщение от администратора\n\n💬 {m.text}</b>",
+        bot.send_message(target_id, f"<b>📥 Сообщение от администратора\n\n{TE_CHAT} {m.text}</b>",
             parse_mode='HTML')
         bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Ответ отправлен</b>",
             parse_mode='HTML', reply_markup=close_kb())
@@ -474,7 +476,7 @@ def register(bot: telebot.TeleBot):
                     try:
                         exp       = datetime.fromisoformat(str(expires_at))
                         days_left = (exp - datetime.now()).days
-                        exp_str   = f"истекает через {days_left}д." if days_left > 0 else "❌ истёк"
+                        exp_str   = f"истекает через {days_left}д." if days_left > 0 else f"{TE_CROSS} истёк"
                     except Exception:
                         exp_str = "—"
                 else:
@@ -529,11 +531,11 @@ def register(bot: telebot.TeleBot):
         username = _get_bot_username()
         ref_link = f"https://t.me/{username}?start=ref_{uid}" if username else f"start=ref_{uid}"
         bot.send_message(uid,
-            f"🔗 <b>Твоя реферальная ссылка:</b>\n"
+            f"{TE_LINK} <b>Твоя реферальная ссылка:</b>\n"
             f"<code>{ref_link}</code>\n\n"
             f"За каждого приведённого клиента, который оплатит подписку, "
             f"ты получишь 1 бесплатное продление на 10 дней.\n\n"
-            f"💎 Накоплено скидок: <b>{disc}</b>",
+            f"{TE_DIAMOND} Накоплено скидок: <b>{disc}</b>",
             parse_mode='HTML', reply_markup=close_kb())
         bot.answer_callback_query(cb.id)
 
@@ -576,7 +578,7 @@ def register(bot: telebot.TeleBot):
             return
         db_set_pending(cb.from_user.id, invoice['invoice_id'])
         bot.edit_message_text(
-            f"<b>💳 Оплата через CryptoBot</b>\n\n"
+            f"<b>{TE_CARD} Оплата через CryptoBot</b>\n\n"
             f"Сумма: <b>{get_price()} USDT</b>\n\n"
             f"Нажми кнопку ниже, оплати и вернись сюда — нажми «Проверить оплату».",
             cb.message.chat.id, cb.message.message_id,
@@ -616,7 +618,7 @@ def register(bot: telebot.TeleBot):
         kb.add(_btn('Я оплатил — проверить', icon='✔️', style='success', callback_data='ton_check_auto'))
         kb.add(_btn('Назад', icon='🔙', callback_data='back_to_payment'))
         bot.edit_message_text(
-            f"<b>💎 Оплата через TON Keeper</b>\n\n"
+            f"<b>{TE_DIAMOND} Оплата через TON Keeper</b>\n\n"
             f"Сумма: <b>{ton_amount} TON</b> (~${get_price()})\n\n"
             f"Нажми кнопку ниже — TON Keeper откроется с уже заполненной суммой, адресом и комментарием.\n\n"
             f"Адрес (вручную):\n<code>{TON_WALLET}</code>\n\n"
@@ -809,7 +811,7 @@ def register(bot: telebot.TeleBot):
             lines.append(f"  {i}. Owner <code>{owner}</code> — {users_cnt} польз. | 📅 {date} | ⏳ {exp}")
         text = (f"<b>📊 Статистика SpamBot</b>\n{'─'*28}\n"
                 f"🤖 Подключённых ботов: <b>{bots_count}</b>\n"
-                f"💰 Выручка за всё время: <b>~{revenue} USDT</b>\n"
+                f"{TE_MONEY} Выручка за всё время: <b>~{revenue} USDT</b>\n"
                 f"{'─'*28}\n"
                 f"👥 Пользователей в главном боте: <b>{main_users}</b>\n"
                 f"👥 Всего пользователей (все боты): <b>{total_users}</b>\n"
@@ -934,7 +936,7 @@ def register(bot: telebot.TeleBot):
             _btn(f"🗑 Да, удалить Bot #{bot_id}", style='danger',
                  callback_data=f'bot_delete_yes_{bot_id}'),
         )
-        kb.add(_btn('❌ Отмена', icon='❌', callback_data=f'bot_delete_no_{bot_id}'))
+        kb.add(_btn('Отмена', icon='❌', callback_data=f'bot_delete_no_{bot_id}'))
         bot.edit_message_text(
             f"{TE_BLOCK} <b>Удаление Bot #{bot_id}</b>\n\n"
             f"• Бот будет остановлен и отключён\n"
@@ -949,7 +951,7 @@ def register(bot: telebot.TeleBot):
     def set_price_cb(cb):
         if cb.from_user.id != SUPER_ADMIN: return
         bot.edit_message_text(
-            f"<b>💰 Текущая цена: {get_price()} USDT</b>\n\n"
+            f"<b>{TE_MONEY} Текущая цена: {get_price()} USDT</b>\n\n"
             f"Введи новую цену (например: 5 или 9.99):",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=back_to_start_kb())
@@ -1156,8 +1158,8 @@ def register(bot: telebot.TeleBot):
                      f"Адрес: <code>{ton_address}</code>\n"
                      f"Сумма: <b>{usdt_amount} USDT</b> | {date}\n\n")
             kb.row(
-                _btn(f"✅ #{wr_id}", style='success', callback_data=f'wr_confirm_{wr_id}'),
-                _btn(f"❌ #{wr_id}", style='danger',  callback_data=f'wr_reject_{wr_id}'),
+                _btn(f"{TE_CHECK} #{wr_id}", style='success', callback_data=f'wr_confirm_{wr_id}'),
+                _btn(f"{TE_CROSS} #{wr_id}", style='danger',  callback_data=f'wr_reject_{wr_id}'),
             )
         kb.add(_btn('Назад', icon='🔙', callback_data='back_admin_panel'))
         if message_id:

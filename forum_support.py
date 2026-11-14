@@ -451,13 +451,13 @@ def fs_info_text(bot_id: int, u) -> str:
 
     return (f"<b>👤 Информация о пользователе</b>\n\n"
             f"👤 Имя: <b>{esc(_full_name(u))}</b>\n"
-            f"🔗 Username: {esc(username)}\n"
+            f"{TE_LINK} Username: {esc(username)}\n"
             f"🆔 Telegram ID: <code>{uid}</code>\n\n"
             f"📋 Ранее известные username:\n{hist_block}\n\n"
             f"📅 Зарегистрирован в боте: {reg}\n"
-            f"📩 Первое обращение: {first}\n"
+            f"{TE_SEND} Первое обращение: {first}\n"
             f"📊 Всего обращений: {_fmt_num(tickets)}\n"
-            f"💬 Сообщений от пользователя: {_fmt_num(msgs_cnt)}")
+            f"{TE_CHAT} Сообщений от пользователя: {_fmt_num(msgs_cnt)}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -898,7 +898,7 @@ def _notify_owner_error(pbot, bot_id: int, text: str, err):
                 owner,
                 f"⚠️ <b>Группа техподдержки</b>\n\n{text}\n\n"
                 f"<code>{html.escape(str(err)[:300])}</code>\n\n"
-                f"Проверь группу в /admin → 💬 Группа техподдержки.",
+                f"Проверь группу в /admin → {TE_CHAT} Группа техподдержки.",
                 parse_mode='HTML')
     except Exception as e:
         log.warning(f'notify owner bot#{bot_id}: {e}')
@@ -995,7 +995,7 @@ def fs_handle_group_message(pbot, bot_id: int, m, bot_self_id: int, pstate) -> N
         else:
             log.warning(f'admin reply bot#{bot_id} → {target_uid}: {e}')
             _topic_notice(pbot, m.chat.id, thread,
-                          '❌ Ошибка доставки ответа пользователю.')
+                          f'{TE_CROSS} Ошибка доставки ответа пользователю.')
     except Exception as e:
         log.warning(f'admin reply bot#{bot_id} → {target_uid}: {e}')
 
@@ -1125,9 +1125,9 @@ def _fbtn(text, icon=None, style=None, **kwargs):
 
 def _confirm_kb():
     kb = InlineKeyboardMarkup()
-    kb.add(_fbtn('📩 Отправить администратору', icon='📤', style='primary',
+    kb.add(_fbtn('Отправить администратору', icon='📤', style='primary',
                  callback_data='fs_confirm_send'))
-    kb.add(_fbtn('❌ Отменить', icon='❌', style='danger', callback_data='fs_confirm_cancel'))
+    kb.add(_fbtn('Отменить', icon='❌', style='danger', callback_data='fs_confirm_cancel'))
     return kb
 
 
@@ -1278,34 +1278,34 @@ def fs_verify_group(pbot, chat_id: int, uid: int, bot_self_id: int, bot_id: int 
     try:
         chat = _api(pbot.get_chat, chat_id)
     except Exception:
-        return False, ('❌ Не удалось получить информацию о чате. '
+        return False, (f'{TE_CROSS} Не удалось получить информацию о чате. '
                        'Убедись, что бот добавлен в группу.')
     if getattr(chat, 'type', '') != 'supergroup':
-        return False, ('❌ Группа должна быть <b>супергруппой</b>. '
+        return False, (f'{TE_CROSS} Группа должна быть <b>супергруппой</b>. '
                        'Обычную группу нужно преобразовать (добавь любую тему/создай новую).')
     if not getattr(chat, 'is_forum', False):
-        return False, ('❌ В группе не включены <b>темы</b>.\n'
+        return False, (f'{TE_CROSS} В группе не включены <b>темы</b>.\n'
                        'Включи: настройки группы → «Темы» → Включить.')
     try:
         me = _api(pbot.get_chat_member, chat_id, bot_self_id)
     except Exception:
-        return False, '❌ Бот не состоит в этой группе.'
+        return False, f'{TE_CROSS} Бот не состоит в этой группе.'
     if getattr(me, 'status', '') != 'administrator':
-        return False, '❌ Назначь бота <b>администратором</b> группы.'
+        return False, f'{TE_CROSS} Назначь бота <b>администратором</b> группы.'
     if not (getattr(me, 'can_manage_topics', False) and getattr(me, 'can_pin_messages', False)):
-        return False, ('❌ У бота нет нужных прав.\nВыдай: '
+        return False, (f'{TE_CROSS} У бота нет нужных прав.\nВыдай: '
                        '<b>управление темами</b> + <b>закрепление сообщений</b>.')
     try:
         member = _api(pbot.get_chat_member, chat_id, uid)
     except Exception:
-        return False, '❌ Не удалось проверить твои права в группе.'
+        return False, f'{TE_CROSS} Не удалось проверить твои права в группе.'
     if getattr(member, 'status', '') not in ('creator', 'administrator'):
-        return False, ('❌ Подключать группу может только её '
+        return False, (f'{TE_CROSS} Подключать группу может только её '
                        '<b>владелец или администратор</b>.')
     if bot_id is not None:
         other = fs_get_group_by_chat(chat_id)
         if other and other[0] != bot_id:
-            return False, ('❌ Эта группа уже подключена к другому боту '
+            return False, (f'{TE_CROSS} Эта группа уже подключена к другому боту '
                            f'(Bot #{other[0]}).')
     return True, ''
 
@@ -1329,7 +1329,7 @@ def _finish_connect(pbot, bot_id: int, uid: int, chat_id: int, title: str, pstat
         fs_bind_group(bot_id, chat_id, title)
     except sqlite3.IntegrityError:
         try:
-            pbot.send_message(uid, '❌ Эта группа уже подключена к другому боту.',
+            pbot.send_message(uid, f'{TE_CROSS} Эта группа уже подключена к другому боту.',
                               parse_mode='HTML')
         except Exception:
             pass
@@ -1343,7 +1343,7 @@ def _finish_connect(pbot, bot_id: int, uid: int, chat_id: int, title: str, pstat
         log.warning(f'stats topic create bot#{bot_id}: {e}')
         try:
             pbot.send_message(uid,
-                              '❌ Группа подключена, но не удалось создать тему '
+                              f'{TE_CROSS} Группа подключена, но не удалось создать тему '
                               '«📊 Статистика». Проверь право бота '
                               '«управление темами» и попробуй ещё раз.',
                               parse_mode='HTML')
@@ -1370,7 +1370,7 @@ def connect_start(pbot, bot_id: int, cb, pstate):
     code = _gen_code()
     pstate[uid] = {'step': 'fs_connect', 'code': code}
     kb = InlineKeyboardMarkup()
-    kb.add(_fbtn('❌ Отмена', icon='❌', callback_data='fs_connect_cancel'))
+    kb.add(_fbtn('Отмена', icon='❌', callback_data='fs_connect_cancel'))
     try:
         pbot.edit_message_text(
             f'<b>{TE_LINK}  Подключение группы техподдержки</b>\n\n'
@@ -1404,9 +1404,9 @@ def connect_cancel(pbot, bot_id: int, cb, pstate):
 
 def disconnect_confirm(pbot, bot_id: int, cb):
     kb = InlineKeyboardMarkup()
-    kb.add(_fbtn('✅ Да, отключить', icon='✔️', callback_data='fs_disconnect_yes',
+    kb.add(_fbtn('Да, отключить', icon='✔️', callback_data='fs_disconnect_yes',
                                 style='danger'))
-    kb.add(_fbtn('❌ Отмена', icon='❌', callback_data='fs_group_menu'))
+    kb.add(_fbtn('Отмена', icon='❌', callback_data='fs_group_menu'))
     try:
         pbot.edit_message_text(
             f'<b>{TE_CROSS}  Отключение группы техподдержки</b>\n\n'
@@ -1432,7 +1432,7 @@ def disconnect_yes(pbot, bot_id: int, cb):
 def menu_text(bot_id: int) -> str:
     g = fs_get_group(bot_id)
     if g:
-        connected = (f'💬 <b>Группа техподдержки</b>\n\n'
+        connected = (f'{TE_CHAT} <b>Группа техподдержки</b>\n\n'
                      f'📌 {html.escape(g[2] or "Группа")} (<code>{g[1]}</code>)\n'
                      f'📅 Подключена: {_fmt_dt_utc(g[4]) or "—"}\n\n'
                      'Режим: обращения пользователей создают темы в группе.\n'
@@ -1440,7 +1440,7 @@ def menu_text(bot_id: int) -> str:
                      '(и через «Ответить», и обычным сообщением).\n'
                      'Ответ на закреплённое инфо = внутренняя заметка.')
     else:
-        connected = ('💬 <b>Группа техподдержки</b>\n\n'
+        connected = (f'{TE_CHAT} <b>Группа техподдержки</b>\n\n'
                      'Группа не подключена.\n'
                      'Сейчас обращения приходят администраторам в личные сообщения.\n\n'
                      'Подключив группу с темами, ты получишь:\n'
@@ -1454,12 +1454,12 @@ def menu_kb(bot_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     if fs_get_group(bot_id):
         kb.add(_fbtn('🔄 Сменить группу', callback_data='fs_connect'))
-        kb.add(_fbtn('❌ Отключить группу', icon='❌', callback_data='fs_disconnect',
+        kb.add(_fbtn('Отключить группу', icon='❌', callback_data='fs_disconnect',
                                     style='danger'))
     else:
-        kb.add(_fbtn('🔗 Подключить группу', icon='🔗', callback_data='fs_connect',
+        kb.add(_fbtn('Подключить группу', icon='🔗', callback_data='fs_connect',
                                     style='primary'))
-    kb.add(_fbtn('🔙 Назад', icon='🔙', callback_data='p_back_admin'))
+    kb.add(_fbtn('Назад', icon='🔙', callback_data='p_back_admin'))
     return kb
 
 def menu_show(pbot, bot_id: int, cb):
@@ -1673,7 +1673,7 @@ def register_forum_support(pbot, bot_id: int, pstate, is_admin, confirm_kb=_conf
             elif m.text and m.text.strip().upper().endswith(st.get('code', '@@')):
                 try:
                     pbot.send_message(m.chat.id,
-                                      '❌ Код нужно отправить <b>в саму группу</b>, '
+                                      f'{TE_CROSS} Код нужно отправить <b>в саму группу</b>, '
                                       'а не сюда.', parse_mode='HTML')
                 except Exception:
                     pass

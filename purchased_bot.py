@@ -27,7 +27,7 @@ from database import (db_add_user, db_get_bot_users, db_deactivate_bot, DBState,
                       db_get_bot_earnings, db_deduct_bot_earnings,
                       db_create_withdrawal, db_renew_bot,
                       db_return_bot_earnings)
-from keyboards import broadcast_type_kb, PE_MONEY, PE_CHECK, PE_GIFT, PE_FIRE, TE_MONEY, TE_CHECK, TE_FIRE, TE_ROCKET, TE_GIFT, TE_CROSS, TE_SEND, TE_BLOCK, TE_CHAT
+from keyboards import broadcast_type_kb, PE_MONEY, PE_CHECK, PE_GIFT, PE_FIRE, TE_MONEY, TE_CHECK, TE_FIRE, TE_ROCKET, TE_GIFT, TE_CROSS, TE_SEND, TE_BLOCK, TE_CHAT, TE_LINK, TE_DIAMOND
 from config import SUPER_ADMIN, WITHDRAWAL_CHANNEL, BOT_USERNAME
 from payments import get_ton_amount
 from forum_support import register_forum_support, RATE_LIMIT_SEC, rate_limited
@@ -112,7 +112,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             if days_left > 0:
                 return f"{str(raw)[:10]} (осталось {days_left}д.)"
             else:
-                return f"{str(raw)[:10]} ❌ истекла"
+                return f"{str(raw)[:10]} {TE_CROSS} истекла"
         except Exception:
             return '—'
 
@@ -133,7 +133,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def send_media_to_admins(m, header):
         """Forward any media type to all admins with user info header."""
         kb = pk_reply(m.from_user.id)
-        caption = header + (f"\n\n💬 {m.caption}" if m.caption else "")
+        caption = header + (f"\n\n{TE_CHAT} {m.caption}" if m.caption else "")
         ct = m.content_type
         try:
             for aid in db_get_bot_admins(db_bot_id):
@@ -285,7 +285,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         pbot.send_message(m.chat.id,
             f"<b>📊 Статус бота</b>\n\n"
             f"👥 Пользователей: <b>{users_cnt}</b>\n"
-            f"🚫 Заблокированных: <b>{blocked_cnt}</b>\n"
+            f"{TE_BLOCK} Заблокированных: <b>{blocked_cnt}</b>\n"
             f"👤 Администраторов: <b>{admins_cnt}</b>\n"
             f"📅 Дата создания: <b>{created_at}</b>\n"
             f"⏳ Подписка до: <b>{_get_exp_str()}</b>\n"
@@ -330,10 +330,10 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         s = db_get_bot_msg_stats(db_bot_id)
         pbot.edit_message_text(
             f"<b>📊 Статистика бота</b>\n\n"
-            f"📩 Сообщений сегодня: <b>{s['today']}</b>\n"
+            f"{TE_SEND} Сообщений сегодня: <b>{s['today']}</b>\n"
             f"📨 Сообщений за неделю: <b>{s['week']}</b>\n"
             f"👥 Уникальных пользователей: <b>{s['total_users']}</b>\n"
-            f"🚫 Заблокировано: <b>{s['blocked']}</b>\n\n"
+            f"{TE_BLOCK} Заблокировано: <b>{s['blocked']}</b>\n\n"
             f"⏳ Подписка до: <b>{_get_exp_str()}</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_back_admin())
@@ -469,7 +469,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         username = f"@{m.from_user.username}" if m.from_user.username else "нет"
         return (f"<b>📥 Сообщение от:</b>\n"
                 f"👤 Имя: <b>{html.escape(m.from_user.full_name)}</b>\n"
-                f"🔗 Username: {html.escape(username)}\n"
+                f"{TE_LINK} Username: {html.escape(username)}\n"
                 f"🆔 ID: <code>{m.from_user.id}</code>")
 
     # ── Текст ──────────────────────────────────────────
@@ -482,7 +482,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             return
         db_bump_user_contact(db_bot_id, m.from_user.id)
         header = _make_header(m)
-        send_to_admins(f"{header}\n\n💬 {html.escape(m.text or '')}", reply_markup=pk_reply(m.from_user.id))
+        send_to_admins(f"{header}\n\n{TE_CHAT} {html.escape(m.text or '')}", reply_markup=pk_reply(m.from_user.id))
         db_log_message(db_bot_id, m.from_user.id, m.text or '')
         pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Сообщение отправлено</b>",
             parse_mode='HTML', reply_markup=pk_close())
@@ -543,13 +543,13 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
 
         # Строим мини-чат: последние 2 сообщения + ID и username пользователя
         username = db_get_username(db_bot_id, target)
-        user_line = f"🆔 ID: <code>{target}</code>  🔗 @{username}" if username else f"🆔 ID: <code>{target}</code>"
+        user_line = f"🆔 ID: <code>{target}</code>  {TE_LINK} @{username}" if username else f"🆔 ID: <code>{target}</code>"
         msgs = db_get_last_user_messages(db_bot_id, target, n=2)
         if msgs:
             lines = [f"<b>📥 Сообщения от пользователя</b>\n{user_line}\n"]
             for msg_text, msg_ts in msgs:
                 ts = str(msg_ts)[:16] if msg_ts else ''
-                lines.append(f"💬 <i>{ts}</i>\n{msg_text}")
+                lines.append(f"{TE_CHAT} <i>{ts}</i>\n{msg_text}")
             restore_text = '\n\n'.join(lines)
         else:
             restore_text = f"<b>📥 Сообщение от пользователя</b>\n{user_line}"
@@ -588,7 +588,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             pbot.answer_callback_query(cb.id, "❌ Шаблон не знайдено", show_alert=True)
             return
         try:
-            pbot.send_message(target_id, f"<b>📥 Сообщение от администратора\n\n💬 {text}</b>",
+            pbot.send_message(target_id, f"<b>📥 Сообщение от администратора\n\n{TE_CHAT} {text}</b>",
                 parse_mode='HTML')
         except Exception:
             pbot.answer_callback_query(cb.id, "❌ Не удалось отправить — пользователь недоступен",
@@ -658,7 +658,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def p_admin_text(m):
         if not is_admin(m.from_user.id): return
         target_id = int(pstate[m.from_user.id].split('_')[-1])
-        pbot.send_message(target_id, f"<b>📥 Сообщение от администратора\n\n💬 {m.text}</b>",
+        pbot.send_message(target_id, f"<b>📥 Сообщение от администратора\n\n{TE_CHAT} {m.text}</b>",
             parse_mode='HTML')
         pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Ответ отправлен</b>",
             parse_mode='HTML', reply_markup=pk_close())
@@ -894,12 +894,12 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                 _pbtn('Продлить бота', style='success', callback_data='p_renew_balance'),
             )
         kb.add(_pbtn('Назад', icon='🔙', callback_data='p_back_admin'))
-        ton_text = f"\n💎 Эквивалент: ~<b>{ton_equiv} TON</b>" if ton_equiv else ""
+        ton_text = f"\n{TE_DIAMOND} Эквивалент: ~<b>{ton_equiv} TON</b>" if ton_equiv else ""
         pbot.edit_message_text(
             f"{TE_MONEY} <b>Мой баланс</b>\n\n"
             f"💵 Текущий баланс: <b>{balance:.4f} USDT</b>{ton_text}\n"
             f"📈 Всего заработано: <b>{total:.4f} USDT</b>\n\n"
-            f"<i>Баланс пополняется когда пользователи покупают бота через твою кнопку «💎 Купить такого бота» (50% с каждой продажи)</i>",
+            f"<i>Баланс пополняется когда пользователи покупают бота через твою кнопку «{TE_DIAMOND} Купить такого бота» (50% с каждой продажи)</i>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=kb)
 
