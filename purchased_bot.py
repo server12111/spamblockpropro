@@ -455,7 +455,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             return False
         if _mg_first_item(m) and _is_rate_limited(db_bot_id, m.from_user.id):
             pbot.send_message(m.chat.id,
-                f"<b>⏳ Подожди {RATE_LIMIT_SEC} секунд перед следующим сообщением</b>",
+                f"<b>⏳ Подожди {RATE_LIMIT_SEC} сек перед следующим сообщением</b>",
                 parse_mode='HTML')
             return False
         return True

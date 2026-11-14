@@ -18,3 +18,4 @@ WEBHOOK_PORT        = int(os.getenv('WEBHOOK_PORT', '8443'))
 WITHDRAWAL_CHANNEL  = int(os.getenv('WITHDRAWAL_CHANNEL', '0'))   # ID канала/чата для запросов на вывод
 BOT_USERNAME        = os.getenv('BOT_USERNAME', '').strip()        # username главного бота (без @)
 STATS_TZ_OFFSET     = int(os.getenv('FS_STATS_TZ', '3'))           # часовой пояс еженедельной статистики (UTC+3)
+RATE_LIMIT_SEC      = int(os.getenv('FS_RATE_LIMIT', '3'))         # лимит отправки сообщений пользователем (сек)

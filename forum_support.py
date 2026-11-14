@@ -37,7 +37,7 @@ from database import (DB_PATH, _utc_now_str,
                       db_fs_count_range, db_fs_tickets_total,
                       db_fs_new_users_range, db_fs_users_total,
                       db_fs_user_tickets_total)
-from config import STATS_TZ_OFFSET
+from config import STATS_TZ_OFFSET, RATE_LIMIT_SEC
 
 log = logging.getLogger(__name__)
 
@@ -49,7 +49,7 @@ ADMIN_TTL = 30                                         # TTL кэша списк
 INFO_HIST_MAX = 10                                     # сколько username показывать в инфо-сообщении
 
 # ── Единый rate limit (используется и purchased_bot._is_rate_limited) ──
-RATE_LIMIT_SEC = 15
+# RATE_LIMIT_SEC импортируется из config (FS_RATE_LIMIT, по умолчанию 3 сек)
 _rate_cache: dict = {}
 _rate_lock = threading.Lock()
 

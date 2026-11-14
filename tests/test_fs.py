@@ -345,7 +345,7 @@ check('mark=False не фиксирует время', rate_limited(1, 3, mark=F
 check('mark=False не записал кэш', (1, 3) not in forum_support._rate_cache)
 forum_support._rate_cache[(1, 3)] = time.time() - 999
 check('истёкший ключ снова пропускает', rate_limited(1, 3, mark=True) is False)
-check('RATE_LIMIT_SEC = 15', fs.RATE_LIMIT_SEC == 15)
+check('RATE_LIMIT_SEC = 3', fs.RATE_LIMIT_SEC == 3)
 
 # ═════════════════════════════════════════════════════════════
 print('\n── 4. Подключение группы: проверка прав ──')
