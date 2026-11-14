@@ -50,6 +50,11 @@ def _is_main_rate_limited(user_id: int) -> bool:
     if now - _main_rate.get(user_id, 0) < MAIN_RATE_SEC:
         return True
     _main_rate[user_id] = now
+    if len(_main_rate) > 10000:  # защита от роста: чистим протухшие записи
+        for k in [k for k, ts in _main_rate.items() if now - ts >= MAIN_RATE_SEC]:
+            _main_rate.pop(k, None)
+        if len(_main_rate) > 10000:
+            _main_rate.clear()
     return False
 
 def start_subscription_checker(main_bot):
@@ -81,7 +86,7 @@ def start_subscription_checker(main_bot):
                         log.info(f'Bot #{bot_id} subscription expired, stopped.')
                         try:
                             main_bot.send_message(owner_id,
-                                "❌ <b>Подписка на вашего бота истекла!</b>\n\n"
+                                f"{TE_CROSS} <b>Подписка на вашего бота истекла!</b>\n\n"
                                 "Чтобы возобновить — нажми «🛒 Купить бота» в главном меню.",
                                 parse_mode='HTML')
                         except Exception:
@@ -294,7 +299,7 @@ def register(bot: telebot.TeleBot):
                     parse_mode='HTML')
         except Exception as e:
             log.error(f'backup error: {e}')
-            bot.send_message(m.chat.id, f"<b>❌ Ошибка бэкапа: {e}</b>", parse_mode='HTML')
+            bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Ошибка бэкапа: {e}</b>", parse_mode='HTML')
 
     @bot.message_handler(commands=['restore_db'])
     def cmd_restore_db(m):
@@ -313,7 +318,7 @@ def register(bot: telebot.TeleBot):
         state.pop(m.from_user.id, None)
         doc = m.document
         if not doc.file_name.endswith('.db'):
-            bot.send_message(m.chat.id, "<b>❌ Нужен файл с расширением .db</b>", parse_mode='HTML')
+            bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Нужен файл с расширением .db</b>", parse_mode='HTML')
             return
         try:
             file_info = bot.get_file(doc.file_id)
@@ -321,13 +326,13 @@ def register(bot: telebot.TeleBot):
             with open(DB_PATH, 'wb') as f:
                 f.write(downloaded)
             bot.send_message(m.chat.id,
-                f"<b>✅ База данных восстановлена!</b>\n\n"
+                f"<b>{TE_CHECK}  База данных восстановлена!</b>\n\n"
                 f"Перезапусти бота на BotHost чтобы загрузились все purchased-боты.",
                 parse_mode='HTML', reply_markup=close_kb())
             log.info(f'DB restored from upload by SUPER_ADMIN, size={len(downloaded)} bytes')
         except Exception as e:
             log.error(f'DB restore error: {e}')
-            bot.send_message(m.chat.id, f"<b>❌ Ошибка восстановления: {e}</b>", parse_mode='HTML')
+            bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Ошибка восстановления: {e}</b>", parse_mode='HTML')
 
     # ── Backup / Restore через кнопки ────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'backup_db')
@@ -377,7 +382,7 @@ def register(bot: telebot.TeleBot):
     # ── Отправить сообщение ──────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'user_send')
     def user_send(cb):
-        bot.edit_message_text("<b>💬 Введи своё сообщение:</b>",
+        bot.edit_message_text(f"<b>{TE_CHAT}  Введи своё сообщение:</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=back_to_start_kb())
         state[cb.from_user.id] = 'await_user_msg'
@@ -385,7 +390,7 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data.startswith('admin_reply_'))
     def admin_reply(cb):
         target = int(cb.data.split('_')[-1])
-        bot.edit_message_text("<b>💬 Введи ответ:</b>",
+        bot.edit_message_text(f"<b>{TE_CHAT}  Введи ответ:</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=cancel_kb())
         state[cb.from_user.id] = f'await_admin_msg_{target}'
@@ -414,7 +419,7 @@ def register(bot: telebot.TeleBot):
                 f"🆔 ID: <code>{m.from_user.id}</code>\n\n"
                 f"💬 {html.escape(m.text or '')}")
         bot.send_message(SUPER_ADMIN, text, parse_mode='HTML', reply_markup=reply_kb(m.from_user.id))
-        bot.send_message(m.chat.id, "<b>✅ Сообщение отправлено</b>",
+        bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Сообщение отправлено</b>",
             parse_mode='HTML', reply_markup=close_kb())
         state.pop(m.from_user.id, None)
 
@@ -424,7 +429,7 @@ def register(bot: telebot.TeleBot):
         target_id = int(state[m.from_user.id].split('_')[-1])
         bot.send_message(target_id, f"<b>📥 Сообщение от администратора\n\n💬 {m.text}</b>",
             parse_mode='HTML')
-        bot.send_message(m.chat.id, "<b>✅ Ответ отправлен</b>",
+        bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Ответ отправлен</b>",
             parse_mode='HTML', reply_markup=close_kb())
         state.pop(m.from_user.id, None)
 
@@ -655,7 +660,7 @@ def register(bot: telebot.TeleBot):
             kb.add(_btn('Проверить снова', style='primary', callback_data='ton_check_auto'))
             kb.add(_btn('Назад', icon='🔙', callback_data='back_to_payment'))
             bot.edit_message_text(
-                f"<b>❌ Оплата не найдена</b>\n\n"
+                f"<b>{TE_CROSS}  Оплата не найдена</b>\n\n"
                 f"Убедись что:\n"
                 f"• Отправил <b>{ton_amount} TON</b>\n"
                 f"• Указал комментарий: <code>{payment_code}</code>\n"
@@ -677,13 +682,13 @@ def register(bot: telebot.TeleBot):
 
         token_val = m.text.strip()
         if ':' not in token_val or len(token_val) < 30:
-            bot.send_message(m.chat.id, "<b>❌ Неверный формат токена. Попробуй ещё раз:</b>",
+            bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Неверный формат токена. Попробуй ещё раз:</b>",
                 parse_mode='HTML')
             return
         try:
             me = telebot.TeleBot(token_val).get_me()
         except Exception:
-            bot.send_message(m.chat.id, "<b>❌ Токен недействителен. Проверь и введи правильный:</b>",
+            bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Токен недействителен. Проверь и введи правильный:</b>",
                 parse_mode='HTML')
             return
         state[m.from_user.id] = {'step': 'await_admin_id', 'token': token_val,
@@ -702,7 +707,7 @@ def register(bot: telebot.TeleBot):
         try:
             admin_id_val = int(m.text.strip())
         except ValueError:
-            bot.send_message(m.chat.id, "<b>❌ ID должен быть числом. Попробуй ещё раз:</b>",
+            bot.send_message(m.chat.id, f"<b>{TE_CROSS}  ID должен быть числом. Попробуй ещё раз:</b>",
                 parse_mode='HTML')
             return
         s         = state.pop(m.from_user.id)
@@ -718,7 +723,7 @@ def register(bot: telebot.TeleBot):
             bot_db_id = db_add_bot(m.from_user.id, token_val, admin_id_val, days=days)
         except Exception:
             bot.send_message(m.chat.id,
-                "<b>❌ Этот токен уже зарегистрирован. Используй другой.</b>", parse_mode='HTML')
+                f"<b>{TE_CROSS}  Этот токен уже зарегистрирован. Используй другой.</b>", parse_mode='HTML')
             return
         if launch_bot(bot_db_id, token_val, admin_id_val, bot):
             db_clear_paid(m.from_user.id)
@@ -737,7 +742,7 @@ def register(bot: telebot.TeleBot):
                 parse_mode='HTML')
         else:
             bot.send_message(m.chat.id,
-                f"<b>❌ Ошибка запуска. Попробуй позже или напиши сюда — админ увидит.</b>", parse_mode='HTML')
+                f"<b>{TE_CROSS}  Ошибка запуска. Попробуй позже или напиши сюда — админ увидит.</b>", parse_mode='HTML')
 
     # ── Рассылка ─────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'broadcast')
@@ -774,7 +779,7 @@ def register(bot: telebot.TeleBot):
         scope = state.pop(m.from_user.id).split('_')[-1]
         users = _broadcast_users(scope)
         sent  = sum(1 for uid in users if _safe_send(uid, m.text))
-        bot.send_message(m.chat.id, f"<b>✅ Рассылка завершена: {sent}/{len(users)}</b>",
+        bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Рассылка завершена: {sent}/{len(users)}</b>",
             parse_mode='HTML', reply_markup=close_kb())
 
     @bot.message_handler(content_types=['photo'],
@@ -786,7 +791,7 @@ def register(bot: telebot.TeleBot):
         photo   = m.photo[-1].file_id
         caption = m.caption or ''
         sent    = sum(1 for uid in users if _safe_photo(uid, photo, caption))
-        bot.send_message(m.chat.id, f"<b>✅ Рассылка завершена: {sent}/{len(users)}</b>",
+        bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Рассылка завершена: {sent}/{len(users)}</b>",
             parse_mode='HTML', reply_markup=close_kb())
 
     # ── Статистика ────────────────────────────────────────
@@ -849,6 +854,7 @@ def register(bot: telebot.TeleBot):
             kb.row(
                 _btn(f"⏹ #{bot_id}", style='danger',  callback_data=f'bot_stop_{bot_id}'),
                 _btn(f"🔄 #{bot_id}", style='primary', callback_data=f'bot_restart_{bot_id}'),
+                _btn(f"🗑 #{bot_id}", style='danger',  callback_data=f'bot_delete_{bot_id}'),
             )
         kb.add(_btn('Закрыть', icon='❌', style='danger', callback_data='close'))
         text = "<b>🤖 Управление ботами</b>\n\n" + "\n".join(lines)
@@ -885,6 +891,59 @@ def register(bot: telebot.TeleBot):
             bot.answer_callback_query(cb.id, f"❌ Ошибка перезапуска Bot #{bot_id}", show_alert=True)
         _show_bots_list(cb.message.chat.id, cb.message.message_id)
 
+    # ── Удаление бота (супер-админ) ───────────────────────
+    @bot.callback_query_handler(func=lambda c: c.data.startswith('bot_delete_yes_'))
+    def bot_delete_yes_cb(cb):
+        if cb.from_user.id != SUPER_ADMIN: return
+        bot_id = int(cb.data.split('_')[-1])
+        info = db_get_bot_info(bot_id)
+        if not info:
+            bot.answer_callback_query(cb.id, "❌ Бот не найден в БД", show_alert=True)
+            return
+        token, _, _, _ = info
+        owner_id = info[2]
+        if token in running_bots:
+            stop_bot(token)
+        db_deactivate_bot(bot_id)
+        bot.answer_callback_query(cb.id, f"🗑 Bot #{bot_id} удалён", show_alert=True)
+        try:
+            bot.send_message(owner_id,
+                f"{TE_BLOCK} <b>Твой бот был удалён администратором платформы.</b>\n\n"
+                f"Если это ошибка — свяжись с поддержкой через этого бота.",
+                parse_mode='HTML')
+        except Exception:
+            pass
+        log.info(f'Bot #{bot_id} deleted by SUPER_ADMIN')
+        _show_bots_list(cb.message.chat.id, cb.message.message_id)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith('bot_delete_no_'))
+    def bot_delete_no_cb(cb):
+        if cb.from_user.id != SUPER_ADMIN: return
+        _show_bots_list(cb.message.chat.id, cb.message.message_id)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith('bot_delete_'))
+    def bot_delete_cb(cb):
+        if cb.from_user.id != SUPER_ADMIN: return
+        bot_id = int(cb.data.split('_')[-1])
+        info = db_get_bot_info(bot_id)
+        if not info:
+            bot.answer_callback_query(cb.id, "❌ Бот не найден в БД", show_alert=True)
+            return
+        kb = InlineKeyboardMarkup()
+        kb.row(
+            _btn(f"🗑 Да, удалить Bot #{bot_id}", style='danger',
+                 callback_data=f'bot_delete_yes_{bot_id}'),
+        )
+        kb.add(_btn('❌ Отмена', icon='❌', callback_data=f'bot_delete_no_{bot_id}'))
+        bot.edit_message_text(
+            f"{TE_BLOCK} <b>Удаление Bot #{bot_id}</b>\n\n"
+            f"• Бот будет остановлен и отключён\n"
+            f"• Владелец получит уведомление\n"
+            f"• Данные пользователей останутся в базе\n\n"
+            f"<i>Удалить навсегда из списка активных?</i>",
+            cb.message.chat.id, cb.message.message_id,
+            parse_mode='HTML', reply_markup=kb)
+
     # ── Установить цену ───────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'set_price')
     def set_price_cb(cb):
@@ -903,12 +962,12 @@ def register(bot: telebot.TeleBot):
             new_price = float(m.text.strip().replace(',', '.'))
             if new_price <= 0: raise ValueError
         except ValueError:
-            bot.send_message(m.chat.id, "<b>❌ Неверный формат. Введи число, например: 10</b>",
+            bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Неверный формат. Введи число, например: 10</b>",
                 parse_mode='HTML')
             return
         set_price(new_price)
         state.pop(m.from_user.id, None)
-        bot.send_message(m.chat.id, f"<b>✅ Цена обновлена: {new_price} USDT</b>",
+        bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Цена обновлена: {new_price} USDT</b>",
             parse_mode='HTML', reply_markup=close_kb())
 
     # ── Маркетплейс ───────────────────────────────────────
@@ -1002,7 +1061,7 @@ def register(bot: telebot.TeleBot):
         if m.from_user.id != SUPER_ADMIN: return
         parts = m.text.strip().split()
         if len(parts) != 2:
-            bot.send_message(m.chat.id, "<b>❌ Неверный формат. Пример: 123456789 30</b>",
+            bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Неверный формат. Пример: 123456789 30</b>",
                 parse_mode='HTML')
             return
         try:
@@ -1010,7 +1069,7 @@ def register(bot: telebot.TeleBot):
             days       = int(parts[1])
             if days <= 0: raise ValueError
         except ValueError:
-            bot.send_message(m.chat.id, "<b>❌ Неверные данные. user_id и дни должны быть числами > 0</b>",
+            bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Неверные данные. user_id и дни должны быть числами > 0</b>",
                 parse_mode='HTML')
             return
         state.pop(m.from_user.id, None)
@@ -1023,7 +1082,7 @@ def register(bot: telebot.TeleBot):
         except Exception:
             pass
         bot.send_message(m.chat.id,
-            f"<b>✅ Купон на {days} дней выдан пользователю <code>{target_uid}</code></b>",
+            f"<b>{TE_CHECK}  Купон на {days} дней выдан пользователю <code>{target_uid}</code></b>",
             parse_mode='HTML', reply_markup=close_kb())
 
     @bot.callback_query_handler(func=lambda c: c.data == 'free_renew')
@@ -1042,7 +1101,7 @@ def register(bot: telebot.TeleBot):
         if m.from_user.id != SUPER_ADMIN: return
         parts = m.text.strip().split()
         if len(parts) != 2:
-            bot.send_message(m.chat.id, "<b>❌ Неверный формат. Пример: 5 30</b>",
+            bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Неверный формат. Пример: 5 30</b>",
                 parse_mode='HTML')
             return
         try:
@@ -1050,11 +1109,11 @@ def register(bot: telebot.TeleBot):
             days          = int(parts[1])
             if days <= 0: raise ValueError
         except ValueError:
-            bot.send_message(m.chat.id, "<b>❌ Неверные данные</b>", parse_mode='HTML')
+            bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Неверные данные</b>", parse_mode='HTML')
             return
         info = db_get_bot_info(target_bot_id)
         if not info:
-            bot.send_message(m.chat.id, f"<b>❌ Бот #{target_bot_id} не найден</b>",
+            bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Бот #{target_bot_id} не найден</b>",
                 parse_mode='HTML')
             return
         state.pop(m.from_user.id, None)
@@ -1069,7 +1128,7 @@ def register(bot: telebot.TeleBot):
         except Exception:
             pass
         bot.send_message(m.chat.id,
-            f"<b>✅ Bot #{target_bot_id} продлён на {days} дней. До: {exp_str}</b>",
+            f"<b>{TE_CHECK}  Bot #{target_bot_id} продлён на {days} дней. До: {exp_str}</b>",
             parse_mode='HTML', reply_markup=close_kb())
 
     # ── Запросы на вывод (super admin) ───────────────────
@@ -1147,7 +1206,7 @@ def register(bot: telebot.TeleBot):
         db_return_bot_earnings(bot_id, usdt_amount)
         try:
             bot.send_message(owner_id,
-                f"❌ <b>Запрос на вывод #{wr_id} отклонён.</b>\n\n"
+                f"{TE_CROSS} <b>Запрос на вывод #{wr_id} отклонён.</b>\n\n"
                 f"Сумма <b>{usdt_amount} USDT</b> возвращена на твой баланс.\n"
                 f"Свяжись с поддержкой через этого бота для уточнения.",
                 parse_mode='HTML')

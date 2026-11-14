@@ -27,7 +27,7 @@ from database import (db_add_user, db_get_bot_users, db_deactivate_bot, DBState,
                       db_get_bot_earnings, db_deduct_bot_earnings,
                       db_create_withdrawal, db_renew_bot,
                       db_return_bot_earnings)
-from keyboards import broadcast_type_kb, PE_MONEY, PE_CHECK, PE_GIFT, PE_FIRE, TE_MONEY, TE_CHECK, TE_FIRE, TE_ROCKET, TE_GIFT, TE_CROSS, TE_SEND, TE_BLOCK
+from keyboards import broadcast_type_kb, PE_MONEY, PE_CHECK, PE_GIFT, PE_FIRE, TE_MONEY, TE_CHECK, TE_FIRE, TE_ROCKET, TE_GIFT, TE_CROSS, TE_SEND, TE_BLOCK, TE_CHAT
 from config import SUPER_ADMIN, WITHDRAWAL_CHANNEL, BOT_USERNAME
 from payments import get_ton_amount
 from forum_support import register_forum_support, RATE_LIMIT_SEC, rate_limited
@@ -65,8 +65,8 @@ def stop_bot(token: str) -> bool:
         log.error(f'stop_bot failed: {e}')
         return False
 
-DEFAULT_WELCOME = ("<b>🤖 Привет! Это бот обратной связи.\n\n"
-                   "💬 Отправь своё сообщение и администратор обязательно его прочитает.</b>")
+DEFAULT_WELCOME = (f"<b>🤖 Привет! Это бот обратной связи.\n\n"
+                   f"{TE_CHAT} Отправь своё сообщение и администратор обязательно его прочитает.</b>")
 
 def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None):
     pbot   = telebot.TeleBot(token)
@@ -422,7 +422,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             pbot.answer_callback_query(cb.id, "🚫 Вы заблокированы администратором", show_alert=True)
             return
         pbot.edit_message_text(
-            "<b>💬 Отправь сообщение, фото, видео, файл или голосовое:</b>",
+            f"<b>{TE_CHAT}  Отправь сообщение, фото, видео, файл или голосовое:</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_back())
         pstate[cb.from_user.id] = 'await_msg'
@@ -454,7 +454,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         """Общие проверки для всех входящих медиа. True = продолжать."""
         db_add_user(db_bot_id, m.from_user.id, m.from_user.username or '')
         if db_is_blocked(db_bot_id, m.from_user.id):
-            pbot.send_message(m.chat.id, "<b>🚫 Вы заблокированы администратором</b>",
+            pbot.send_message(m.chat.id, f"<b>{TE_BLOCK}  Вы заблокированы администратором</b>",
                 parse_mode='HTML')
             pstate.pop(m.from_user.id, None)
             return False
@@ -484,7 +484,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         header = _make_header(m)
         send_to_admins(f"{header}\n\n💬 {html.escape(m.text or '')}", reply_markup=pk_reply(m.from_user.id))
         db_log_message(db_bot_id, m.from_user.id, m.text or '')
-        pbot.send_message(m.chat.id, "<b>✅ Сообщение отправлено</b>",
+        pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Сообщение отправлено</b>",
             parse_mode='HTML', reply_markup=pk_close())
         pstate.pop(m.from_user.id, None)
 
@@ -503,7 +503,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         db_bump_user_contact(db_bot_id, m.from_user.id)
         send_media_to_admins(m, _make_header(m))
         db_log_message(db_bot_id, m.from_user.id, f'[{m.content_type}]')
-        pbot.send_message(m.chat.id, "<b>✅ Сообщение отправлено</b>",
+        pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Сообщение отправлено</b>",
             parse_mode='HTML', reply_markup=pk_close())
         pstate.pop(m.from_user.id, None)
 
@@ -525,11 +525,11 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                                               'caption': cb.message.html_caption or cb.message.caption or ''}
             pbot.delete_message(cb.message.chat.id, cb.message.message_id)
             pbot.send_message(cb.message.chat.id,
-                "<b>💬 Введи ответ или отправь фото:</b>",
+                f"<b>{TE_CHAT}  Введи ответ или отправь фото:</b>",
                 parse_mode='HTML', reply_markup=pk_reply_input_with_templates(target))
         else:
             preply_cache[cb.from_user.id] = {'target_id': target, 'text': original_text, 'media': False}
-            pbot.edit_message_text("<b>💬 Введи ответ или отправь фото:</b>",
+            pbot.edit_message_text(f"<b>{TE_CHAT}  Введи ответ или отправь фото:</b>",
                 cb.message.chat.id, cb.message.message_id,
                 parse_mode='HTML', reply_markup=pk_reply_input_with_templates(target))
         pstate[cb.from_user.id] = f'await_reply_{target}'
@@ -596,7 +596,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             return
         pstate.pop(cb.from_user.id, None)
         preply_cache.pop(cb.from_user.id, None)
-        pbot.edit_message_text("<b>✅ Ответ по шаблону отправлен</b>",
+        pbot.edit_message_text(f"<b>{TE_CHECK}  Ответ по шаблону отправлен</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_close())
 
@@ -616,7 +616,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         target = int(pstate[m.from_user.id].split('_')[-1])
         db_add_template(db_bot_id, m.text)
         pstate[m.from_user.id] = f'await_reply_{target}'
-        pbot.send_message(m.chat.id, "<b>✅ Шаблон сохранён</b>",
+        pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Шаблон сохранён</b>",
             parse_mode='HTML', reply_markup=pk_reply_input_with_templates(target))
 
     @pbot.callback_query_handler(func=lambda c: c.data.startswith('p_del_tpl_menu_'))
@@ -660,7 +660,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         target_id = int(pstate[m.from_user.id].split('_')[-1])
         pbot.send_message(target_id, f"<b>📥 Сообщение от администратора\n\n💬 {m.text}</b>",
             parse_mode='HTML')
-        pbot.send_message(m.chat.id, "<b>✅ Ответ отправлен</b>",
+        pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Ответ отправлен</b>",
             parse_mode='HTML', reply_markup=pk_close())
         preply_cache.pop(m.from_user.id, None)
         pstate.pop(m.from_user.id, None)
@@ -679,11 +679,11 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             pbot.send_photo(target_id, m.photo[-1].file_id, caption=cap_text, parse_mode='HTML')
         except Exception as e:
             log.warning(f'p_admin_photo_reply failed: {e}')
-            pbot.send_message(m.chat.id, "<b>❌ Не удалось отправить фото</b>", parse_mode='HTML')
+            pbot.send_message(m.chat.id, f"<b>{TE_CROSS}  Не удалось отправить фото</b>", parse_mode='HTML')
             return
         pstate.pop(m.from_user.id, None)
         preply_cache.pop(m.from_user.id, None)
-        pbot.send_message(m.chat.id, "<b>✅ Фото отправлено</b>",
+        pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Фото отправлено</b>",
             parse_mode='HTML', reply_markup=pk_close())
 
     # ── Блокировка ─────────────────────────────────────
@@ -731,7 +731,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         for uid in blocked:
             kb.add(_pbtn(f"Разблокировать {uid}", icon='✔️', style='success', callback_data=f'p_unblock_list_{uid}'))
         kb.add(_pbtn('Назад', icon='🔙', callback_data='p_back_admin'))
-        pbot.edit_message_text(f"<b>🚫 Заблокированные ({len(blocked)}):</b>",
+        pbot.edit_message_text(f"<b>{TE_BLOCK}  Заблокированные ({len(blocked)}):</b>",
             chat_id, message_id, parse_mode='HTML', reply_markup=kb)
 
     @pbot.callback_query_handler(func=lambda c: c.data.startswith('p_unblock_list_'))
@@ -793,12 +793,12 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         try:
             new_admin = int(m.text.strip())
         except ValueError:
-            pbot.send_message(m.chat.id, "<b>❌ ID должен быть числом</b>", parse_mode='HTML')
+            pbot.send_message(m.chat.id, f"<b>{TE_CROSS}  ID должен быть числом</b>", parse_mode='HTML')
             return
         pstate.pop(m.from_user.id, None)
         db_add_bot_admin(db_bot_id, new_admin)
         pbot.send_message(m.chat.id,
-            f"<b>✅ Администратор <code>{new_admin}</code> добавлен!</b>\n"
+            f"<b>{TE_CHECK}  Администратор <code>{new_admin}</code> добавлен!</b>\n"
             f"Теперь он будет получать сообщения и может отвечать.",
             parse_mode='HTML', reply_markup=pk_close())
 
@@ -818,12 +818,12 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         try:
             new_primary = int(m.text.strip())
         except ValueError:
-            pbot.send_message(m.chat.id, "<b>❌ ID должен быть числом</b>", parse_mode='HTML')
+            pbot.send_message(m.chat.id, f"<b>{TE_CROSS}  ID должен быть числом</b>", parse_mode='HTML')
             return
         pstate.pop(m.from_user.id, None)
         db_set_primary_admin(db_bot_id, new_primary)
         pbot.send_message(m.chat.id,
-            f"<b>✅ Главный администратор изменён на <code>{new_primary}</code>!</b>",
+            f"<b>{TE_CHECK}  Главный администратор изменён на <code>{new_primary}</code>!</b>",
             parse_mode='HTML', reply_markup=pk_close())
 
     # ── Изменить приветствие ───────────────────────────
@@ -845,7 +845,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         pstate.pop(m.from_user.id, None)
         db_set_bot_setting(db_bot_id, 'welcome', m.text)
         pbot.send_message(m.chat.id,
-            f"<b>✅ Приветствие обновлено!</b>\n\n<b>Предпросмотр:</b>\n\n{m.text}",
+            f"<b>{TE_CHECK}  Приветствие обновлено!</b>\n\n<b>Предпросмотр:</b>\n\n{m.text}",
             parse_mode='HTML', reply_markup=pk_close())
 
     # ── Удалить бота ───────────────────────────────────
@@ -871,7 +871,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def p_confirm_delete(cb):
         if not is_primary_admin(cb.from_user.id): return
         pbot.edit_message_text(
-            "<b>✅ Бот удалён. Спасибо за использование!</b>",
+            f"<b>{TE_CHECK}  Бот удалён. Спасибо за использование!</b>",
             cb.message.chat.id, cb.message.message_id, parse_mode='HTML')
         db_deactivate_bot(db_bot_id)
         def _delayed_stop():
@@ -925,7 +925,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if not is_admin(m.from_user.id): return
         address = m.text.strip()
         if len(address) < 32:
-            pbot.send_message(m.chat.id, "<b>❌ Неверный TON-адрес. Попробуй ещё раз:</b>",
+            pbot.send_message(m.chat.id, f"<b>{TE_CROSS}  Неверный TON-адрес. Попробуй ещё раз:</b>",
                 parse_mode='HTML')
             return
         s = pstate[m.from_user.id]
@@ -956,7 +956,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                     raise ValueError
             except ValueError:
                 pbot.send_message(m.chat.id,
-                    f"<b>❌ Неверная сумма. Максимум: {balance:.4f} USDT</b>",
+                    f"<b>{TE_CROSS}  Неверная сумма. Максимум: {balance:.4f} USDT</b>",
                     parse_mode='HTML')
                 return
         pstate.pop(m.from_user.id, None)
@@ -1089,7 +1089,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         pstate.pop(m.from_user.id, None)
         users = db_get_bot_users(db_bot_id)
         sent  = sum(1 for uid in users if _safe_send(pbot, uid, m.text))
-        pbot.send_message(m.chat.id, f"<b>✅ Рассылка завершена: {sent}/{len(users)}</b>",
+        pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Рассылка завершена: {sent}/{len(users)}</b>",
             parse_mode='HTML', reply_markup=pk_close())
 
     @pbot.message_handler(content_types=['photo'],
@@ -1101,7 +1101,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         photo   = m.photo[-1].file_id
         caption = m.caption or ''
         sent    = sum(1 for uid in users if _safe_photo(pbot, uid, photo, caption))
-        pbot.send_message(m.chat.id, f"<b>✅ Рассылка завершена: {sent}/{len(users)}</b>",
+        pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Рассылка завершена: {sent}/{len(users)}</b>",
             parse_mode='HTML', reply_markup=pk_close())
 
     # ── Forum Topics: техподдержка через группу с темами ─────────
@@ -1165,7 +1165,7 @@ def launch_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None) -> bool
                     owner_id = info[2] if info else None
                     if owner_id:
                         main_bot.send_message(owner_id,
-                            "❌ <b>Токен вашего бота недействителен!</b>\n\n"
+                            f"{TE_CROSS} <b>Токен вашего бота недействителен!</b>\n\n"
                             "Похоже, токен был отозван или изменён в @BotFather. "
                             "Бот не работает, пока токен не будет обновлён.",
                             parse_mode='HTML')

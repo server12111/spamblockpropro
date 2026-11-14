@@ -38,6 +38,8 @@ from database import (DB_PATH, _utc_now_str,
                       db_fs_new_users_range, db_fs_users_total,
                       db_fs_user_tickets_total)
 from config import STATS_TZ_OFFSET, RATE_LIMIT_SEC
+from keyboards import (_ICON, TE_BLOCK, TE_CHAT, TE_CHECK, TE_CROSS,
+                       TE_LINK, TE_SEND)
 
 log = logging.getLogger(__name__)
 
@@ -801,7 +803,7 @@ def _flush_album(pbot, bot_id: int, key):
         db_log_message(bot_id, uid, f'[{buf["msgs"][0].content_type} x{len(buf["ids"])}]')
         if buf.get('confirm_kb'):
             try:
-                pbot.send_message(buf['chat_id'], '<b>✅ Сообщение отправлено</b>',
+                pbot.send_message(buf['chat_id'], f'<b>{TE_CHECK}  Сообщение отправлено</b>',
                                   parse_mode='HTML', reply_markup=buf['confirm_kb']())
             except Exception:
                 pass
@@ -809,7 +811,7 @@ def _flush_album(pbot, bot_id: int, key):
         log.warning(f'album flush bot#{bot_id} uid={uid}: {e}')
         try:
             pbot.send_message(buf['chat_id'],
-                              '<b>❌ Не удалось отправить сообщение. Попробуй позже.</b>',
+                              f'<b>{TE_CROSS}  Не удалось отправить сообщение. Попробуй позже.</b>',
                               parse_mode='HTML')
         except Exception:
             pass
@@ -840,7 +842,7 @@ def route_user_message(pbot, bot_id: int, m, confirm_kb=None) -> bool:
                                 'Не удалось создать тему в группе техподдержки', e)
             try:
                 pbot.send_message(m.chat.id,
-                                  '<b>❌ Не удалось доставить сообщение в техподдержку. '
+                                  f'<b>{TE_CROSS}  Не удалось доставить сообщение в техподдержку. '
                                   'Попробуй позже.</b>', parse_mode='HTML')
             except Exception:
                 pass
@@ -858,7 +860,7 @@ def route_user_message(pbot, bot_id: int, m, confirm_kb=None) -> bool:
         db_log_message(bot_id, uid, m.text or f'[{m.content_type}]')
         if confirm_kb:
             try:
-                pbot.send_message(m.chat.id, '<b>✅ Сообщение отправлено</b>',
+                pbot.send_message(m.chat.id, f'<b>{TE_CHECK}  Сообщение отправлено</b>',
                                   parse_mode='HTML', reply_markup=confirm_kb())
             except Exception:
                 pass
@@ -871,7 +873,7 @@ def route_user_message(pbot, bot_id: int, m, confirm_kb=None) -> bool:
                                 'Бот не может писать в группу техподдержки', e)
         try:
             pbot.send_message(m.chat.id,
-                              '<b>❌ Не удалось доставить сообщение в техподдержку. '
+                              f'<b>{TE_CROSS}  Не удалось доставить сообщение в техподдержку. '
                               'Попробуй позже.</b>', parse_mode='HTML')
         except Exception:
             pass
@@ -967,7 +969,7 @@ def fs_handle_group_message(pbot, bot_id: int, m, bot_self_id: int, pstate) -> N
 
     if db_is_blocked(bot_id, target_uid):
         _topic_notice(pbot, m.chat.id, thread,
-                      '🚫 Пользователь заблокирован — ответ не доставлен.')
+                      f'{TE_BLOCK} Пользователь заблокирован — ответ не доставлен.')
         return
 
     # ── альбом от админа: накапливаем и отправляем одной пачкой ──
@@ -1042,7 +1044,7 @@ def _flush_admin_album(pbot, bot_id: int, key):
             return
         if db_is_blocked(bot_id, target_uid):
             _topic_notice(pbot, buf['gid'], thread,
-                          '🚫 Пользователь заблокирован — ответ не доставлен.')
+                          f'{TE_BLOCK} Пользователь заблокирован — ответ не доставлен.')
             return
         _api(pbot.copy_messages, target_uid, buf['gid'], buf['ids'])
         fs_log_admin_msg(bot_id, target_uid)
@@ -1074,7 +1076,7 @@ def queue_random_message(pbot, bot_id: int, m) -> None:
     uid = m.from_user.id
     if db_is_blocked(bot_id, uid):
         try:
-            pbot.send_message(m.chat.id, '<b>🚫 Вы заблокированы администратором</b>',
+            pbot.send_message(m.chat.id, f'<b>{TE_BLOCK}  Вы заблокированы администратором</b>',
                               parse_mode='HTML')
         except Exception:
             pass
@@ -1090,7 +1092,7 @@ def queue_random_message(pbot, bot_id: int, m) -> None:
         except Exception:
             pass
         return
-    text = '<b>💬 Отправить сообщение администратору?</b>'
+    text = f'<b>{TE_CHAT}  Отправить сообщение администратору?</b>'
     if cnt > 1:
         text += f'\n\n📝 В очереди: <b>{cnt}</b> сообщений'
     kb = _confirm_kb()
@@ -1112,11 +1114,20 @@ def queue_random_message(pbot, bot_id: int, m) -> None:
         log.warning(f'queue prompt bot#{bot_id} uid={uid}: {e}')
 
 
+def _fbtn(text, icon=None, style=None, **kwargs):
+    """Кнопка с премиум-иконкой (аналог _pbtn в purchased_bot)."""
+    extra = {}
+    if icon and icon in _ICON:
+        extra['icon_custom_emoji_id'] = _ICON[icon]
+    if style:
+        extra['style'] = style
+    return InlineKeyboardButton(text, **extra, **kwargs)
+
 def _confirm_kb():
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton('📩 Отправить администратору',
-                                callback_data='fs_confirm_send'))
-    kb.add(InlineKeyboardButton('❌ Отменить', callback_data='fs_confirm_cancel'))
+    kb.add(_fbtn('📩 Отправить администратору', icon='📤', style='primary',
+                 callback_data='fs_confirm_send'))
+    kb.add(_fbtn('❌ Отменить', icon='❌', style='danger', callback_data='fs_confirm_cancel'))
     return kb
 
 
@@ -1232,7 +1243,7 @@ def confirm_send(pbot, bot_id: int, cb) -> None:
         fs_delete_pending(bot_id, uid)
         pbot.answer_callback_query(cb.id, '✅ Отправлено')
         try:
-            pbot.edit_message_text('<b>✅ Сообщение отправлено</b>',
+            pbot.edit_message_text(f'<b>{TE_CHECK}  Сообщение отправлено</b>',
                                    cb.message.chat.id, cb.message.message_id,
                                    parse_mode='HTML')
         except Exception:
@@ -1343,7 +1354,7 @@ def _finish_connect(pbot, bot_id: int, uid: int, chat_id: int, title: str, pstat
     try:
         pbot.send_message(
             uid,
-            f'✅ <b>Группа техподдержки подключена!</b>\n\n'
+            f'{TE_CHECK} <b>Группа техподдержки подключена!</b>\n\n'
             f'📌 {html.escape(title or "Группа")} (<code>{chat_id}</code>)\n\n'
             'Теперь обращения пользователей создают отдельные темы.\n'
             'Чтобы ответить — просто напиши в теме пользователя '
@@ -1359,10 +1370,10 @@ def connect_start(pbot, bot_id: int, cb, pstate):
     code = _gen_code()
     pstate[uid] = {'step': 'fs_connect', 'code': code}
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton('❌ Отмена', callback_data='fs_connect_cancel'))
+    kb.add(_fbtn('❌ Отмена', icon='❌', callback_data='fs_connect_cancel'))
     try:
         pbot.edit_message_text(
-            '<b>🔗 Подключение группы техподдержки</b>\n\n'
+            f'<b>{TE_LINK}  Подключение группы техподдержки</b>\n\n'
             '1️⃣ Добавь бота в свою группу с темами и назначь администратором с правами:\n'
             '   • Управление темами\n'
             '   • Закрепление сообщений\n'
@@ -1393,12 +1404,12 @@ def connect_cancel(pbot, bot_id: int, cb, pstate):
 
 def disconnect_confirm(pbot, bot_id: int, cb):
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton('✅ Да, отключить', callback_data='fs_disconnect_yes',
+    kb.add(_fbtn('✅ Да, отключить', icon='✔️', callback_data='fs_disconnect_yes',
                                 style='danger'))
-    kb.add(InlineKeyboardButton('❌ Отмена', callback_data='fs_group_menu'))
+    kb.add(_fbtn('❌ Отмена', icon='❌', callback_data='fs_group_menu'))
     try:
         pbot.edit_message_text(
-            '<b>❌ Отключение группы техподдержки</b>\n\n'
+            f'<b>{TE_CROSS}  Отключение группы техподдержки</b>\n\n'
             'Обращения снова будут приходить администраторам в личные сообщения.\n'
             'Связи пользователь→тема будут сброшены (данные пользователей сохранятся).\n\n'
             'Отключить?',
@@ -1411,7 +1422,7 @@ def disconnect_yes(pbot, bot_id: int, cb):
     pbot.answer_callback_query(cb.id, '✅ Группа отключена')
     try:
         pbot.edit_message_text(
-            f'✅ <b>Группа (<code>{chat_id}</code>) отключена.</b>\n\n'
+            f'{TE_CHECK} <b>Группа (<code>{chat_id}</code>) отключена.</b>\n\n'
             'Возврат в стандартный режим: обращения приходят администраторам в ЛС.',
             cb.message.chat.id, cb.message.message_id, parse_mode='HTML')
     except Exception:
@@ -1442,13 +1453,13 @@ def menu_text(bot_id: int) -> str:
 def menu_kb(bot_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     if fs_get_group(bot_id):
-        kb.add(InlineKeyboardButton('🔄 Сменить группу', callback_data='fs_connect'))
-        kb.add(InlineKeyboardButton('❌ Отключить группу', callback_data='fs_disconnect',
+        kb.add(_fbtn('🔄 Сменить группу', callback_data='fs_connect'))
+        kb.add(_fbtn('❌ Отключить группу', icon='❌', callback_data='fs_disconnect',
                                     style='danger'))
     else:
-        kb.add(InlineKeyboardButton('🔗 Подключить группу', callback_data='fs_connect',
+        kb.add(_fbtn('🔗 Подключить группу', icon='🔗', callback_data='fs_connect',
                                     style='primary'))
-    kb.add(InlineKeyboardButton('🔙 Назад', callback_data='p_back_admin'))
+    kb.add(_fbtn('🔙 Назад', icon='🔙', callback_data='p_back_admin'))
     return kb
 
 def menu_show(pbot, bot_id: int, cb):
@@ -1496,12 +1507,12 @@ def fs_weekly_report_text(bot_id: int, start_tz: datetime, end_tz: datetime) -> 
     updated = _now_tz().strftime('%d.%m.%Y %H:%M')
     return (f'<b>📊 Статистика техподдержки</b>\n\n'
             f'📅 Период: {disp_start} — {disp_end}\n\n'
-            f'<b>📩 Обращения</b>\n'
+            f'<b>{TE_SEND}  Обращения</b>\n'
             f'• За неделю: {_fmt_num(tickets_week)}\n'
             f'• За всё время: {_fmt_num(tickets_total)}\n'
             f'• Новых пользователей за неделю: {_fmt_num(new_users)}\n'
             f'• Всего уникальных пользователей: {_fmt_num(users_total)}\n\n'
-            f'<b>💬 Сообщения</b>\n'
+            f'<b>{TE_CHAT}  Сообщения</b>\n'
             f'• Получено от пользователей: {_fmt_num(msgs_user)}\n'
             f'• Отправлено администраторами: {_fmt_num(msgs_admin)}\n\n'
             f'🕒 Последнее обновление: {updated}')
