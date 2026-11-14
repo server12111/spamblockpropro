@@ -73,6 +73,26 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     pstate = DBState(db_bot_id)
     preply_cache = {}  # {admin_id: {'target_id': int, 'text': str}}
 
+    def _edit(text, chat_id, message_id, reply_markup=None, parse_mode='HTML'):
+        """edit_message_text с фолбэком: Telegram не даёт править сообщения
+        старше 48 часов — шлём новое с тем же содержимым."""
+        try:
+            return pbot.edit_message_text(text, chat_id, message_id,
+                                          parse_mode=parse_mode,
+                                          reply_markup=reply_markup)
+        except Exception as e:
+            s = str(e).lower()
+            if 'not modified' in s:
+                return True
+            try:
+                return pbot.send_message(chat_id, text,
+                                         parse_mode=parse_mode,
+                                         reply_markup=reply_markup)
+            except Exception as e2:
+                log.warning(f'_edit fallback failed: {e2}')
+                return None
+
+
     # Временные сбои Telegram (502/503/504, сеть) не должны засорять логи
     # ERROR-трейсбеками: infinity_polling повторяет сам, пишем WARNING раз в 5 минут.
     # ВАЖНО: telebot вызывает exception_handler.handle(e) — нужен ОБЪЕКТ с .handle(),
@@ -311,7 +331,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def p_back_admin_cb(cb):
         if not is_admin(cb.from_user.id): return
         pstate.pop(cb.from_user.id, None)
-        pbot.edit_message_text(
+        _edit(
             f"<b>{TE_KEYBOARD} Панель админа</b>\n\n{TE_HOURGLASS} Подписка до: <b>{_get_exp_str()}</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_admin())
@@ -319,7 +339,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_open_admin')
     def p_open_admin_cb(cb):
         if not is_admin(cb.from_user.id): return
-        pbot.edit_message_text(
+        _edit(
             f"<b>{TE_KEYBOARD} Панель админа</b>\n\n{TE_HOURGLASS} Подписка до: <b>{_get_exp_str()}</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_admin())
@@ -328,7 +348,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def p_stats_cb(cb):
         if not is_admin(cb.from_user.id): return
         s = db_get_bot_msg_stats(db_bot_id)
-        pbot.edit_message_text(
+        _edit(
             f"<b>{TE_STATS} Статистика бота</b>\n\n"
             f"{TE_SEND} Сообщений сегодня: <b>{s['today']}</b>\n"
             f"{TE_MAIL} Сообщений за неделю: <b>{s['week']}</b>\n"
@@ -356,7 +376,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if not is_admin(cb.from_user.id): return
         kb, templates = pk_manage_templates()
         header = f"<b>{TE_NOTE} Шаблоны ответов ({len(templates)}):</b>" if templates else f"<b>{TE_NOTE} Шаблоны ответов пусты</b>"
-        pbot.edit_message_text(header, cb.message.chat.id, cb.message.message_id,
+        _edit(header, cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=kb)
 
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_mgadd_tpl')
@@ -365,7 +385,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         pstate[cb.from_user.id] = 'mgadd_tpl'
         kb = InlineKeyboardMarkup()
         kb.add(_pbtn('Отмена', icon='❌', style='danger', callback_data='p_admin_templates'))
-        pbot.edit_message_text(f"<b>{TE_PLUS} Введи текст нового шаблона:</b>",
+        _edit(f"<b>{TE_PLUS} Введи текст нового шаблона:</b>",
             cb.message.chat.id, cb.message.message_id, parse_mode='HTML', reply_markup=kb)
 
     @pbot.message_handler(func=lambda m: pstate.get(m.from_user.id) == 'mgadd_tpl')
@@ -387,7 +407,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         kb, templates = pk_manage_templates()
         header = f"<b>{TE_NOTE} Шаблоны ответов ({len(templates)}):</b>" if templates else f"<b>{TE_NOTE} Шаблоны ответов пусты</b>"
         try:
-            pbot.edit_message_text(header, cb.message.chat.id, cb.message.message_id,
+            _edit(header, cb.message.chat.id, cb.message.message_id,
                 parse_mode='HTML', reply_markup=kb)
         except Exception:
             pass
@@ -399,7 +419,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_cancel')
     def p_cancel(cb):
         pstate.pop(cb.from_user.id, None)
-        pbot.edit_message_text(get_welcome(), cb.message.chat.id, cb.message.message_id,
+        _edit(get_welcome(), cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_start(is_admin(cb.from_user.id)))
 
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_close')
@@ -421,7 +441,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if db_is_blocked(db_bot_id, cb.from_user.id):
             pbot.answer_callback_query(cb.id, "🚫 Вы заблокированы администратором", show_alert=True)
             return
-        pbot.edit_message_text(
+        _edit(
             f"<b>{TE_CHAT}  Отправь сообщение, фото, видео, файл или голосовое:</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_back())
@@ -514,10 +534,12 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         target = int(cb.data.split('_')[-1])
         # Cache original message for back button restoration
         try:
-            original_text = cb.message.html_text
+            original_text = getattr(cb.message, 'html_text', None)
         except Exception:
-            original_text = cb.message.text or ''
-        is_media = cb.message.content_type != 'text'
+            original_text = None
+        # старые (>48 ч) сообщения приходят как InaccessibleMessage без полей —
+        # считаем их текстовыми, содержимое берём из БД/кэша при ответе
+        is_media = getattr(cb.message, 'content_type', 'text') != 'text'
         if is_media:
             preply_cache[cb.from_user.id] = {'target_id': target, 'text': None, 'media': True,
                                               'content_type': cb.message.content_type,
@@ -529,7 +551,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                 parse_mode='HTML', reply_markup=pk_reply_input_with_templates(target))
         else:
             preply_cache[cb.from_user.id] = {'target_id': target, 'text': original_text, 'media': False}
-            pbot.edit_message_text(f"<b>{TE_CHAT}  Введи ответ или отправь фото:</b>",
+            _edit(f"<b>{TE_CHAT}  Введи ответ или отправь фото:</b>",
                 cb.message.chat.id, cb.message.message_id,
                 parse_mode='HTML', reply_markup=pk_reply_input_with_templates(target))
         pstate[cb.from_user.id] = f'await_reply_{target}'
@@ -555,7 +577,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             restore_text = f"<b>{TE_INBOX} Сообщение от пользователя</b>\n{user_line}"
 
         try:
-            pbot.edit_message_text(restore_text,
+            _edit(restore_text,
                 cb.message.chat.id, cb.message.message_id,
                 parse_mode='HTML', reply_markup=pk_reply(target))
         except Exception as e:
@@ -574,7 +596,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             text = f"<b>{TE_NOTE} Шаблоны пусты</b>\n\nДобавь первый шаблон:"
         else:
             text = f"<b>{TE_NOTE} Шаблоны ({len(templates)}):</b>\n\nВыбери или управляй:"
-        pbot.edit_message_text(text, cb.message.chat.id, cb.message.message_id,
+        _edit(text, cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_templates_list(target))
 
     @pbot.callback_query_handler(func=lambda c: c.data.startswith('p_use_tpl_'))
@@ -596,7 +618,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             return
         pstate.pop(cb.from_user.id, None)
         preply_cache.pop(cb.from_user.id, None)
-        pbot.edit_message_text(f"<b>{TE_CHECK}  Ответ по шаблону отправлен</b>",
+        _edit(f"<b>{TE_CHECK}  Ответ по шаблону отправлен</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_close())
 
@@ -604,7 +626,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def p_add_template_start(cb):
         if not is_admin(cb.from_user.id): return
         target = int(cb.data.split('_')[-1])
-        pbot.edit_message_text(f"<b>{TE_PLUS} Введи текст нового шаблона:</b>",
+        _edit(f"<b>{TE_PLUS} Введи текст нового шаблона:</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_reply_input_with_templates(target))
         pstate[cb.from_user.id] = f'await_add_tpl_{target}'
@@ -629,7 +651,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             preview = text[:35] + '…' if len(text) > 35 else text
             kb.add(_pbtn(preview, icon='❌', style='danger', callback_data=f'p_del_tpl_{target}_{tid}'))
         kb.add(_pbtn('Назад', icon='🔙', callback_data=f'p_templates_{target}'))
-        pbot.edit_message_text(f"<b>{TE_CROSS} Выбери шаблон для удаления:</b>",
+        _edit(f"<b>{TE_CROSS} Выбери шаблон для удаления:</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=kb)
 
@@ -724,14 +746,14 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def _show_blocked(chat_id, message_id):
         blocked = db_get_blocked_list(db_bot_id)
         if not blocked:
-            pbot.edit_message_text(f"<b>{TE_USERS} Нет заблокированных пользователей</b>",
+            _edit(f"<b>{TE_USERS} Нет заблокированных пользователей</b>",
                 chat_id, message_id, parse_mode='HTML', reply_markup=pk_back_admin())
             return
         kb = InlineKeyboardMarkup()
         for uid in blocked:
             kb.add(_pbtn(f"Разблокировать {uid}", icon='✔️', style='success', callback_data=f'p_unblock_list_{uid}'))
         kb.add(_pbtn('Назад', icon='🔙', callback_data='p_back_admin'))
-        pbot.edit_message_text(f"<b>{TE_BLOCK}  Заблокированные ({len(blocked)}):</b>",
+        _edit(f"<b>{TE_BLOCK}  Заблокированные ({len(blocked)}):</b>",
             chat_id, message_id, parse_mode='HTML', reply_markup=kb)
 
     @pbot.callback_query_handler(func=lambda c: c.data.startswith('p_unblock_list_'))
@@ -763,7 +785,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if primary_id and primary_id != cb_from_user_id_placeholder:
             kb.add(_pbtn('Сменить главного', style='primary', callback_data='p_change_primary'))
         kb.add(_pbtn('Назад', icon='🔙', callback_data='p_back_admin'))
-        pbot.edit_message_text("\n".join(lines), chat_id, message_id,
+        _edit("\n".join(lines), chat_id, message_id,
             parse_mode='HTML', reply_markup=kb)
 
     def p_admins_open(cb):
@@ -780,7 +802,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_add_admin')
     def p_add_admin(cb):
         if not is_primary_admin(cb.from_user.id): return
-        pbot.edit_message_text(
+        _edit(
             f"<b>{TE_PLUS} Введи Telegram ID нового администратора:</b>\n"
             "<i>(он должен сначала написать любому боту, чтобы Telegram знал его ID)</i>",
             cb.message.chat.id, cb.message.message_id,
@@ -805,7 +827,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_change_primary')
     def p_change_primary(cb):
         if not is_primary_admin(cb.from_user.id): return
-        pbot.edit_message_text(
+        _edit(
             f"<b>{TE_REFRESH} Введи Telegram ID нового главного администратора:</b>\n"
             "<i>Главный администратор может управлять другими админами и удалить бота</i>",
             cb.message.chat.id, cb.message.message_id,
@@ -830,7 +852,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_edit_welcome')
     def p_edit_welcome(cb):
         if not is_admin(cb.from_user.id): return
-        pbot.edit_message_text(
+        _edit(
             f"<b>{TE_PENCIL} Введи новый текст приветствия</b>\n\n"
             "Поддерживается HTML:\n"
             "<code>&lt;b&gt;жирный&lt;/b&gt;</code>, <code>&lt;i&gt;курсив&lt;/i&gt;</code>\n\n"
@@ -852,7 +874,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_delete_bot')
     def p_delete_bot(cb):
         if not is_primary_admin(cb.from_user.id): return
-        pbot.edit_message_text(
+        _edit(
             f"<b>{TE_EXCLAM} Ты уверен что хочешь удалить бота?\n\n"
             "• Бот остановится навсегда\n"
             "• Все данные пользователей будут удалены\n"
@@ -863,14 +885,14 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_cancel_delete')
     def p_cancel_delete(cb):
         if not is_primary_admin(cb.from_user.id): return
-        pbot.edit_message_text(f"<b>{TE_KEYBOARD} Панель админа</b>",
+        _edit(f"<b>{TE_KEYBOARD} Панель админа</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_admin())
 
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_confirm_delete')
     def p_confirm_delete(cb):
         if not is_primary_admin(cb.from_user.id): return
-        pbot.edit_message_text(
+        _edit(
             f"<b>{TE_CHECK}  Бот удалён. Спасибо за использование!</b>",
             cb.message.chat.id, cb.message.message_id, parse_mode='HTML')
         db_deactivate_bot(db_bot_id)
@@ -895,7 +917,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             )
         kb.add(_pbtn('Назад', icon='🔙', callback_data='p_back_admin'))
         ton_text = f"\n{TE_DIAMOND} Эквивалент: ~<b>{ton_equiv} TON</b>" if ton_equiv else ""
-        pbot.edit_message_text(
+        _edit(
             f"{TE_MONEY} <b>Мой баланс</b>\n\n"
             f"{TE_DOLLAR} Текущий баланс: <b>{balance:.4f} USDT</b>{ton_text}\n"
             f"{TE_CHART} Всего заработано: <b>{total:.4f} USDT</b>\n\n"
@@ -911,7 +933,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             pbot.answer_callback_query(cb.id, "❌ Баланс равен нулю", show_alert=True)
             return
         pstate[cb.from_user.id] = {'step': 'p_await_ton_address', 'balance': balance}
-        pbot.edit_message_text(
+        _edit(
             f"<b>{TE_MONEY} Вывод средств</b>\n\n"
             f"Баланс для вывода: <b>{balance:.4f} USDT</b>\n\n"
             f"Введи свой TON-адрес (кошелёк для получения):",
@@ -1026,7 +1048,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                 show_alert=True)
             return
         kb.add(_pbtn('Назад', icon='🔙', callback_data='p_balance'))
-        pbot.edit_message_text(
+        _edit(
             f"<b>{TE_CLOCK} Продление через баланс</b>\n\n"
             f"Баланс: <b>{balance:.4f} USDT</b>\n"
             f"Цена 30 дней: <b>{price} USDT</b>\n\n"
@@ -1056,7 +1078,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         db_deduct_bot_earnings(db_bot_id, cost)
         new_exp = db_renew_bot(db_bot_id, days)
         exp_str = str(new_exp)[:10] if new_exp else '—'
-        pbot.edit_message_text(
+        _edit(
             f"{TE_CHECK} <b>Бот продлён на {days} дней!</b>\n\n"
             f"Списано: <b>{cost:.4f} USDT</b>\n"
             f"Подписка до: <b>{exp_str}</b>",
@@ -1067,7 +1089,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_broadcast')
     def p_broadcast_start(cb):
         if not is_admin(cb.from_user.id): return
-        pbot.edit_message_text(f"<b>{TE_ANNOUNCE} Выбери тип рассылки:</b>",
+        _edit(f"<b>{TE_ANNOUNCE} Выбери тип рассылки:</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=broadcast_type_kb('p'))
 
@@ -1075,11 +1097,11 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def p_broadcast_type(cb):
         if not is_admin(cb.from_user.id): return
         if 'text' in cb.data:
-            pbot.edit_message_text(f"<b>{TE_NOTE} Введи текст рассылки (HTML):</b>",
+            _edit(f"<b>{TE_NOTE} Введи текст рассылки (HTML):</b>",
                 cb.message.chat.id, cb.message.message_id, parse_mode='HTML')
             pstate[cb.from_user.id] = 'p_bcast_text'
         else:
-            pbot.edit_message_text(f"<b>{TE_PICTURE} Отправь фото с подписью (или без):</b>",
+            _edit(f"<b>{TE_PICTURE} Отправь фото с подписью (или без):</b>",
                 cb.message.chat.id, cb.message.message_id, parse_mode='HTML')
             pstate[cb.from_user.id] = 'p_bcast_photo'
 

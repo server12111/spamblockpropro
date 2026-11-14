@@ -159,6 +159,25 @@ def register(bot: telebot.TeleBot):
     bot.exception_handler = _EH()
 
     state = DBState(0)
+    def _edit(text, chat_id, message_id, reply_markup=None, parse_mode='HTML'):
+        """edit_message_text с фолбэком: Telegram не даёт править сообщения
+        старше 48 часов (InaccessibleMessage) — шлём новое с тем же содержимым."""
+        try:
+            return bot.edit_message_text(text, chat_id, message_id,
+                                         parse_mode=parse_mode,
+                                         reply_markup=reply_markup)
+        except Exception as e:
+            s = str(e).lower()
+            if 'not modified' in s:
+                return True
+            try:
+                return bot.send_message(chat_id, text,
+                                        parse_mode=parse_mode,
+                                        reply_markup=reply_markup)
+            except Exception as e2:
+                log.warning(f'_edit fallback failed: {e2}')
+                return None
+
     _bot_username_cache = [None]
 
     def _get_bot_username():
@@ -232,14 +251,14 @@ def register(bot: telebot.TeleBot):
                 if token not in running_bots:
                     launch_bot(bot_id, token, admin_id_val, bot)
             exp_str = str(new_exp)[:10] if new_exp else '—'
-            bot.edit_message_text(
+            _edit(
                 f"{TE_CHECK} <b>Подписка успешно продлена на {renew_days} дней!</b>\n\n"
                 f"Действует до: <b>{exp_str}</b>",
                 chat_id, message_id, parse_mode='HTML', reply_markup=close_kb())
         else:
             db_mark_paid(uid)
             state[uid] = 'await_bot_token'
-            bot.edit_message_text(
+            _edit(
                 f"{TE_CHECK} <b>Оплата получена!\n\n"
                 f"{TE_ROBOT} Введи токен своего бота (получи в @BotFather):</b>",
                 chat_id, message_id, parse_mode='HTML', reply_markup=cancel_kb())
@@ -361,7 +380,7 @@ def register(bot: telebot.TeleBot):
     def back_to_start_cb(cb):
         state.pop(cb.from_user.id, None)
         db_del_pending(cb.from_user.id)
-        bot.edit_message_text(start_text(),
+        _edit(start_text(),
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=start_kb())
 
@@ -372,14 +391,14 @@ def register(bot: telebot.TeleBot):
         db_del_pending(uid)
         disc = db_get_discount_count(uid)
         show_trial = not db_has_used_trial(uid)
-        bot.edit_message_text(buy_text(),
+        _edit(buy_text(),
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=payment_kb(disc, show_trial))
 
     # ── Отправить сообщение ──────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'user_send')
     def user_send(cb):
-        bot.edit_message_text(f"<b>{TE_CHAT}  Введи своё сообщение:</b>",
+        _edit(f"<b>{TE_CHAT}  Введи своё сообщение:</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=back_to_start_kb())
         state[cb.from_user.id] = 'await_user_msg'
@@ -387,7 +406,7 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data.startswith('admin_reply_'))
     def admin_reply(cb):
         target = int(cb.data.split('_')[-1])
-        bot.edit_message_text(f"<b>{TE_CHAT}  Введи ответ:</b>",
+        _edit(f"<b>{TE_CHAT}  Введи ответ:</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=cancel_kb())
         state[cb.from_user.id] = f'await_admin_msg_{target}'
@@ -441,7 +460,7 @@ def register(bot: telebot.TeleBot):
             db_mark_coupon_used(uid)
             db_mark_paid(uid)
             state[uid] = {'step': 'await_bot_token_free', 'days': coupon_days}
-            bot.edit_message_text(
+            _edit(
                 f"{TE_GIFT} <b>У тебя есть бесплатный купон на {coupon_days} дней!</b>\n\n"
                 f"{TE_ROBOT} Введи токен своего бота (получи в @BotFather):",
                 cb.message.chat.id, cb.message.message_id,
@@ -451,7 +470,7 @@ def register(bot: telebot.TeleBot):
         # Уже оплатил — продолжаем настройку
         if db_is_paid(uid):
             state[uid] = 'await_bot_token'
-            bot.edit_message_text(
+            _edit(
                 f"{TE_CHECK} <b>Оплата уже получена!\n\n"
                 f"{TE_ROBOT} Введи токен своего бота (получи в @BotFather):</b>",
                 cb.message.chat.id, cb.message.message_id,
@@ -480,7 +499,7 @@ def register(bot: telebot.TeleBot):
                 kb.add(_btn(f"Продлить {name} (+30д.)", style='success', callback_data=f'renew_bot_{bot_id}'))
             kb.add(_btn('Купить новый бот', style='primary', callback_data='buy_new_bot'))
             kb.add(_btn('Назад', icon='🔙', callback_data='back_to_start'))
-            bot.edit_message_text("\n".join(lines),
+            _edit("\n".join(lines),
                 cb.message.chat.id, cb.message.message_id,
                 parse_mode='HTML', reply_markup=kb)
             return
@@ -488,7 +507,7 @@ def register(bot: telebot.TeleBot):
         # Нет ботов — обычная покупка
         disc = db_get_discount_count(uid)
         show_trial = not db_has_used_trial(uid)
-        bot.edit_message_text(buy_text(),
+        _edit(buy_text(),
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=payment_kb(disc, show_trial))
 
@@ -497,7 +516,7 @@ def register(bot: telebot.TeleBot):
         uid = cb.from_user.id
         disc = db_get_discount_count(uid)
         show_trial = not db_has_used_trial(uid)
-        bot.edit_message_text(buy_text(),
+        _edit(buy_text(),
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=payment_kb(disc, show_trial))
 
@@ -511,7 +530,7 @@ def register(bot: telebot.TeleBot):
             new_state['via_bot_id'] = cur['via_bot_id']
         state[uid] = new_state
         disc = db_get_discount_count(uid)
-        bot.edit_message_text(
+        _edit(
             f"<b>{TE_REFRESH} Продление подписки на 30 дней</b>\n\n"
             f"Сумма: <b>{get_price()} USDT</b>\n\n"
             f"Выбери способ оплаты:",
@@ -545,7 +564,7 @@ def register(bot: telebot.TeleBot):
         db_mark_trial_used(uid)
         db_mark_paid(uid)
         state[uid] = 'await_bot_token_trial'
-        bot.edit_message_text(
+        _edit(
             f"{TE_GIFT} <b>Бесплатный пробный период (3 дня) активирован!\n\n"
             f"{TE_ROBOT} Введи токен своего бота (получи в @BotFather):</b>",
             cb.message.chat.id, cb.message.message_id,
@@ -572,7 +591,7 @@ def register(bot: telebot.TeleBot):
             bot.answer_callback_query(cb.id, "❌ Ошибка создания инвойса. Попробуй ещё раз.", show_alert=True)
             return
         db_set_pending(cb.from_user.id, invoice['invoice_id'])
-        bot.edit_message_text(
+        _edit(
             f"<b>{TE_CARD} Оплата через CryptoBot</b>\n\n"
             f"Сумма: <b>{get_price()} USDT</b>\n\n"
             f"Нажми кнопку ниже, оплати и вернись сюда — нажми «Проверить оплату».",
@@ -612,7 +631,7 @@ def register(bot: telebot.TeleBot):
         kb.add(_btn('Открыть TON Keeper и оплатить', icon='💎', style='primary', url=link))
         kb.add(_btn('Я оплатил — проверить', icon='✔️', style='success', callback_data='ton_check_auto'))
         kb.add(_btn('Назад', icon='🔙', callback_data='back_to_payment'))
-        bot.edit_message_text(
+        _edit(
             f"<b>{TE_DIAMOND} Оплата через TON Keeper</b>\n\n"
             f"Сумма: <b>{ton_amount} TON</b> (~${get_price()})\n\n"
             f"Нажми кнопку ниже — TON Keeper откроется с уже заполненной суммой, адресом и комментарием.\n\n"
@@ -635,7 +654,7 @@ def register(bot: telebot.TeleBot):
         ton_amount   = s['ton']
         payment_code = s.get('code', f"SPB{uid}")
         bot.answer_callback_query(cb.id, "🔍 Проверяю блокчейн...")
-        bot.edit_message_text(f"<b>{TE_SEARCH} Проверяю блокчейн TON...</b>",
+        _edit(f"<b>{TE_SEARCH} Проверяю блокчейн TON...</b>",
             cb.message.chat.id, cb.message.message_id, parse_mode='HTML')
         found = ton_check_transfer(uid, ton_amount, payment_code)
         if found:
@@ -656,7 +675,7 @@ def register(bot: telebot.TeleBot):
             kb.add(_btn('Открыть TON Keeper', icon='💎', style='primary', url=link))
             kb.add(_btn('Проверить снова', style='primary', callback_data='ton_check_auto'))
             kb.add(_btn('Назад', icon='🔙', callback_data='back_to_payment'))
-            bot.edit_message_text(
+            _edit(
                 f"<b>{TE_CROSS}  Оплата не найдена</b>\n\n"
                 f"Убедись что:\n"
                 f"• Отправил <b>{ton_amount} TON</b>\n"
@@ -745,14 +764,14 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data == 'broadcast')
     def broadcast_start(cb):
         if cb.from_user.id != SUPER_ADMIN: return
-        bot.edit_message_text(f"<b>{TE_ANNOUNCE} Выбери тип рассылки:</b>",
+        _edit(f"<b>{TE_ANNOUNCE} Выбери тип рассылки:</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=broadcast_type_kb('mine'))
 
     @bot.callback_query_handler(func=lambda c: c.data == 'broadcast_all')
     def broadcast_all_start(cb):
         if cb.from_user.id != SUPER_ADMIN: return
-        bot.edit_message_text(f"<b>{TE_ANNOUNCE} Рассылка по всем ботам. Выбери тип:</b>",
+        _edit(f"<b>{TE_ANNOUNCE} Рассылка по всем ботам. Выбери тип:</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=broadcast_type_kb('all'))
 
@@ -762,11 +781,11 @@ def register(bot: telebot.TeleBot):
         parts = cb.data.split('_')
         btype, scope = parts[1], parts[2]
         if btype == 'text':
-            bot.edit_message_text(f"<b>{TE_NOTE} Введи текст рассылки (HTML):</b>",
+            _edit(f"<b>{TE_NOTE} Введи текст рассылки (HTML):</b>",
                 cb.message.chat.id, cb.message.message_id, parse_mode='HTML')
             state[cb.from_user.id] = f'bcast_text_{scope}'
         else:
-            bot.edit_message_text(f"<b>{TE_PICTURE} Отправь фото с подписью (или без):</b>",
+            _edit(f"<b>{TE_PICTURE} Отправь фото с подписью (или без):</b>",
                 cb.message.chat.id, cb.message.message_id, parse_mode='HTML')
             state[cb.from_user.id] = f'bcast_photo_{scope}'
 
@@ -813,7 +832,7 @@ def register(bot: telebot.TeleBot):
                 f"{'─'*28}\n"
                 f"{TE_NOTE} Боты по кол-ву пользователей:\n"
                 f"{chr(10).join(lines) if lines else '  —'}")
-        bot.edit_message_text(text, cb.message.chat.id, cb.message.message_id,
+        _edit(text, cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=close_kb())
 
     # ── Управление ботами ────────────────────────────────
@@ -827,7 +846,7 @@ def register(bot: telebot.TeleBot):
         if not bots_list:
             text = f"<b>{TE_ROBOT} Нет активных ботов</b>"
             if message_id:
-                bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=close_kb())
+                _edit(text, chat_id, message_id, parse_mode='HTML', reply_markup=close_kb())
             else:
                 bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=close_kb())
             return
@@ -856,7 +875,7 @@ def register(bot: telebot.TeleBot):
         kb.add(_btn('Закрыть', icon='❌', style='danger', callback_data='close'))
         text = f"<b>{TE_ROBOT} Управление ботами</b>\n\n" + "\n".join(lines)
         if message_id:
-            bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
+            _edit(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
         else:
             bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=kb)
 
@@ -932,7 +951,7 @@ def register(bot: telebot.TeleBot):
                  callback_data=f'bot_delete_yes_{bot_id}'),
         )
         kb.add(_btn('Отмена', icon='❌', callback_data=f'bot_delete_no_{bot_id}'))
-        bot.edit_message_text(
+        _edit(
             f"{TE_BLOCK} <b>Удаление Bot #{bot_id}</b>\n\n"
             f"• Бот будет остановлен и отключён\n"
             f"• Владелец получит уведомление\n"
@@ -945,7 +964,7 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data == 'set_price')
     def set_price_cb(cb):
         if cb.from_user.id != SUPER_ADMIN: return
-        bot.edit_message_text(
+        _edit(
             f"<b>{TE_MONEY} Текущая цена: {get_price()} USDT</b>\n\n"
             f"Введи новую цену (например: 5 или 9.99):",
             cb.message.chat.id, cb.message.message_id,
@@ -980,7 +999,7 @@ def register(bot: telebot.TeleBot):
             kb = InlineKeyboardMarkup()
             kb.add(_btn('Назад', icon='🔙', callback_data='back_admin_panel'))
             if message_id:
-                bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
+                _edit(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
             else:
                 bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=kb)
             return
@@ -1003,7 +1022,7 @@ def register(bot: telebot.TeleBot):
         kb.add(_btn('Назад', icon='🔙', callback_data='back_admin_panel'))
         text = "\n".join(lines)
         if message_id:
-            bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
+            _edit(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
         else:
             bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=kb)
 
@@ -1020,7 +1039,7 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data == 'back_admin_panel')
     def back_admin_panel_cb(cb):
         if cb.from_user.id != SUPER_ADMIN: return
-        bot.edit_message_text(f"<b>{TE_KEYBOARD} Панель супер-админа</b>",
+        _edit(f"<b>{TE_KEYBOARD} Панель супер-админа</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=super_admin_kb())
 
@@ -1036,7 +1055,7 @@ def register(bot: telebot.TeleBot):
         kb.add(_btn('Купон для нового бота',     icon='🎁', style='success', callback_data='free_coupon'))
         kb.add(_btn('Продлить существующий бот', style='primary', callback_data='free_renew'))
         kb.add(_btn('Назад', icon='🔙', callback_data='back_admin_panel'))
-        bot.edit_message_text(
+        _edit(
             f"{TE_GIFT} <b>Бесплатная выдача</b>\n\n"
             "Выбери тип:",
             cb.message.chat.id, cb.message.message_id,
@@ -1045,7 +1064,7 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data == 'free_coupon')
     def free_coupon_cb(cb):
         if cb.from_user.id != SUPER_ADMIN: return
-        bot.edit_message_text(
+        _edit(
             f"<b>{TE_NEW} Купон для нового бота</b>\n\n"
             "Введи в формате:\n<code>user_id дни</code>\n\n"
             "Пример: <code>123456789 30</code>",
@@ -1085,7 +1104,7 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data == 'free_renew')
     def free_renew_cb(cb):
         if cb.from_user.id != SUPER_ADMIN: return
-        bot.edit_message_text(
+        _edit(
             f"<b>{TE_REFRESH} Бесплатное продление бота</b>\n\n"
             "Введи в формате:\n<code>bot_id дни</code>\n\n"
             "Пример: <code>5 30</code>",
@@ -1141,7 +1160,7 @@ def register(bot: telebot.TeleBot):
             kb = InlineKeyboardMarkup()
             kb.add(_btn('Назад', icon='🔙', callback_data='back_admin_panel'))
             if message_id:
-                bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
+                _edit(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
             else:
                 bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=kb)
             return
@@ -1158,7 +1177,7 @@ def register(bot: telebot.TeleBot):
             )
         kb.add(_btn('Назад', icon='🔙', callback_data='back_admin_panel'))
         if message_id:
-            bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
+            _edit(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
         else:
             bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=kb)
 

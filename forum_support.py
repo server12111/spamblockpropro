@@ -1097,8 +1097,12 @@ def queue_random_message(pbot, bot_id: int, m) -> None:
     kb = _confirm_kb()
     if prompt_id:
         try:
-            pbot.edit_message_text(text, m.chat.id, prompt_id,
-                                   parse_mode='HTML', reply_markup=kb)
+            res = _edit(pbot, text, m.chat.id, prompt_id,
+                        parse_mode='HTML', reply_markup=kb)
+            # если фолбэк создал новое сообщение — обновляем id промпта,
+            # чтобы счётчик очереди продолжал работать и после 48 часов
+            if isinstance(res, t.Message) and res.message_id != prompt_id:
+                fs_set_prompt(bot_id, uid, res.message_id)
             return
         except ApiTelegramException as e:
             if 'not modified' in _err_low(e):
@@ -1112,6 +1116,25 @@ def queue_random_message(pbot, bot_id: int, m) -> None:
     except Exception as e:
         log.warning(f'queue prompt bot#{bot_id} uid={uid}: {e}')
 
+
+
+def _edit(pbot, text, chat_id, message_id, reply_markup=None, parse_mode='HTML'):
+    """edit_message_text с фолбэком на новое сообщение (лимит Telegram 48 ч)."""
+    try:
+        return pbot.edit_message_text(text, chat_id, message_id,
+                                      parse_mode=parse_mode,
+                                      reply_markup=reply_markup)
+    except Exception as e:
+        s = str(e).lower()
+        if 'not modified' in s:
+            return True
+        try:
+            return pbot.send_message(chat_id, text,
+                                     parse_mode=parse_mode,
+                                     reply_markup=reply_markup)
+        except Exception as e2:
+            log.warning(f'_edit fallback failed: {e2}')
+            return None
 
 def _fbtn(text, icon=None, style=None, **kwargs):
     """Кнопка с премиум-иконкой (аналог _pbtn в purchased_bot)."""
@@ -1242,7 +1265,7 @@ def confirm_send(pbot, bot_id: int, cb) -> None:
         fs_delete_pending(bot_id, uid)
         pbot.answer_callback_query(cb.id, '✅ Отправлено')
         try:
-            pbot.edit_message_text(f'<b>{TE_CHECK}  Сообщение отправлено</b>',
+            _edit(pbot, f'<b>{TE_CHECK}  Сообщение отправлено</b>',
                                    cb.message.chat.id, cb.message.message_id,
                                    parse_mode='HTML')
         except Exception:
@@ -1258,7 +1281,7 @@ def confirm_cancel(pbot, bot_id: int, cb) -> None:
     fs_delete_pending(bot_id, uid)
     pbot.answer_callback_query(cb.id, 'Очередь отменена')
     try:
-        pbot.edit_message_text(f'<b>{TE_CROSS} Очередь отменена</b>',
+        _edit(pbot, f'<b>{TE_CROSS} Очередь отменена</b>',
                                cb.message.chat.id, cb.message.message_id,
                                parse_mode='HTML')
     except Exception:
@@ -1371,7 +1394,7 @@ def connect_start(pbot, bot_id: int, cb, pstate):
     kb = InlineKeyboardMarkup()
     kb.add(_fbtn('Отмена', icon='❌', callback_data='fs_connect_cancel'))
     try:
-        pbot.edit_message_text(
+        _edit(pbot, 
             f'<b>{TE_LINK}  Подключение группы техподдержки</b>\n\n'
             '1️⃣ Добавь бота в свою группу с темами и назначь администратором с правами:\n'
             '   • Управление темами\n'
@@ -1407,7 +1430,7 @@ def disconnect_confirm(pbot, bot_id: int, cb):
                                 style='danger'))
     kb.add(_fbtn('Отмена', icon='❌', callback_data='fs_group_menu'))
     try:
-        pbot.edit_message_text(
+        _edit(pbot, 
             f'<b>{TE_CROSS}  Отключение группы техподдержки</b>\n\n'
             'Обращения снова будут приходить администраторам в личные сообщения.\n'
             'Связи пользователь→тема будут сброшены (данные пользователей сохранятся).\n\n'
@@ -1420,7 +1443,7 @@ def disconnect_yes(pbot, bot_id: int, cb):
     chat_id = fs_unbind_group(bot_id)
     pbot.answer_callback_query(cb.id, '✅ Группа отключена')
     try:
-        pbot.edit_message_text(
+        _edit(pbot, 
             f'{TE_CHECK} <b>Группа (<code>{chat_id}</code>) отключена.</b>\n\n'
             'Возврат в стандартный режим: обращения приходят администраторам в ЛС.',
             cb.message.chat.id, cb.message.message_id, parse_mode='HTML')
@@ -1462,7 +1485,7 @@ def menu_kb(bot_id: int) -> InlineKeyboardMarkup:
     return kb
 
 def menu_show(pbot, bot_id: int, cb):
-    pbot.edit_message_text(menu_text(bot_id), cb.message.chat.id, cb.message.message_id,
+    _edit(pbot, menu_text(bot_id), cb.message.chat.id, cb.message.message_id,
                            parse_mode='HTML', reply_markup=menu_kb(bot_id))
 
 
