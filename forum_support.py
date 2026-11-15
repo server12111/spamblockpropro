@@ -1796,8 +1796,11 @@ def _can_manage_group(bot_id: int, uid: int) -> bool:
     return bool(info and (uid == info[2] or uid == info[1]))
 
 
-def register_forum_support(pbot, bot_id: int, pstate, is_admin, confirm_kb=_confirm_kb):
+def register_forum_support(pbot, bot_id: int, pstate, is_admin, confirm_kb=_confirm_kb,
+                           direct_route=None):
     """Регистрирует обработчики форум-режима на дочернем боте.
+    direct_route(m) — доставка случайного сообщения юзера СРАЗУ (тема/админы)
+    без очереди подтверждения; очередь остаётся только анти-потерей при сбое.
     Возвращает route-функцию для маршрутизации обращений пользователя."""
     bot_self_id = 0
     try:
@@ -1855,6 +1858,7 @@ def register_forum_support(pbot, bot_id: int, pstate, is_admin, confirm_kb=_conf
             log.error(f'fs connect private bot#{bot_id}: {e}', exc_info=True)
 
     # ── случайные сообщения пользователя (без кнопки p_send) ──
+    # доставляются СРАЗУ (direct_route); очередь — только анти-потеря при сбое
     @pbot.message_handler(
         func=lambda m: m.chat.type == 'private'
                        and pstate.get(m.from_user.id) is None
@@ -1863,6 +1867,8 @@ def register_forum_support(pbot, bot_id: int, pstate, is_admin, confirm_kb=_conf
         content_types=USER_MSG_TYPES)
     def _fs_random_user_msg(m):
         try:
+            if direct_route is not None and direct_route(m):
+                return
             queue_random_message(pbot, bot_id, m)
         except Exception as e:
             log.error(f'fs random msg bot#{bot_id}: {e}', exc_info=True)

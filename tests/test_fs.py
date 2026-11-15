@@ -1056,16 +1056,22 @@ try:
     copied_id = copies22[-1][3]
     mapped30 = fs.fs_get_mapping(-1001212121212, copied_id)
     check('маппинг интеграции записан', mapped30 is not None and mapped30[1] == 4001)
-    # 3) случайное сообщение (без состояния) → очередь подтверждения
+    # 3) случайное сообщение (без состояния) → доставляется СРАЗУ в тему
+    # (очередь подтверждения убрана: без промптов, сразу админу)
+    fs._rate_cache.pop((30, 4001), None)   # снимаем лимит от p_send-сообщения
     m30b = make_user_msg(uid=4001, mid=9102, text='внеплановое в интеграции')
     dispatch_msg(pbot22x, m30b)
     pend30 = fs.fs_get_pending(30, 4001)
-    check('случайное сообщение → очередь подтверждения', pend30 is not None)
-    # rate limit сработал на p_send-сообщении — очищаем, чтобы подтвердить сразу
-    fs._rate_cache.pop((30, 4001), None)
+    check('случайное сообщение НЕ попадает в очередь', pend30 is None)
+    copies30b = [c for c in _api_log if c[0] == 'copy_message' and c[1][0] == -1001212121212]
+    check('случайное сообщение доставлено в тему сразу', len(copies30b) >= 2)
+    mapped30b = fs.fs_get_mapping(-1001212121212, copies30b[-1][3])
+    check('маппинг случайного сообщения записан',
+          mapped30b is not None and mapped30b[1] == 4001 and mapped30b[3] == 9102)
+    # подтверждение без очереди → «Очередь пуста», ничего не ломает
     cb30b = make_cb('fs_confirm_send', from_id=4001)
     dispatch_cb(pbot22x, cb30b)
-    check('подтверждение доставило очередь', fs.fs_get_pending(30, 4001) is None)
+    check('fs_confirm_send без очереди безопасен', fs.fs_get_pending(30, 4001) is None)
     # 4) админ пишет случайное сообщение → не попадает в очередь
     m30c = make_user_msg(uid=70001, mid=9103, text='админ что-то пишет')
     dispatch_msg(pbot22x, m30c)

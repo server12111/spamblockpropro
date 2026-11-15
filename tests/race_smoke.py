@@ -151,10 +151,28 @@ def run():
     _c = _sq_mod.connect(db.DB_PATH)
     _users = _c.execute('SELECT COUNT(*) FROM bot_users WHERE bot_id=? AND user_id>=2001', (bot_id,)).fetchone()[0]
     _msgs = _c.execute('SELECT COUNT(*) FROM fs_pending WHERE bot_id=? AND user_id>=2001', (bot_id,)).fetchone()[0]
-    _items = _c.execute('SELECT COALESCE(SUM(json_array_length(payload)),0) FROM fs_pending WHERE bot_id=? AND user_id>=2001', (bot_id,)).fetchone()[0]
     _c.close()
-    check('гонки: 3 очереди подтверждения', _msgs == 3, str(_msgs))
-    check('гонки: все 30 сообщений сохранены в очередях (без потерянных апдейтов)', _items == 30, str(_items))
+    # случайные сообщения доставляются СРАЗУ (очередь — только анти-потеря):
+    # rate limit отсеивает бёрсты, но НИЧЕГО не теряется и не падает
+    check('гонки: 3 юзера зарегистрированы', _users == 3, str(_users))
+    check('гонки: очереди не копятся (доставка прямая)', _msgs == 0, str(_msgs))
+
+    # lost-update регресс fs_append_pending теперь юнит-уровнем:
+    # 3 потока × 10 сообщений в одну очередь → все 30 на месте
+    from forum_support import fs_append_pending
+    race_items = []
+    def qworker(uid):
+        for i in range(10):
+            fs_append_pending(bot_id, 3000 + uid,
+                              {'mid': 7000 + uid * 10 + i, 'type': 'text', 'mg': ''})
+    qths = [_th.Thread(target=qworker, args=(u,)) for u in (1, 2, 3)]
+    for _t in qths: _t.start()
+    for _t in qths: _t.join(60)
+    _c = _sq_mod.connect(db.DB_PATH)
+    _items = _c.execute('SELECT COALESCE(SUM(json_array_length(payload)),0) FROM fs_pending '
+                        "WHERE bot_id=? AND user_id>=3000 AND status='pending'", (bot_id,)).fetchone()[0]
+    _c.close()
+    check('lost-update: все 30 сообщений сохранены (3 потока в одну очередь)', _items == 30, str(_items))
     print(f'  ⏱ {dt:.1f}s')
 
     print('── ИТОГ ──')

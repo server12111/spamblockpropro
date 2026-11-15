@@ -214,13 +214,16 @@ try:
     dcb(pb, ucb('cancel', uid=888))
 finally:
     telebot.TeleBot.delete_message = _orig_del
-# после cancel юзер НЕ должен остаться в await_msg: текст уходит в очередь
-# подтверждения (промпт «Отправить сообщение администратору?»), а не как доставка
+# после cancel юзер НЕ должен остаться в await_msg: следующее сообщение
+# доставляется СРАЗУ админам (бот без группы) — без промптов очереди
 dmsg(pb, umsg(888, 'проверка состояния', 230))
-check('после cancel юзер попал в очередь подтверждения (состояние снято)',
-      any('Отправить сообщение администратору' in (txt or '') for _, txt in SEND_LOG))
-check('нет подтверждения доставки из застрявшего await_msg',
-      not any('Сообщение отправлено<' in (txt or '') for _, txt in SEND_LOG))
+check('после cancel сообщение доставлено админам сразу (состояние снято)',
+      any(cid == SUPER and 'Сообщение от:' in (txt or '') for cid, txt in SEND_LOG),
+      [(c, (t or '')[:40]) for c, t in SEND_LOG])
+check('юзеру показано «Сообщение отправлено»',
+      any(cid == 888 and 'Сообщение отправлено' in (txt or '') for cid, txt in SEND_LOG))
+check('никаких промптов очереди больше нет',
+      not any('Отправить сообщение администратору' in (txt or '') for _, txt in SEND_LOG))
 
 print('── миграция группы: fs_msgs.chat_id обновляется вместе с fs_groups ──')
 from forum_support import (fs_bind_group, fs_map_message, fs_get_mapping,

@@ -561,33 +561,48 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                 f"{TE_LINK} Username: {html.escape(username)}\n"
                 f"{TE_ID} ID: <code>{m.from_user.id}</code>")
 
-    # ── Текст ──────────────────────────────────────────
-    @pbot.message_handler(func=lambda m: pstate.get(m.from_user.id) == 'await_msg')
-    def p_user_text(m):
-        if not _user_msg_checks(m): return
-        # Форум-режим: группа подключена → сообщение уходит в тему пользователя
+    def _deliver_direct(m):
+        """ПОЛНАЯ доставка обращения юзера СРАЗУ (без очереди подтверждения):
+        форум-режим → тема пользователя, иначе — админам напрямую.
+        Используется и для сообщений по кнопке p_send, и для случайных
+        (рандомные раньше копились в очереди с промптами — неудобно).
+        Возвращает False только когда доставка не удалась (сообщение уже
+        положено в анти-потерю очередь)."""
+        if not _user_msg_checks(m):
+            return True   # заблокирован/лимит — юзер уже уведомлён
         if fs_route and fs_route(m):
-            pstate.pop(m.from_user.id, None)
-            return
+            return True   # ушло в тему (или юзеру показана ошибка доставки)
         db_bump_user_contact(db_bot_id, m.from_user.id)
         fs_bump_ticket(db_bot_id, m.from_user.id)   # обращение учитывается и без группы
         header = _make_header(m)
-        user_body = m.text or ''
-        # длинные обращения: заголовок отдельно + тело кусками (html_safe_chunks)
-        if len(header) + len(html.escape(user_body)) + 10 > 4000:
-            delivered = send_to_admins_long(header, user_body,
-                                            reply_markup=pk_reply(m.from_user.id))
+        if m.content_type == 'text':
+            user_body = m.text or ''
+            if len(header) + len(html.escape(user_body)) + 10 > 4000:
+                delivered = send_to_admins_long(header, user_body,
+                                                reply_markup=pk_reply(m.from_user.id))
+            else:
+                delivered = send_to_admins(f"{header}\n\n{TE_CHAT} {html.escape(user_body)}",
+                                           reply_markup=pk_reply(m.from_user.id))
+            log_text = m.text or ''
         else:
-            delivered = send_to_admins(f"{header}\n\n{TE_CHAT} {html.escape(user_body)}",
-                                       reply_markup=pk_reply(m.from_user.id))
+            delivered = send_media_to_admins(m, header)
+            log_text = f'[{m.content_type}]'
         if not delivered:
             # ни один админ не получил (Telegram недоступен) — не теряем сообщение
             queue_random_message(pbot, db_bot_id, m)
-            pstate.pop(m.from_user.id, None)
-            return
-        db_log_message(db_bot_id, m.from_user.id, m.text or '')
-        pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Сообщение отправлено</b>",
-            parse_mode='HTML', reply_markup=pk_close())
+            return False
+        db_log_message(db_bot_id, m.from_user.id, log_text)
+        try:
+            pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Сообщение отправлено</b>",
+                parse_mode='HTML', reply_markup=pk_close())
+        except Exception:
+            pass
+        return True
+
+    # ── Текст ──────────────────────────────────────────
+    @pbot.message_handler(func=lambda m: pstate.get(m.from_user.id) == 'await_msg')
+    def p_user_text(m):
+        _deliver_direct(m)
         pstate.pop(m.from_user.id, None)
 
     # ── Медиа ──────────────────────────────────────────
@@ -598,19 +613,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         func=lambda m: pstate.get(m.from_user.id) == 'await_msg'
     )
     def p_user_media(m):
-        if not _user_msg_checks(m): return
-        if fs_route and fs_route(m):
-            pstate.pop(m.from_user.id, None)
-            return
-        db_bump_user_contact(db_bot_id, m.from_user.id)
-        fs_bump_ticket(db_bot_id, m.from_user.id)
-        if not send_media_to_admins(m, _make_header(m)):
-            queue_random_message(pbot, db_bot_id, m)
-            pstate.pop(m.from_user.id, None)
-            return
-        db_log_message(db_bot_id, m.from_user.id, f'[{m.content_type}]')
-        pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Сообщение отправлено</b>",
-            parse_mode='HTML', reply_markup=pk_close())
+        _deliver_direct(m)
         pstate.pop(m.from_user.id, None)
 
     # ── Ответ админа ───────────────────────────────────
@@ -1277,8 +1280,9 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     # ── Forum Topics: техподдержка через группу с темами ─────────
     # Регистрируется последним: все обработчики состояний выше имеют приоритет,
     # форум-обработчики ловят только то, что не перехватили они.
+    # direct_route: случайные сообщения юзеров доставляются СРАЗУ (без очереди)
     fs_route = register_forum_support(pbot, db_bot_id, pstate, is_admin,
-                                      confirm_kb=pk_close)
+                                      confirm_kb=pk_close, direct_route=_deliver_direct)
 
     return pbot
 
