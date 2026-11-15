@@ -407,7 +407,8 @@ def _is_bot_blocked(e) -> bool:
 
 def _is_chat_not_found(e) -> bool:
     s = _err_low(e)
-    return 'chat not found' in s or 'user deactivated' in s or 'peer id invalid' in s
+    return ('chat not found' in s or 'user deactivated' in s or 'peer id invalid' in s
+            or 'message to copy not found' in s or 'message to forward not found' in s)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1229,6 +1230,16 @@ def _deliver_pending_payload(pbot, bot_id: int, items: list, uid: int) -> bool:
                 else:
                     sent, thread = _relay_batch_to_topic(pbot, bot_id, group,
                                                          chat_user, uid, ids)
+            except ApiTelegramException as e:
+                if _is_chat_not_found(e):
+                    # юзер удалил свой аккаунт/сообщение — пропускаем без блокировки
+                    log.warning(f'pending skip bot#{bot_id} uid={uid}: {e}')
+                    for it in grp:
+                        it['done'] = 1
+                    continue
+                log.warning(f'pending deliver bot#{bot_id} uid={uid}: {e}')
+                all_ok = False
+                continue
             except Exception as e:
                 log.warning(f'pending deliver bot#{bot_id} uid={uid}: {e}')
                 all_ok = False
