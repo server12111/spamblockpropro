@@ -888,7 +888,8 @@ def route_user_message(pbot, bot_id: int, m, confirm_kb=None) -> bool:
         return True
     except Exception as e:
         log.warning(f'route user msg bot#{bot_id} uid={uid}: {e}')
-        if _is_bot_blocked(e) or _is_chat_not_found(e):
+        err_s = str(e).lower()
+        if _is_bot_blocked(e) or _is_chat_not_found(e) or 'not enough rights' in err_s:
             # группа недоступна боту (удалена/потеряны права) — уведомляем владельца
             _notify_owner_error(pbot, bot_id,
                                 'Бот не может писать в группу техподдержки', e)
@@ -949,6 +950,15 @@ def fs_handle_group_message(pbot, bot_id: int, m, bot_self_id: int, pstate) -> N
       и обычное сообщение в теме без Reply;
     - ответ на закреплённое инфо-сообщение = внутренняя заметка (не доставляется);
     - служебные события и сообщения не-админов игнорируются."""
+    if m.content_type == 'migrate_to_chat_id':
+        # группа была преобразована: обновляем chat_id в привязке
+        new_chat_id = getattr(m, 'migrate_to_chat_id', None)
+        if new_chat_id:
+            c = _conn()
+            c.execute('UPDATE fs_groups SET chat_id=? WHERE bot_id=?', (new_chat_id, bot_id))
+            c.commit(); c.close()
+            log.info(f'Bot #{bot_id}: группа мигрировала → chat_id {new_chat_id}')
+        return
     if m.content_type in SERVICE_TYPES:
         return
     if not m.from_user or m.from_user.id == bot_self_id:
