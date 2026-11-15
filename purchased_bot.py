@@ -119,6 +119,18 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             return True
     pbot.exception_handler = _ChildEH()
 
+    def _send_long(chat, header, body, reply_markup=None):
+        """Длинные сообщения: если header+body > 4000 символов (лимит Telegram),
+        отправляет заголовок отдельно и тело кусками по 3800 (без HTML в кусках)."""
+        if len(header) + len(body or '') + 4 <= 4000:
+            return pbot.send_message(chat, header + '\n\n' + (body or ''),
+                                     parse_mode='HTML', reply_markup=reply_markup)
+        pbot.send_message(chat, header, parse_mode='HTML', reply_markup=reply_markup)
+        body = body or ''
+        for i in range(0, len(body), 3800):
+            pbot.send_message(chat, body[i:i + 3800])
+        return True
+
     def get_welcome():
         return db_get_bot_setting(db_bot_id, 'welcome', DEFAULT_WELCOME)
 
@@ -146,7 +158,11 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def send_to_admins(text, reply_markup=None):
         for aid in db_get_bot_admins(db_bot_id):
             try:
-                pbot.send_message(aid, text, parse_mode='HTML', reply_markup=reply_markup)
+                if len(text) > 4000:
+                    _hdr, _, _body = text.partition('\n\n')
+                    _send_long(aid, _hdr, _body, reply_markup=reply_markup)
+                else:
+                    pbot.send_message(aid, text, parse_mode='HTML', reply_markup=reply_markup)
             except Exception as e:
                 log.warning(f'send_to_admins bot#{db_bot_id} admin {aid}: {e}')
 
@@ -581,7 +597,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             lines = [f"<b>{TE_INBOX} Сообщения от пользователя</b>\n{user_line}\n"]
             for msg_text, msg_ts in msgs:
                 ts = str(msg_ts)[:16] if msg_ts else ''
-                lines.append(f"{TE_CHAT} <i>{ts}</i>\n{msg_text}")
+                lines.append(f"{TE_CHAT} <i>{ts}</i>\n{html.escape(str(msg_text))}")
             restore_text = '\n\n'.join(lines)
         else:
             restore_text = f"<b>{TE_INBOX} Сообщение от пользователя</b>\n{user_line}"
@@ -690,8 +706,8 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def p_admin_text(m):
         if not is_admin(m.from_user.id): return
         target_id = int(pstate[m.from_user.id].split('_')[-1])
-        pbot.send_message(target_id, f"<b>{TE_INBOX} Сообщение от администратора\n\n{TE_CHAT} {html.escape(m.text or '')}</b>",
-            parse_mode='HTML')
+        _send_long(target_id,
+                   f"<b>{TE_INBOX} Сообщение от администратора</b>", m.text or '')
         pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Ответ отправлен</b>",
             parse_mode='HTML', reply_markup=pk_close())
         preply_cache.pop(m.from_user.id, None)
@@ -706,13 +722,18 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if not is_admin(m.from_user.id): return
         target_id = int(pstate[m.from_user.id].split('_')[-1])
         caption = m.caption or ''
-        cap_text = f"<b>{TE_INBOX} Сообщение от администратора</b>\n\n{html.escape(caption)}" if caption else f"<b>{TE_INBOX} Сообщение от администратора</b>"
-        try:
-            pbot.send_photo(target_id, m.photo[-1].file_id, caption=cap_text, parse_mode='HTML')
-        except Exception as e:
-            log.warning(f'p_admin_photo_reply failed: {e}')
-            pbot.send_message(m.chat.id, f"<b>{TE_CROSS}  Не удалось отправить фото</b>", parse_mode='HTML')
-            return
+        if len(caption) > 900:
+            # подпись > лимита Telegram (1024): фото отдельно + текст отдельно
+            pbot.send_photo(target_id, m.photo[-1].file_id)
+            _send_long(target_id, f"<b>{TE_INBOX} Сообщение от администратора</b>", caption)
+        else:
+            cap_text = f"<b>{TE_INBOX} Сообщение от администратора</b>\n\n{html.escape(caption)}" if caption else f"<b>{TE_INBOX} Сообщение от администратора</b>"
+            try:
+                pbot.send_photo(target_id, m.photo[-1].file_id, caption=cap_text, parse_mode='HTML')
+            except Exception as e:
+                log.warning(f'p_admin_photo_reply failed: {e}')
+                pbot.send_message(m.chat.id, f"<b>{TE_CROSS}  Не удалось отправить фото</b>", parse_mode='HTML')
+                return
         pstate.pop(m.from_user.id, None)
         preply_cache.pop(m.from_user.id, None)
         pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Фото отправлено</b>",
