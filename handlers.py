@@ -449,12 +449,20 @@ def register(bot: telebot.TeleBot):
                 parse_mode='HTML')
             return
         username = f"@{m.from_user.username}" if m.from_user.username else "нет"
-        text = (f"<b>{TE_INBOX} Сообщение от:</b>\n"
-                f"{TE_USER} Имя: <b>{html.escape(m.from_user.full_name)}</b>\n"
-                f"{TE_LINK} Username: {html.escape(username)}\n"
-                f"{TE_ID} ID: <code>{m.from_user.id}</code>\n\n"
-                f"{TE_CHAT} {html.escape(m.text or '')}")
-        bot.send_message(SUPER_ADMIN, text, parse_mode='HTML', reply_markup=reply_kb(m.from_user.id))
+        header = (f"<b>{TE_INBOX} Сообщение от:</b>\n"
+                  f"{TE_USER} Имя: <b>{html.escape(m.from_user.full_name)}</b>\n"
+                  f"{TE_LINK} Username: {html.escape(username)}\n"
+                  f"{TE_ID} ID: <code>{m.from_user.id}</code>")
+        body = html.escape(m.text or '')
+        # длинные обращения: заголовок отдельно + тело кусками по 3800
+        if len(header) + len(body) + 4 > 4000:
+            bot.send_message(SUPER_ADMIN, header, parse_mode='HTML',
+                             reply_markup=reply_kb(m.from_user.id))
+            for i in range(0, len(body), 3800):
+                bot.send_message(SUPER_ADMIN, body[i:i + 3800])
+        else:
+            bot.send_message(SUPER_ADMIN, header + '\n\n' + f"{TE_CHAT} {body}",
+                             parse_mode='HTML', reply_markup=reply_kb(m.from_user.id))
         bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Сообщение отправлено</b>",
             parse_mode='HTML', reply_markup=close_kb())
         state.pop(m.from_user.id, None)
