@@ -128,7 +128,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         pbot.send_message(chat, header, parse_mode='HTML', reply_markup=reply_markup)
         body = body or ''
         for i in range(0, len(body), 3800):
-            pbot.send_message(chat, body[i:i + 3800])
+            pbot.send_message(chat, html.escape(body[i:i + 3800]), parse_mode='HTML')
         return True
 
     def get_welcome():

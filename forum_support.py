@@ -1205,6 +1205,16 @@ def _deliver_pending_payload(pbot, bot_id: int, items: list, uid: int) -> bool:
             chat_user = _api(pbot.get_chat, uid)
         except Exception as e:
             log.warning(f'pending get_chat bot#{bot_id} uid={uid}: {e}')
+            if _is_chat_not_found(e) or _is_bot_blocked(e):
+                # терминальная ошибка: аккаунт удалён/заблокировал бота —
+                # очередь не может быть доставлена никогда: сбрасываем с уведомлением
+                try:
+                    pbot.send_message(uid, '<b>❌ Не удалось отправить ваши сообщения '
+                                           '(аккаунт недоступен). Очередь сброшена.</b>',
+                                      parse_mode='HTML')
+                except Exception:
+                    pass
+                return True  # очередь потреблена (сброшена), не бесконечный retry
             return False
         fs_touch_user(pbot, bot_id, chat_user)
         for mg, grp in _group_pending_items(todo):
