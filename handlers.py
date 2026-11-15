@@ -16,6 +16,7 @@ from database import (DB_PATH,
                        db_renew_bot,
                        get_price, set_price,
                        db_set_pending, db_del_pending, db_get_pending,
+                       db_take_grant_days,
                        db_mark_paid, db_is_paid, db_clear_paid,
                        db_has_used_trial, db_mark_trial_used,
                        db_set_referral, db_get_referrer, db_mark_referral_paid,
@@ -274,7 +275,7 @@ def register(bot: telebot.TeleBot):
                 f"Действует до: <b>{exp_str}</b>",
                 chat_id, message_id, parse_mode='HTML', reply_markup=close_kb())
         else:
-            db_mark_paid(uid)
+            db_mark_paid(uid, days=30)
             state[uid] = 'await_bot_token'
             _edit(
                 f"{TE_CHECK} <b>Оплата получена!\n\n"
@@ -509,7 +510,7 @@ def register(bot: telebot.TeleBot):
         coupon_days = db_get_free_coupon(uid)
         if coupon_days:
             db_mark_coupon_used(uid)
-            db_mark_paid(uid)
+            db_mark_paid(uid, days=coupon_days)
             state[uid] = {'step': 'await_bot_token_free', 'days': coupon_days}
             _edit(
                 f"{TE_GIFT} <b>У тебя есть бесплатный купон на {coupon_days} дней!</b>\n\n"
@@ -618,7 +619,7 @@ def register(bot: telebot.TeleBot):
                 "❌ Ты уже использовал бесплатный пробный период.", show_alert=True)
             return
         db_mark_trial_used(uid)
-        db_mark_paid(uid)
+        db_mark_paid(uid, days=3)
         state[uid] = 'await_bot_token_trial'
         _edit(
             f"{TE_GIFT} <b>Бесплатный пробный период (3 дня) активирован!\n\n"
@@ -791,7 +792,11 @@ def register(bot: telebot.TeleBot):
         s         = state.pop(m.from_user.id)
         token_val = s['token']
         uname     = s.get('username', '')
-        if s.get('free_days'):
+        # дни берём из гранта (однократно) — пробный/купон не превращаются в 30
+        grant_days = db_take_grant_days(m.from_user.id)
+        if grant_days is not None:
+            days = grant_days
+        elif s.get('free_days'):
             days = s['free_days']
         elif s.get('trial'):
             days = 3

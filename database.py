@@ -11,6 +11,7 @@ from config import PRICE_USDT
 log = logging.getLogger(__name__)
 
 _data_dir = os.getenv('DATA_DIR', '.')
+DATA_DIR = _data_dir  # публичный экспорт (main.py, forum_support)
 os.makedirs(_data_dir, exist_ok=True)
 DB_PATH = os.path.join(_data_dir, 'spambots.db')
 
@@ -236,6 +237,10 @@ def init_db():
             usdt_amount REAL NOT NULL,
             status      TEXT DEFAULT 'pending',
             created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS bot_grants (
+            user_id  INTEGER PRIMARY KEY,
+            days     INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS free_coupons (
             user_id    INTEGER PRIMARY KEY,
@@ -668,10 +673,30 @@ def db_get_pending(user_id: int):
     return row[0] if row else None
 
 # ── Paid Setups ───────────────────────────────────────
-def db_mark_paid(user_id: int):
+def db_mark_paid(user_id: int, days: int = 30):
+    """Отмечает оплату И записывает, на сколько дней права выдаются.
+    Пробный период (3) и купоны (N) не превращаются в 30-дневную подписку."""
     c = _conn()
     c.execute('INSERT OR IGNORE INTO paid_setups (user_id) VALUES (?)', (user_id,))
+    c.execute('INSERT OR REPLACE INTO bot_grants (user_id, days) VALUES (?,?)',
+              (user_id, max(int(days), 3)))
     c.commit(); c.close()
+
+def db_take_grant_days(user_id: int):
+    """Забирает записанные дни права (однократно). None — нет записи (30 по умолчанию)."""
+    c = _conn()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        row = c.execute('SELECT days FROM bot_grants WHERE user_id=?', (user_id,)).fetchone()
+        c.execute('DELETE FROM bot_grants WHERE user_id=?', (user_id,))
+        c.commit()
+        return row[0] if row else None
+    except Exception:
+        try:
+            c.execute('ROLLBACK')
+        except Exception:
+            pass
+        c.close(); raise
 
 def db_is_paid(user_id: int) -> bool:
     c = _conn()

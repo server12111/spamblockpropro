@@ -161,12 +161,15 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if len(text) > 4000:
             hdr, _, raw = text.partition('\n\n')
             send_to_admins_long(hdr, raw, reply_markup=reply_markup)
-            return
+            return True
+        ok = False
         for aid in db_get_bot_admins(db_bot_id):
             try:
                 pbot.send_message(aid, text, parse_mode='HTML', reply_markup=reply_markup)
+                ok = True
             except Exception as e:
                 log.warning(f'send_to_admins bot#{db_bot_id} admin {aid}: {e}')
+        return ok
 
     def send_to_admins_long(header, body_raw, reply_markup=None):
         for aid in db_get_bot_admins(db_bot_id):
