@@ -81,10 +81,14 @@ def rate_limited(bot_id: int, user_id: int, mark: bool = True) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════
-#  Локальный доступ к БД (таблицы fs_* создаются в database.init_db)
+#  Локальный доступ к БД (таблицы fs_* создаются в database.init_db).
+#  Используем общий пул database._conn: retry на disk I/O / locked,
+#  thread-local кэш соединений — та же обёртка, что у всех db_* функций.
 # ══════════════════════════════════════════════════════════════
+from database import _conn as _pooled_conn
+
 def _conn():
-    return sqlite3.connect(DB_PATH, timeout=15)
+    return _pooled_conn()
 
 
 # ── Группа ────────────────────────────────────────────────────
