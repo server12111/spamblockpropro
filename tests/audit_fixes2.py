@@ -367,6 +367,32 @@ try:
 finally:
     telebot.TeleBot.send_photo = _orig_sp
 
+print('── вывод средств: адрес с HTML не ломает список заявок ──')
+from database import db_create_withdrawal
+EDIT_LOG = []
+_orig_emt = telebot.TeleBot.edit_message_text
+def _rec_edit(self, text, chat_id, message_id, **kw):
+    EDIT_LOG.append((chat_id, text))
+    return _orig_emt(self, text, chat_id, message_id, **kw)
+telebot.TeleBot.edit_message_text = _rec_edit
+try:
+    BAD_ADDR = '<b>' * 12            # 36 символов, ломал бы HTML всего списка
+    wr = db_create_withdrawal(bot3_id, SUPER, BAD_ADDR, 5.0)
+    SEND_LOG.clear()
+    dcb(main_bot, ucb('withdrawal_list'))
+    lst = [t for _, t in EDIT_LOG if 'Запросы на вывод' in (t or '')]
+    check('список заявок сформирован с экранированным адресом',
+          lst and '&lt;b&gt;' in lst[-1], lst[-1][:200] if lst else 'нет списка')
+    check('в списке нет сырого <b> от адреса (только разметка бота)',
+          lst and '<b>' * 2 not in lst[-1])
+    # отклонение: уведомление владельцу тоже экранировано
+    SEND_LOG.clear()
+    dcb(main_bot, ucb(f'wr_reject_{wr}'))
+    check('уведомление об отклонении с экранированным адресом',
+          any(cid == SUPER and '&lt;b&gt;' in (txt or '') for cid, txt in SEND_LOG))
+finally:
+    telebot.TeleBot.edit_message_text = _orig_emt
+
 print()
 print(f'ИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL')
 sys.exit(1 if FAIL else 0)

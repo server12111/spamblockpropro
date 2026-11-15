@@ -1130,7 +1130,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                 main_bot.send_message(WITHDRAWAL_CHANNEL,
                     f"{TE_MONEY} <b>Новый запрос на вывод #{wr_id}</b>\n\n"
                     f"Bot #{db_bot_id} | Owner: <code>{owner_id}</code>\n"
-                    f"Адрес: <code>{address}</code>\n"
+                    f"Адрес: <code>{html.escape(address)}</code>\n"
                     f"Сумма: <b>{amount:.4f} USDT</b> (~{ton_equiv} TON)",
                     parse_mode='HTML', reply_markup=kb_admin)
             except Exception as e:
@@ -1138,7 +1138,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         pbot.send_message(m.chat.id,
             f"{TE_CHECK} <b>Запрос на вывод создан!</b>\n\n"
             f"Сумма: <b>{amount:.4f} USDT</b>\n"
-            f"Адрес: <code>{address}</code>\n\n"
+            f"Адрес: <code>{html.escape(address)}</code>\n\n"
             f"Администратор обработает запрос в ближайшее время.",
             parse_mode='HTML', reply_markup=pk_close())
 

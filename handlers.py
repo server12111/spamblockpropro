@@ -1292,8 +1292,10 @@ def register(bot: telebot.TeleBot):
         for wr_id, bot_id, owner_id, ton_address, usdt_amount, created_at in pending[:30]:
             shown += 1
             date = str(created_at)[:16] if created_at else '—'
+            # адрес вводит владелец бота: '<' в нём ломал бы ВЕСЬ список (400),
+            # и заявки становилось бы не видно до ручной правки БД
             text += (f"#{wr_id} | Bot #{bot_id} | Owner: <code>{owner_id}</code>\n"
-                     f"Адрес: <code>{ton_address}</code>\n"
+                     f"Адрес: <code>{html.escape(str(ton_address))}</code>\n"
                      f"Сумма: <b>{usdt_amount} USDT</b> | {date}\n\n")
             kb.row(
                 _btn(f"#{wr_id}", icon='✔️', style='success', callback_data=f'wr_confirm_{wr_id}'),
@@ -1327,7 +1329,7 @@ def register(bot: telebot.TeleBot):
             bot.send_message(owner_id,
                 f"{TE_CHECK} <b>Запрос на вывод #{wr_id} подтверждён!</b>\n\n"
                 f"Сумма: <b>{usdt_amount} USDT</b>\n"
-                f"Адрес: <code>{ton_address}</code>\n\n"
+                f"Адрес: <code>{html.escape(str(ton_address))}</code>\n\n"
                 f"Средства переведены. Спасибо!",
                 parse_mode='HTML')
         except Exception:
@@ -1356,6 +1358,7 @@ def register(bot: telebot.TeleBot):
             bot.send_message(owner_id,
                 f"{TE_CROSS} <b>Запрос на вывод #{wr_id} отклонён.</b>\n\n"
                 f"Сумма <b>{usdt_amount} USDT</b> возвращена на твой баланс.\n"
+                f"Адрес: <code>{html.escape(str(ton_address))}</code>\n"
                 f"Свяжись с поддержкой через этого бота для уточнения.",
                 parse_mode='HTML')
         except Exception:
