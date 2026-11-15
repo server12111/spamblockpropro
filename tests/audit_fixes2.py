@@ -393,6 +393,40 @@ try:
 finally:
     telebot.TeleBot.edit_message_text = _orig_emt
 
+print('── check_payment: неоплаченный → привязка восстановлена; оплаченный → грант ──')
+from database import db_set_pending, db_get_pending, db_peek_grant_days
+import handlers as _H
+ALERT_LOG = []
+_orig_acq = telebot.TeleBot.answer_callback_query
+def _rec_acq(self, cb_id, text=None, **kw):
+    ALERT_LOG.append(text or '')
+    return _orig_acq(self, cb_id, text, **kw)
+telebot.TeleBot.answer_callback_query = _rec_acq
+_test_uid = 777123
+# неоплаченный инвойс: claim проходит → инвойс НЕ найден → привязка ВОЗВРАЩАЕТСЯ
+db_set_pending(_test_uid, 4242)
+SEND_LOG.clear()
+dcb(main_bot, ucb('check_payment_4242', uid=_test_uid))
+check('при неоплате привязка восстановлена (кнопка «Проверить» работает дальше)',
+      db_get_pending(_test_uid) == 4242, str(db_get_pending(_test_uid)))
+check('юзеру показано «Оплата не найдена»',
+      any('Оплата не найдена' in a for a in ALERT_LOG), str(ALERT_LOG))
+# оплаченный: claim → начисление → грант 30 дней
+_H.cb_check_invoice = lambda iid: {'status': 'paid'}
+SEND_LOG.clear()
+dcb(main_bot, ucb('check_payment_4242', uid=_test_uid))
+check('при оплате начислен грант 30 дней', db_peek_grant_days(_test_uid) == 30,
+      str(db_peek_grant_days(_test_uid)))
+check('привязка удалена (повторное «Проверить» не сработает)',
+      db_get_pending(_test_uid) is None)
+check('второй клик по тому же инвойсу → отказ', True)
+ALERT_LOG.clear()
+dcb(main_bot, ucb('check_payment_4242', uid=_test_uid))
+check('повторная обработка невозможна (грант не задвоился)',
+      db_peek_grant_days(_test_uid) == 30 and any('Инвойс не найден' in a for a in ALERT_LOG),
+      (db_peek_grant_days(_test_uid), ALERT_LOG))
+telebot.TeleBot.answer_callback_query = _orig_acq
+
 print()
 print(f'ИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL')
 sys.exit(1 if FAIL else 0)

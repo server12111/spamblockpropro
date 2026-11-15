@@ -63,6 +63,44 @@ check('списаний ровно 3 (100 // 30)', successes == 3, f'{successes}
 check('баланс 10 (остаток не ушёл в минус)', abs(bal2 - 10.0) < 1e-9, str(bal2))
 check('без исключений', not errs, str(errs[:2]))
 
+print('── Гонка продления (2 потока × 30д = +60, не +30) ──')
+from datetime import datetime as _dt
+bid = db.db_add_bot(50, '999:race_ext_audit_regress_12345', 50, days=30)
+e0 = _dt.fromisoformat(db.db_get_bot_expires(bid))
+rr = []
+def rr_f():
+    rr.append(db.db_renew_bot(bid, 30))
+ths = [threading.Thread(target=rr_f) for _ in range(2)]
+for t in ths: t.start()
+for t in ths: t.join()
+e1 = _dt.fromisoformat(db.db_get_bot_expires(bid))
+gained = (e1 - e0).total_seconds() / 86400
+check('2 параллельных продления = +60 дней (не +30)', abs(gained - 60) < 1, f'{gained:.2f}')
+
+print('── Атомарный захват инвойса (двойное «Проверить оплату») ──')
+db.db_set_pending(60, 777)
+claims = []
+def cl():
+    claims.append(db.db_claim_pending_payment(60, 777))
+ths = [threading.Thread(target=cl) for _ in range(2)]
+for t in ths: t.start()
+for t in ths: t.join()
+check('захватов True ровно 1 (не 2)', claims.count(True) == 1, str(claims))
+check('привязка удалена после захвата', db.db_get_pending(60) is None)
+check('чужой/несуществующий инвойс → False', db.db_claim_pending_payment(60, 888) is False)
+
+print('── Атомарное списание скидки (двойное нажатие) ──')
+db.db_set_referral(70, 71)
+db.db_mark_referral_paid(71)
+disc_res = []
+def dr():
+    disc_res.append(db.db_use_discount_atomic(70))
+ths = [threading.Thread(target=dr) for _ in range(2)]
+for t in ths: t.start()
+for t in ths: t.join()
+check('списание скидки True ровно 1 (не 2)', disc_res.count(True) == 1, str(disc_res))
+check('после списания скидок 0', db.db_get_discount_count(70) == 0)
+
 print('── Конкурентные рефералы ──')
 db.db_set_referral(333, 444)
 db.db_set_referral(333, 445)

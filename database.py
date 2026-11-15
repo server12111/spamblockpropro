@@ -21,6 +21,11 @@ DB_PATH = os.path.join(_data_dir, 'spambots.db')
 # потоков, утечек нет. Ключ кэша — путь к БД (совместимо с подменой в тестах).
 _tls = threading.local()
 
+# Гейт восстановления: на время подмены файла БД (restore) ВСЕ обращения
+# через пул блокируются — параллельные операции не пишут в старый файл
+# и не создают соединения посреди замены (см. db_restore_section).
+_restore_gate = threading.RLock()
+
 class _CachedConn:
     """Обёртка: close() не закрывает кэшированное соединение, а откатывает
     незавершённую транзакцию (чтобы чужая транзакция не держала блокировку).
@@ -98,7 +103,19 @@ def _file_signature(path):
     except OSError:
         return None
 
+def db_restore_section():
+    """Контекстный менеджер-гейт: `with db_restore_section():` останавливает
+    доступ к БД всех остальных потоков пула на время restore (close_all →
+    подмена файла → init_db). Потоки просто дождутся своей очереди и
+    переоткроют соединения уже с новой БД — без режима обслуживания."""
+    return _restore_gate
+
 def _conn():
+    # во время restore ждём завершения замены файла (см. db_restore_section)
+    with _restore_gate:
+        return _conn_locked()
+
+def _conn_locked():
     path = DB_PATH
     conns = getattr(_tls, 'conns', None)
     if conns is None:
@@ -427,18 +444,31 @@ def db_get_all_bots_for_checker():
 
 # ── Subscription ──────────────────────────────────────
 def db_renew_bot(bot_id: int, days: int = 30):
+    """Продление. BEGIN IMMEDIATE: чтение expires + вычисление + запись —
+    одна атомарная транзакция, иначе два параллельных вызова читали одну
+    дату и второй терял свои дни (продлено +30 вместо +60)."""
     c = _conn()
-    row = c.execute('SELECT expires_at FROM bots WHERE id=?', (bot_id,)).fetchone()
     try:
-        current = datetime.fromisoformat(str(row[0])) if row and row[0] else datetime.now()
-        base    = max(current, datetime.now())
+        c.execute('BEGIN IMMEDIATE')
+        row = c.execute('SELECT expires_at FROM bots WHERE id=?', (bot_id,)).fetchone()
+        try:
+            current = datetime.fromisoformat(str(row[0])) if row and row[0] else datetime.now()
+            base    = max(current, datetime.now())
+        except Exception:
+            base = datetime.now()
+        new_expires = base + timedelta(days=days)
+        c.execute('UPDATE bots SET expires_at=?, active=1 WHERE id=?',
+                  (new_expires.isoformat(), bot_id))
+        c.commit()
+        return new_expires
     except Exception:
-        base = datetime.now()
-    new_expires = base + timedelta(days=days)
-    c.execute('UPDATE bots SET expires_at=?, active=1 WHERE id=?',
-              (new_expires.isoformat(), bot_id))
-    c.commit(); c.close()
-    return new_expires
+        try:
+            c.execute('ROLLBACK')
+        except Exception:
+            pass
+        c.close(); raise
+    finally:
+        c.close()
 
 # ── Bot Admins ────────────────────────────────────────
 def db_get_bot_admins(bot_id: int) -> list:
@@ -672,6 +702,31 @@ def db_get_pending(user_id: int):
     c.close()
     return row[0] if row else None
 
+def db_claim_pending_payment(user_id: int, invoice_id: int) -> bool:
+    """Атомарный захват права обработать оплату: BEGIN IMMEDIATE → проверка
+    привязки → удаление. Два одновременных «Проверить оплату» дают ровно
+    один True — второй не проходит (запись уже удалена). Начисления
+    (_after_payment_confirmed) вызываются только у победителя."""
+    c = _conn()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        row = c.execute('SELECT invoice_id FROM pending_payments WHERE user_id=?',
+                        (user_id,)).fetchone()
+        if row and row[0] == invoice_id:
+            c.execute('DELETE FROM pending_payments WHERE user_id=?', (user_id,))
+            c.commit()
+            return True
+        c.execute('ROLLBACK')
+        return False
+    except Exception:
+        try:
+            c.execute('ROLLBACK')
+        except Exception:
+            pass
+        c.close(); raise
+    finally:
+        c.close()
+
 # ── Paid Setups ───────────────────────────────────────
 def db_mark_paid(user_id: int, days: int = 30):
     """Отмечает оплату И записывает, на сколько дней права выдаются.
@@ -823,6 +878,18 @@ def db_use_discount(user_id: int):
     c.execute('''UPDATE referral_discounts SET discount_count=MAX(0, discount_count-1)
                  WHERE user_id=?''', (user_id,))
     c.commit(); c.close()
+
+def db_use_discount_atomic(user_id: int) -> bool:
+    """Атомарное списание скидки: True только если она была (discount_count>0).
+    Два параллельных нажатия при одной скидке дают ровно одно продление."""
+    c = _conn()
+    try:
+        cur = c.execute('UPDATE referral_discounts SET discount_count=discount_count-1 '
+                        'WHERE user_id=? AND discount_count>0', (user_id,))
+        c.commit()
+        return cur.rowcount > 0
+    except Exception:
+        c.rollback(); c.close(); raise
 
 # ── Bot Message Stats ─────────────────────────────────
 def db_log_message(bot_id: int, user_id: int, text: str = ''):

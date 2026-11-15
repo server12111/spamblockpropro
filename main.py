@@ -124,13 +124,23 @@ if __name__ == '__main__':
                          allowed_updates=['message', 'callback_query', 'message_reaction'])
 
     if WEBHOOK_URL:
-        from urllib.parse import urlparse
+        import hashlib
+        import hmac as _hmac
         from flask import Flask, request, abort
 
         app = Flask(__name__)
+        # путь вебхука — прежний секрет (совместимость с прокси хостинга)
         secret = TOKEN.replace(':', '_')
+        # НЕЗАВИСИМЫЙ секрет для заголовка: Telegram сам присылает его в
+        # X-Telegram-Bot-Api-Secret-Token на каждый апдейт. URL мог стать
+        # известен — без этого секрета поддельные апдейты отправлять нельзя
+        wh_secret = hashlib.sha256(('whk:' + TOKEN).encode()).hexdigest()
+        app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024  # апдейты Telegram < 256 КБ
 
         def _telegram_webhook():
+            hdr = request.headers.get('X-Telegram-Bot-Api-Secret-Token', '')
+            if not _hmac.compare_digest(hdr, wh_secret):
+                abort(403)
             if request.headers.get('content-type') == 'application/json':
                 update = telebot.types.Update.de_json(request.get_data().decode('utf-8'))
                 bot.process_new_updates([update])
@@ -162,9 +172,12 @@ if __name__ == '__main__':
             try:
                 # allowed_updates ОБЯЗАТЕЛЬНО как в polling: без него Telegram
                 # по умолчанию НЕ доставляет message_reaction — зеркалирование
-                # реакций в форум-режиме молча перестаёт работать
+                # реакций в форум-режиме молча перестаёт работать.
+                # secret_token: Telegram будет подписывать каждый апдейт этим
+                # секретом — проверяется в _telegram_webhook через compare_digest
                 bot.set_webhook(url=f'{base}/{secret}',
-                                allowed_updates=['message', 'callback_query', 'message_reaction'])
+                                allowed_updates=['message', 'callback_query', 'message_reaction'],
+                                secret_token=wh_secret)
                 webhook_ok = True
                 # секрет (производный от токена) в лог не пишем
                 log.info(f'Webhook set: {base}/***')

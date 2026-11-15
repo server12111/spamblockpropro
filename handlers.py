@@ -1,5 +1,6 @@
 import os
 import html
+import sqlite3
 import telebot
 import time
 import threading
@@ -16,11 +17,12 @@ from database import (DB_PATH, init_db,
                        db_renew_bot,
                        get_price, set_price,
                        db_set_pending, db_del_pending, db_get_pending,
+                       db_claim_pending_payment,
                        db_take_grant_days, db_peek_grant_days,
                        db_mark_paid, db_is_paid, db_clear_paid,
                        db_has_used_trial, db_mark_trial_used,
                        db_set_referral, db_get_referrer, db_mark_referral_paid,
-                       db_get_discount_count, db_use_discount,
+                       db_get_discount_count, db_use_discount_atomic,
                        db_set_marketplace, db_is_marketplace_enabled,
                        db_get_marketplace_bots,
                        db_add_bot_earnings, db_get_bot_earnings,
@@ -214,45 +216,50 @@ def register(bot: telebot.TeleBot):
         if scope == 'all': return db_get_all_users()
         return db_get_bot_users(0)
 
-    def _after_payment_confirmed(uid, chat_id, message_id, renew_days=30):
-        """Вызывается после любой успешной оплаты."""
+    def _after_payment_confirmed(uid, chat_id, message_id, renew_days=30,
+                                 is_real_payment=True):
+        """Вызывается после успешной оплаты/продления.
+        is_real_payment=False для БЕСПЛАТНЫХ действий (использование скидки):
+        партнёрская комиссия и реферальный бонус начисляются ТОЛЬКО за деньги —
+        раньше бесплатное продление по скидке могло дать 50% «за оплату»."""
         # Начисление комиссии владельцу бота через маркетплейс (50%)
         s_cur = state.get(uid)
         via_bot_id = None
         if isinstance(s_cur, dict):
             via_bot_id = s_cur.get('via_bot_id')
 
-        # Реферальный бонус при первой оплате
-        referrer = db_get_referrer(uid)
-        if referrer:
-            db_mark_referral_paid(uid)
-            try:
-                disc = db_get_discount_count(referrer)
-                bot.send_message(referrer,
-                    f"{TE_PARTY} <b>Твой реферал оплатил подписку!</b>\n\n"
-                    f"{TE_DIAMOND} Накоплено скидок: <b>{disc}</b>\n"
-                    f"Каждая скидка = 1 бесплатное продление на 10 дней.\n"
-                    f"Используй при следующей оплате через кнопку «{TE_CART} Купить бота».",
-                    parse_mode='HTML')
-            except Exception:
-                pass
-
-        # 50% комиссия владельцу бота-реферера
-        if via_bot_id:
-            commission = round(get_price() * 0.5, 4)
-            db_add_bot_earnings(via_bot_id, commission)
-            info = db_get_bot_info(via_bot_id)
-            if info:
-                owner_id_ref = info[2]
+        if is_real_payment:
+            # Реферальный бонус при первой оплате
+            referrer = db_get_referrer(uid)
+            if referrer:
+                db_mark_referral_paid(uid)
                 try:
-                    bot.send_message(owner_id_ref,
-                        f"{TE_MONEY} <b>Новая комиссия!</b>\n\n"
-                        f"Пользователь купил бота через твой бот.\n"
-                        f"Начислено: <b>{commission} USDT</b> (50%)\n\n"
-                        f"Баланс: смотри в /admin своего бота → {TE_MONEY} Мой баланс",
+                    disc = db_get_discount_count(referrer)
+                    bot.send_message(referrer,
+                        f"{TE_PARTY} <b>Твой реферал оплатил подписку!</b>\n\n"
+                        f"{TE_DIAMOND} Накоплено скидок: <b>{disc}</b>\n"
+                        f"Каждая скидка = 1 бесплатное продление на 10 дней.\n"
+                        f"Используй при следующей оплате через кнопку «{TE_CART} Купить бота».",
                         parse_mode='HTML')
                 except Exception:
                     pass
+
+            # 50% комиссия владельцу бота-реферера
+            if via_bot_id:
+                commission = round(get_price() * 0.5, 4)
+                db_add_bot_earnings(via_bot_id, commission)
+                info = db_get_bot_info(via_bot_id)
+                if info:
+                    owner_id_ref = info[2]
+                    try:
+                        bot.send_message(owner_id_ref,
+                            f"{TE_MONEY} <b>Новая комиссия!</b>\n\n"
+                            f"Пользователь купил бота через твой бот.\n"
+                            f"Начислено: <b>{commission} USDT</b> (50%)\n\n"
+                            f"Баланс: смотри в /admin своего бота → {TE_MONEY} Мой баланс",
+                            parse_mode='HTML')
+                    except Exception:
+                        pass
 
         s = state.get(uid)
         if isinstance(s, dict) and s.get('step') == 'renewing':
@@ -370,15 +377,19 @@ def register(bot: telebot.TeleBot):
                 _chk.execute('SELECT COUNT(*) FROM bots')
             finally:
                 _chk.close()
-            # бэкап текущей базы перед заменой
+            # бэкап текущей базы перед заменой.
+            # Гейт: на время подмены файла доступ к БД всех остальных потоков
+            # приостановлен (ждут в _conn), иначе параллельные операции писали
+            # бы в старый файл или открывали соединения посреди замены
             import shutil as _shutil
-            from database import db_close_all
+            from database import db_close_all, db_restore_section
             backup_path = DB_PATH + f'.pre_restore_{int(time.time())}.bak'
-            db_close_all()
-            if os.path.exists(DB_PATH):
-                _shutil.copy2(DB_PATH, backup_path)
-            os.replace(tmp_path, DB_PATH)  # атомарная замена
-            init_db()  # применяем миграции к восстановленной БД
+            with db_restore_section():
+                db_close_all()
+                if os.path.exists(DB_PATH):
+                    _shutil.copy2(DB_PATH, backup_path)
+                os.replace(tmp_path, DB_PATH)  # атомарная замена
+                init_db()  # применяем миграции к восстановленной БД
             log.info(f'БД заменена; прежняя сохранена: {backup_path}')
             bot.send_message(m.chat.id,
                 f"<b>{TE_CHECK}  База данных восстановлена!</b>\n\n"
@@ -664,14 +675,17 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data == 'use_discount')
     def use_discount_cb(cb):
         uid = cb.from_user.id
-        if db_get_discount_count(uid) <= 0:
+        # АТОМАРНОЕ списание: два одновременных нажатия при одной скидке —
+        # только одно проходит (проверка и списание раньше были раздельными)
+        if not db_use_discount_atomic(uid):
             bot.answer_callback_query(cb.id, "❌ У тебя нет скидок.", show_alert=True)
             return
-        db_use_discount(uid)
         s = state.get(uid)
         if not (isinstance(s, dict) and s.get('step') == 'renewing'):
             db_mark_paid(uid)
-        _after_payment_confirmed(uid, cb.message.chat.id, cb.message.message_id, renew_days=10)
+        # скидка — НЕ денежный платёж: без партнёрской комиссии и реф-бонуса
+        _after_payment_confirmed(uid, cb.message.chat.id, cb.message.message_id,
+                                 renew_days=10, is_real_payment=False)
 
     # ── CryptoBot ────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'pay_cryptobot')
@@ -691,17 +705,18 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data.startswith('check_payment_'))
     def check_payment_cb(cb):
         invoice_id = int(cb.data.split('_')[-1])
-        # инвойс должен быть выставлен ЭТОМУ юзеру (защита от чужих/повторных)
-        bound = db_get_pending(cb.from_user.id)
-        if not bound or bound != invoice_id:
+        # АТОМАРНЫЙ захват права обработать оплату: два одновременных клика —
+        # один True. Раньше проверка и удаление были раздельными: оба потока
+        # доходили до начислений (двойное продление / лишний грант)
+        if not db_claim_pending_payment(cb.from_user.id, invoice_id):
             bot.answer_callback_query(cb.id, "❌ Инвойс не найден. Создай оплату заново.", show_alert=True)
             return
         invoice = cb_check_invoice(invoice_id)
         if invoice and invoice.get('status') == 'paid':
-            # одноразовое подтверждение: удаляем привязку ДО начислений
-            db_del_pending(cb.from_user.id)
             _after_payment_confirmed(cb.from_user.id, cb.message.chat.id, cb.message.message_id)
         else:
+            # не оплачен — возвращаем привязку: кнопка «Проверить» работает дальше
+            db_set_pending(cb.from_user.id, invoice_id)
             bot.answer_callback_query(cb.id, "❌ Оплата не найдена. Попробуй ещё раз.", show_alert=True)
 
     # ── TON ──────────────────────────────────────────────
@@ -839,8 +854,8 @@ def register(bot: telebot.TeleBot):
             days = 30
         try:
             bot_db_id = db_add_bot(m.from_user.id, token_val, admin_id_val, days=days)
-        except Exception:
-            # токен занят: возвращаем юзера к вводу токена, грант не тронут
+        except sqlite3.IntegrityError:
+            # именно занятый токен (UNIQUE): возвращаем юзера к вводу, грант не тронут
             if s.get('free_days'):
                 state[m.from_user.id] = {'step': 'await_bot_token_free', 'days': s['free_days']}
             elif s.get('trial'):
@@ -849,6 +864,18 @@ def register(bot: telebot.TeleBot):
                 state[m.from_user.id] = 'await_bot_token'
             bot.send_message(m.chat.id,
                 f"<b>{TE_CROSS}  Этот токен уже зарегистрирован. Введи другой токен:</b>", parse_mode='HTML')
+            return
+        except Exception as e:
+            # другая причина (сбой БД и т.п.) — не вводим юзера в заблуждение;
+            # возвращаем состояние await_admin_id, чтобы ID можно было отправить снова
+            log.warning(f'db_add_bot failed for {m.from_user.id}: {e}')
+            state[m.from_user.id] = {
+                'step': 'await_admin_id', 'token': token_val,
+                'username': uname, 'trial': s.get('trial', False),
+                'free_days': s.get('free_days')}
+            bot.send_message(m.chat.id,
+                f"<b>{TE_CROSS}  Ошибка базы данных. Попробуй через минуту — просто отправь ID снова:</b>",
+                parse_mode='HTML')
             return
         db_take_grant_days(m.from_user.id)  # расходуем грант (успешная регистрация)
         if launch_bot(bot_db_id, token_val, admin_id_val, bot):

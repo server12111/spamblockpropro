@@ -91,7 +91,10 @@ def ton_check_transfer(user_id: int, expected_ton: float, payment_code: str) -> 
                 value   = int(in_msg.get('value', 0))
                 if value < min_nano: continue
                 comment = in_msg.get('message', '')
-                if payment_code not in comment: continue
+                # ТОЧНОЕ совпадение (после strip): подстрока 'SPB123' была бы
+                # внутри 'SPB123SPB456' и засчитала бы чужую транзакцию.
+                # Инструкция юзеру: комментарий = только код
+                if comment.strip() != payment_code: continue
                 tx_hash = tx.get('transaction_id', {}).get('hash', '')
                 if not tx_hash or db_is_tx_used(tx_hash): continue
                 db_mark_tx_used(tx_hash, user_id)

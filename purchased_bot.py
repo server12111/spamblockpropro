@@ -1113,8 +1113,17 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         # Получаем данные владельца бота
         info = db_get_bot_info(db_bot_id)
         owner_id = info[2] if info else m.from_user.id
-        # Создаём запрос
-        wr_id = db_create_withdrawal(db_bot_id, owner_id, address, amount)
+        # Создаём запрос; при сбое INSERT деньги возвращаются на баланс —
+        # иначе списание есть, а заявки нет (деньги «зависают»)
+        try:
+            wr_id = db_create_withdrawal(db_bot_id, owner_id, address, amount)
+        except Exception as e:
+            log.warning(f'withdrawal create failed bot#{db_bot_id}: {e}')
+            db_return_bot_earnings(db_bot_id, amount)
+            pbot.send_message(m.chat.id,
+                f"<b>{TE_CROSS}  Не удалось создать заявку — средства возвращены "
+                f"на баланс. Попробуй позже.</b>", parse_mode='HTML', reply_markup=pk_close())
+            return
         # Отправляем в канал суперадмина через main_bot (чтобы кнопки обрабатывались в нём)
         if WITHDRAWAL_CHANNEL and main_bot:
             try:
@@ -1206,7 +1215,16 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             pbot.answer_callback_query(cb.id,
                 "❌ Недостаточно средств (баланс изменился)", show_alert=True)
             return
-        new_exp = db_renew_bot(db_bot_id, days)
+        try:
+            new_exp = db_renew_bot(db_bot_id, days)
+        except Exception as e:
+            # продление не прошло — списанные деньги возвращаем (целостность)
+            log.warning(f'p_renew_bal renew failed bot#{db_bot_id}: {e}')
+            db_return_bot_earnings(db_bot_id, cost)
+            pbot.answer_callback_query(cb.id,
+                "❌ Не удалось продлить — средства возвращены на баланс. Попробуй позже.",
+                show_alert=True)
+            return
         exp_str = str(new_exp)[:10] if new_exp else '—'
         _edit(
             f"{TE_CHECK} <b>Бот продлён на {days} дней!</b>\n\n"
