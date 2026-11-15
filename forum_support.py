@@ -220,30 +220,44 @@ def fs_get_pending(bot_id: int, user_id: int):
 
 def fs_append_pending(bot_id: int, user_id: int, item: dict):
     """Добавляет сообщение в очередь. Возвращает (кол-во, prompt_msg_id)
-    или (None, None) если очередь полна."""
+    или (None, None) если очередь полна.
+    BEGIN IMMEDIATE: атомарный read-modify-write — параллельные сообщения
+    одного юзера (телеграм-воркеры) не теряют элементы."""
     c = _conn()
-    row = c.execute('SELECT payload, prompt_msg_id FROM fs_pending '
-                    'WHERE bot_id=? AND user_id=?', (bot_id, user_id)).fetchone()
-    if row:
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        row = c.execute('SELECT payload, prompt_msg_id FROM fs_pending '
+                        'WHERE bot_id=? AND user_id=?', (bot_id, user_id)).fetchone()
+        if row:
+            try:
+                items = json_loads(row[0])
+            except Exception:
+                items = []
+            if len(items) >= PENDING_MAX:
+                c.execute('ROLLBACK')
+                c.close()
+                return None, row[1]
+            items.append(item)
+            c.execute('UPDATE fs_pending SET payload=?, updated_at=? '
+                      'WHERE bot_id=? AND user_id=?',
+                      (json_dumps(items), _utc_now_str(), bot_id, user_id))
+            cnt, prompt = len(items), row[1]
+        else:
+            items = [item]
+            c.execute('INSERT INTO fs_pending (bot_id, user_id, payload, updated_at) '
+                      'VALUES (?,?,?,?)',
+                      (bot_id, user_id, json_dumps(items), _utc_now_str()))
+            cnt, prompt = 1, None
+        c.commit()
+        return cnt, prompt
+    except Exception:
         try:
-            items = json_loads(row[0])
+            c.execute('ROLLBACK')
         except Exception:
-            items = []
-        if len(items) >= PENDING_MAX:
-            c.close(); return None, row[1]
-        items.append(item)
-        c.execute('UPDATE fs_pending SET payload=?, updated_at=? '
-                  'WHERE bot_id=? AND user_id=?',
-                  (json_dumps(items), _utc_now_str(), bot_id, user_id))
-        cnt, prompt = len(items), row[1]
-    else:
-        items = [item]
-        c.execute('INSERT INTO fs_pending (bot_id, user_id, payload, updated_at) '
-                  'VALUES (?,?,?,?)',
-                  (bot_id, user_id, json_dumps(items), _utc_now_str()))
-        cnt, prompt = 1, None
-    c.commit(); c.close()
-    return cnt, prompt
+            pass
+        raise
+    finally:
+        c.close()
 
 def fs_set_prompt(bot_id: int, user_id: int, msg_id: int):
     c = _conn()
@@ -287,10 +301,12 @@ def fs_delete_pending(bot_id: int, user_id: int):
 
 # ── Обращения ─────────────────────────────────────────────────
 def fs_bump_ticket(bot_id: int, user_id: int):
-    """Учёт обращений: серия сообщений с паузой < TICKET_GAP_SEC = одно обращение."""
+    """Учёт обращений: серия сообщений с паузой < TICKET_GAP_SEC = одно обращение.
+    BEGIN IMMEDIATE: два одновременных сообщения не создадут дубль обращения."""
     now_dt = datetime.utcnow()
     now_s = now_dt.strftime('%Y-%m-%d %H:%M:%S')
     c = _conn()
+    c.execute('BEGIN IMMEDIATE')
     row = c.execute('SELECT id, last_at FROM fs_tickets '
                     'WHERE bot_id=? AND user_id=? AND closed_at IS NULL '
                     'ORDER BY id DESC LIMIT 1', (bot_id, user_id)).fetchone()
