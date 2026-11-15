@@ -660,6 +660,13 @@ def db_del_pending(user_id: int):
     c.execute('DELETE FROM pending_payments WHERE user_id=?', (user_id,))
     c.commit(); c.close()
 
+def db_get_pending(user_id: int):
+    """ID инвойса, привязанного к юзеру (защита от чужих/повторных инвойсов)."""
+    c = _conn()
+    row = c.execute('SELECT invoice_id FROM pending_payments WHERE user_id=?', (user_id,)).fetchone()
+    c.close()
+    return row[0] if row else None
+
 # ── Paid Setups ───────────────────────────────────────
 def db_mark_paid(user_id: int):
     c = _conn()
