@@ -315,7 +315,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     @pbot.message_handler(commands=['templates'])
     def p_templates_cmd(m):
         if not is_admin(m.from_user.id): return
-        templates = db_get_templates(db_bot_id)
+        templates = db_get_templates(db_bot_id)[:50]
         if not templates:
             pbot.send_message(m.chat.id, f"<b>{TE_NOTE} Шаблоны пусты\n\nИспользуй кнопку «{TE_NOTE} Шаблоны» при ответе, чтобы добавить</b>",
                 parse_mode='HTML', reply_markup=pk_close())
@@ -359,7 +359,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             parse_mode='HTML', reply_markup=pk_back_admin())
 
     def pk_manage_templates():
-        templates = db_get_templates(db_bot_id)
+        templates = db_get_templates(db_bot_id)[:50]
         kb = InlineKeyboardMarkup()
         for tid, text in templates:
             preview = text[:30] + '…' if len(text) > 30 else text
@@ -601,7 +601,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def p_show_templates(cb):
         if not is_admin(cb.from_user.id): return
         target = int(cb.data.split('_')[-1])
-        templates = db_get_templates(db_bot_id)
+        templates = db_get_templates(db_bot_id)[:50]
         if not templates:
             text = f"<b>{TE_NOTE} Шаблоны пусты</b>\n\nДобавь первый шаблон:"
         else:
@@ -655,7 +655,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def p_del_tpl_menu(cb):
         if not is_admin(cb.from_user.id): return
         target = int(cb.data.split('_')[-1])
-        templates = db_get_templates(db_bot_id)
+        templates = db_get_templates(db_bot_id)[:50]
         kb = InlineKeyboardMarkup()
         for tid, text in templates:
             preview = text[:35] + '…' if len(text) > 35 else text
@@ -674,7 +674,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         tid    = int(parts[4])
         db_del_template(tid, db_bot_id)
         pbot.answer_callback_query(cb.id, "✅ Шаблон видалено")
-        templates = db_get_templates(db_bot_id)
+        templates = db_get_templates(db_bot_id)[:50]
         kb = InlineKeyboardMarkup()
         for t_id, text in templates:
             preview = text[:35] + '…' if len(text) > 35 else text
@@ -760,7 +760,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                 chat_id, message_id, parse_mode='HTML', reply_markup=pk_back_admin())
             return
         kb = InlineKeyboardMarkup()
-        for uid in blocked:
+        for uid in blocked[:30]:
             kb.add(_pbtn(f"Разблокировать {uid}", icon='✔️', style='success', callback_data=f'p_unblock_list_{uid}'))
         kb.add(_pbtn('Назад', icon='🔙', callback_data='p_back_admin'))
         _edit(f"<b>{TE_BLOCK}  Заблокированные ({len(blocked)}):</b>",
