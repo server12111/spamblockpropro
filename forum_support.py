@@ -1930,7 +1930,39 @@ def register_forum_support(pbot, bot_id: int, pstate, is_admin, confirm_kb=_conf
     return route
 
 
-# ── лёгкие JSON-хелперы (чтобы не тянуть json в сигнатурах выше) ──
+# ── лёгкие хелперы, общие для модулей ─────────────────────────
+def html_safe_chunks(escaped: str, max_len: int = 3800) -> list:
+    """Режет УЖЕ экранированный текст на куски ≤ max_len.
+    Две ловли одновременно:
+    1) нельзя резать по «сырым» кускам и потом экранировать: &amp; может
+       разорваться → Telegram отвечает 400 на битый HTML;
+    2) нельзя резать уже экранированный текст наивно по длине: сущность
+       (&amp; = 5 символов) может оказаться на границе — отступаем к '&'.
+    Сущности длиннее max_len не существуют (максимум ~10 символов), поэтому
+    отступ всегда заканчивает кусок валидной границей.
+    Пустая строка → [] (иначе вызывающий отправил бы пустое сообщение → 400)."""
+    escaped = escaped or ''
+    if not escaped:
+        return []
+    if len(escaped) <= max_len:
+        return [escaped]
+    chunks = []
+    pos = 0
+    n = len(escaped)
+    while pos < n:
+        end = min(pos + max_len, n)
+        if end < n:
+            amp = escaped.rfind('&', pos, end)
+            semi = escaped.rfind(';', pos, end)
+            if amp > semi:      # граница попала внутрь незакрытой сущности
+                end = amp
+            if end <= pos:      # страховка от бесконечного цикла
+                end = pos + max_len
+        chunks.append(escaped[pos:end])
+        pos = end
+    return chunks
+
+
 def json_dumps(obj) -> str:
     import json as _json
     return _json.dumps(obj, ensure_ascii=False)

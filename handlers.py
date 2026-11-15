@@ -34,6 +34,7 @@ from keyboards import (start_kb, back_to_start_kb, back_to_payment_kb, cancel_kb
 from payments import (cb_create_invoice, cb_check_invoice,
                       get_ton_amount, ton_payment_link, ton_check_transfer)
 from purchased_bot import launch_bot, stop_bot, running_bots, running_bot_ids
+from forum_support import html_safe_chunks
 
 log = logging.getLogger(__name__)
 
@@ -480,17 +481,16 @@ def register(bot: telebot.TeleBot):
                   f"{TE_LINK} Username: {html.escape(username)}\n"
                   f"{TE_ID} ID: <code>{m.from_user.id}</code>")
         body = html.escape(m.text or '')
-        # длинные обращения: заголовок отдельно + тело кусками по 3800.
-        # РЕЖЕМ СЫРОЙ ТЕКСТ и экранируем каждый кусок отдельно: разрез уже
-        # экранированной строки рвёт HTML-сущности (&amp; → "&am" + "p;")
-        # и Telegram отвечает 400 на битый HTML
-        raw = m.text or ''
+        # длинные обращения: заголовок отдельно + тело кусками.
+        # html_safe_chunks режет УЖЕ ЭКРАНИРОВАННЫЙ текст: сырой разрез рвёт
+        # сущности (&amp; → "&am"+"p;" → 400), а наивный разрез экранированного
+        # мог отдать кусок >4096 (3800 символов '<' → ~19000 экранированных)
         if len(header) + len(body) + 4 > 4000:
             try:
                 bot.send_message(SUPER_ADMIN, header, parse_mode='HTML',
                                  reply_markup=reply_kb(m.from_user.id))
-                for i in range(0, len(raw), 3800):
-                    bot.send_message(SUPER_ADMIN, html.escape(raw[i:i + 3800]), parse_mode='HTML')
+                for chunk in html_safe_chunks(body):
+                    bot.send_message(SUPER_ADMIN, chunk, parse_mode='HTML')
             except Exception as e:
                 log.warning(f'user_text delivery to SUPER_ADMIN failed: {e}')
                 bot.send_message(m.chat.id,
@@ -916,7 +916,15 @@ def register(bot: telebot.TeleBot):
         users   = _broadcast_users(scope)
         photo   = m.photo[-1].file_id
         caption = html.escape(m.caption or '')
-        sent    = sum(1 for uid in users if _safe_photo(uid, photo, caption))
+        if len(caption) > 1000:
+            # экранирование могло раздуть подпись за лимит Telegram (1024):
+            # фото без подписи + подпись отдельным текстом (кусками)
+            cap_chunks = html_safe_chunks(caption)
+            sent = sum(1 for uid in users
+                       if _safe_photo(uid, photo, '')
+                       and all(_safe_send(uid, c) for c in cap_chunks))
+        else:
+            sent = sum(1 for uid in users if _safe_photo(uid, photo, caption))
         bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Рассылка завершена: {sent}/{len(users)}</b>",
             parse_mode='HTML', reply_markup=close_kb())
 

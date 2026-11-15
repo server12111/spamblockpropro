@@ -30,7 +30,8 @@ from database import (db_add_user, db_get_bot_users, db_deactivate_bot, DBState,
 from keyboards import broadcast_type_kb, PE_MONEY, PE_CHECK, PE_GIFT, PE_FIRE
 from config import SUPER_ADMIN, WITHDRAWAL_CHANNEL, BOT_USERNAME
 from payments import get_ton_amount
-from forum_support import register_forum_support, RATE_LIMIT_SEC, rate_limited, fs_bump_ticket, queue_random_message
+from forum_support import (register_forum_support, RATE_LIMIT_SEC, rate_limited,
+                           fs_bump_ticket, queue_random_message, html_safe_chunks)
 
 log = logging.getLogger(__name__)
 
@@ -120,15 +121,18 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     pbot.exception_handler = _ChildEH()
 
     def _send_long(chat, header, body, reply_markup=None):
-        """Длинные сообщения: если header+body > 4000 символов (лимит Telegram),
-        отправляет заголовок отдельно и тело кусками по 3800 (без HTML в кусках)."""
-        if len(header) + len(body or '') + 4 <= 4000:
-            return pbot.send_message(chat, header + '\n\n' + html.escape(body or ''),
+        """Длинные сообщения: если header+тело не влезают в лимит Telegram (4096),
+        отправляет заголовок отдельно и тело кусками. Лимит меряем по ЭКРАНИРОВАННОЙ
+        длине: 3800 сырых символов с '<' превращаются в ~19000 экранированных и
+        упали бы с 'message is too long'. Куски режет html_safe_chunks —
+        без разрыва сущностей и с гарантированным влезанием."""
+        esc = html.escape(body or '')
+        if len(header) + len(esc) + 4 <= 4000:
+            return pbot.send_message(chat, header + '\n\n' + esc,
                                      parse_mode='HTML', reply_markup=reply_markup)
         pbot.send_message(chat, header, parse_mode='HTML', reply_markup=reply_markup)
-        body = body or ''
-        for i in range(0, len(body), 3800):
-            pbot.send_message(chat, html.escape(body[i:i + 3800]), parse_mode='HTML')
+        for chunk in html_safe_chunks(esc):
+            pbot.send_message(chat, chunk, parse_mode='HTML')
         return True
 
     def get_welcome():
@@ -172,33 +176,45 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         return ok
 
     def send_to_admins_long(header, body_raw, reply_markup=None):
+        esc = html.escape(body_raw or '')
         for aid in db_get_bot_admins(db_bot_id):
             try:
                 pbot.send_message(aid, header, parse_mode='HTML', reply_markup=reply_markup)
-                for i in range(0, len(body_raw), 3600):
-                    pbot.send_message(aid, html.escape(body_raw[i:i + 3600]),
-                                      parse_mode='HTML')
+                # html_safe_chunks: куски гарантированно ≤3600 ПОСЛЕ экранирования
+                # и не рвут сущности (&amp; на границе давал бы 400)
+                for chunk in html_safe_chunks(esc, 3600):
+                    pbot.send_message(aid, chunk, parse_mode='HTML')
             except Exception as e:
                 log.warning(f'send_to_admins_long bot#{db_bot_id} admin {aid}: {e}')
 
     def send_media_to_admins(m, header):
-        """Forward any media type to all admins with user info header."""
+        """Forward any media type to all admins with user info header.
+        Возвращает True, если хотя бы один админ получил сообщение
+        (БЕЗ return вызывающий p_user_media считает доставку провалом и
+        кладёт сообщение в очередь → двойная доставка при подтверждении).
+        try на КАЖДОГО админа: сбой одному не обрывает доставку остальным.
+        Подпись Telegram ограничена 1024 символами, а экранирование может
+        раздуть её (заголовок + подпись с '<') — тогда подпись уходит
+        отдельным текстом после медиа."""
         kb = pk_reply(m.from_user.id)
-        caption = header + (f"\n\n{TE_CHAT} {html.escape(m.caption)}" if m.caption else "")
         ct = m.content_type
-        try:
-            for aid in db_get_bot_admins(db_bot_id):
+        cap_full = header + (f"\n\n{TE_CHAT} {html.escape(m.caption)}" if m.caption else "")
+        cap_overflow = len(cap_full) > 1000 and bool(m.caption)
+        cap = cap_full if len(cap_full) <= 1000 else header
+        ok = False
+        for aid in db_get_bot_admins(db_bot_id):
+            try:
                 if ct == 'photo':
-                    pbot.send_photo(aid, m.photo[-1].file_id, caption=caption,
+                    pbot.send_photo(aid, m.photo[-1].file_id, caption=cap,
                                     parse_mode='HTML', reply_markup=kb)
                 elif ct == 'video':
-                    pbot.send_video(aid, m.video.file_id, caption=caption,
+                    pbot.send_video(aid, m.video.file_id, caption=cap,
                                     parse_mode='HTML', reply_markup=kb)
                 elif ct == 'document':
-                    pbot.send_document(aid, m.document.file_id, caption=caption,
+                    pbot.send_document(aid, m.document.file_id, caption=cap,
                                        parse_mode='HTML', reply_markup=kb)
                 elif ct == 'audio':
-                    pbot.send_audio(aid, m.audio.file_id, caption=caption,
+                    pbot.send_audio(aid, m.audio.file_id, caption=cap,
                                     parse_mode='HTML', reply_markup=kb)
                 elif ct == 'voice':
                     pbot.send_message(aid, header + f"\n{TE_MIC} Голосовое сообщение:",
@@ -213,13 +229,18 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                                       parse_mode='HTML', reply_markup=kb)
                     pbot.send_sticker(aid, m.sticker.file_id)
                 elif ct == 'animation':
-                    pbot.send_animation(aid, m.animation.file_id, caption=caption,
+                    pbot.send_animation(aid, m.animation.file_id, caption=cap,
                                         parse_mode='HTML', reply_markup=kb)
                 else:
                     # контакты, геолокация, опросы и прочее — пересылка как есть
                     pbot.forward_message(aid, m.chat.id, m.message_id)
-        except Exception as e:
-            log.error(f'send_media_to_admins error: {e}')
+                if cap_overflow:
+                    for chunk in html_safe_chunks(html.escape(m.caption)):
+                        pbot.send_message(aid, chunk, parse_mode='HTML')
+                ok = True
+            except Exception as e:
+                log.warning(f'send_media_to_admins bot#{db_bot_id} admin {aid}: {e}')
+        return ok
 
     def _get_file_id(msg) -> str:
         ct = msg.content_type

@@ -300,6 +300,73 @@ check('снятая реакция не порождает уведомлени�
 
 telebot.TeleBot.set_message_reaction = ORIG['set_message_reaction']
 
+print('── html_safe_chunks: сущности не рвутся, куски в лимите ──')
+from forum_support import html_safe_chunks, fs_get_pending as fs_pending_of
+# сущность '&amp;' начинается на позиции 3798 и НАИВНЫЙ разрез по 3800 рвёт её
+esc = html.escape('x' * 3798 + '&' + 'y' * 100)
+chunks = html_safe_chunks(esc, 3800)
+check('сумма кусков = исходная строка', ''.join(chunks) == esc)
+check('ни один кусок не разрывает сущность',
+      all(not re.search(r'&(?!amp;|lt;|gt;|quot;|#)', c) for c in chunks),
+      [c[-8:] for c in chunks])
+check('куски в лимите', all(len(c) <= 3800 for c in chunks))
+# экранированное переполнение: 4000 символов '<' → 16000 экранированных
+esc2 = html.escape('<' * 4000)
+chunks2 = html_safe_chunks(esc2)
+check('переполнение экранированием: куски ≤3800',
+      all(len(c) <= 3800 for c in chunks2) and sum(len(c) for c in chunks2) == 16000)
+check('короткий текст → один кусок', html_safe_chunks('abc') == ['abc'])
+check('пустая строка → нет кусков (не шлём пустое сообщение в Telegram)',
+      html_safe_chunks('') == [] and html_safe_chunks(None) == [])
+
+print('── p_user_media: доставка возвращает ok, НЕТ двойной доставки ──')
+# отдельный бот БЕЗ группы (DM-режим): send_media_to_admins должен вернуть
+# True, иначе p_user_media кладёт сообщение в очередь → админ получает медиа 2 раза
+PHOTO_LOG = []
+_orig_sp = telebot.TeleBot.send_photo
+def _rec_photo(self, cid, photo, **kw):
+    PHOTO_LOG.append(cid)
+    return _orig_sp(self, cid, photo, **kw)
+telebot.TeleBot.send_photo = _rec_photo
+try:
+    TOKEN_MEDIA = '777002:AAAmedia_test_token_zzzzzzzzzzzz'
+    bot3_id = db_add_bot(SUPER, TOKEN_MEDIA, SUPER, days=30)
+    pb3 = PB.make_purchased_bot(bot3_id, TOKEN_MEDIA, SUPER, main_bot)
+    dcb(pb3, ucb('p_send', uid=999))
+    photo_msg = t.Message.de_json({'message_id': 260, 'from': {'id': 999, 'is_bot': False,
+        'first_name': 'М', 'username': 'm999'},
+        'chat': {'id': 999, 'type': 'private', 'first_name': 'М'},
+        'date': int(time.time()),
+        'photo': [{'file_id': 'ph1', 'file_unique_id': 'u1', 'width': 10, 'height': 10, 'file_size': 100}]})
+    SEND_LOG.clear()
+    dmsg(pb3, photo_msg)
+    check('медиа доставлено админу (send_media_to_admins вернул True)',
+          SUPER in PHOTO_LOG, str(PHOTO_LOG))
+    check('юзеру показано «Сообщение отправлено»',
+          any(cid == 999 and 'Сообщение отправлено' in (txt or '') for cid, txt in SEND_LOG))
+    check('НЕТ ложной постановки в очередь (дабл-доставка устранена)',
+          fs_pending_of(bot3_id, 999) is None)
+
+    # caption-переполнение: подпись из '<' раздувается экранированием за лимит 1024.
+    # Другой юзер (998): у 999 сработал бы rate limit 3 сек между сообщениями
+    dcb(pb3, ucb('p_send', uid=998))
+    cap_msg = t.Message.de_json({'message_id': 261, 'from': {'id': 998, 'is_bot': False,
+        'first_name': 'М', 'username': 'm998'},
+        'chat': {'id': 998, 'type': 'private', 'first_name': 'М'},
+        'date': int(time.time()),
+        'caption': '<' * 300,
+        'photo': [{'file_id': 'ph2', 'file_unique_id': 'u2', 'width': 10, 'height': 10, 'file_size': 100}]})
+    PHOTO_LOG.clear()
+    SEND_LOG.clear()
+    dmsg(pb3, cap_msg)
+    check('медиа с раздутой подписью доставлено (caption ушёл отдельным текстом)',
+          SUPER in PHOTO_LOG and any(cid == SUPER and '&lt;' in (txt or '') for cid, txt in SEND_LOG),
+          (str(PHOTO_LOG), str(SEND_LOG)[:120]))
+    check('после медиа с подписью очередь тоже пуста',
+          fs_pending_of(bot3_id, 998) is None)
+finally:
+    telebot.TeleBot.send_photo = _orig_sp
+
 print()
 print(f'ИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL')
 sys.exit(1 if FAIL else 0)
