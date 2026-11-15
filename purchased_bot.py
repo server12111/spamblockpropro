@@ -321,7 +321,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                 parse_mode='HTML', reply_markup=pk_close())
             return
         lines = [f"<b>{TE_NOTE} Сохранённые шаблоны:</b>\n"]
-        for tid, text in templates:
+        for tid, text in templates[:50]:
             lines.append(f"• [{tid}] {text}")
         pbot.send_message(m.chat.id, "\n".join(lines),
             parse_mode='HTML', reply_markup=pk_close())

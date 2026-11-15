@@ -196,6 +196,18 @@ def register(bot: telebot.TeleBot):
         try: bot.send_photo(uid, photo, caption=caption, parse_mode='HTML'); return True
         except: return False
 
+    @staticmethod
+    def _cap_lines(header, rows, limit=30):
+        """Собирает текст списка с ограничением: сообщения Telegram ≤4096 символов,
+        а списки (боты/выводы/блокировки) растут месяцами — длинный текст начнёт
+        падать с 'message is too long'. Возвращает готовый текст с припиской."""
+        rows = list(rows)
+        shown = rows[:limit]
+        text = header + '\n' + '\n'.join(shown)
+        if len(rows) > limit:
+            text += f"\n<i>… показаны первые {limit} из {len(rows)}</i>"
+        return text[:4000]
+
     def _broadcast_users(scope):
         if scope == 'all': return db_get_all_users()
         return db_get_bot_users(0)
@@ -413,13 +425,21 @@ def register(bot: telebot.TeleBot):
 
     @bot.callback_query_handler(func=lambda c: c.data == 'cancel')
     def cancel_cb(cb):
-        bot.delete_message(cb.message.chat.id, cb.message.message_id)
+        # состояние сбрасываем ДО удаления: сообщение может быть старше 48 ч
+        # (удаление упадёт) — юзер не должен застревать в состоянии
         state.pop(cb.from_user.id, None)
         db_del_pending(cb.from_user.id)
+        try:
+            bot.delete_message(cb.message.chat.id, cb.message.message_id)
+        except Exception:
+            pass
 
     @bot.callback_query_handler(func=lambda c: c.data == 'close')
     def close_cb(cb):
-        bot.delete_message(cb.message.chat.id, cb.message.message_id)
+        try:
+            bot.delete_message(cb.message.chat.id, cb.message.message_id)
+        except Exception:
+            pass
 
     @bot.message_handler(func=lambda m: state.get(m.from_user.id) == 'await_user_msg')
     def user_text(m):
@@ -817,12 +837,14 @@ def register(bot: telebot.TeleBot):
         bots_count, main_users, total_users, breakdown = db_get_stats()
         revenue = round(bots_count * get_price(), 2)
         lines = []
-        for i, row in enumerate(breakdown, 1):
+        for i, row in enumerate(breakdown[:20], 1):
             owner, _, users_cnt, created_at = row[0], row[1], row[2], row[3]
             expires_at = row[4] if len(row) > 4 else None
             date = str(created_at)[:10] if created_at else '—'
             exp  = str(expires_at)[:10] if expires_at else '—'
             lines.append(f"  {i}. Owner <code>{owner}</code> — {users_cnt} польз. | {TE_CALENDAR} {date} | {TE_HOURGLASS} {exp}")
+        if len(breakdown) > 20:
+            lines.append(f"  … и ещё {len(breakdown) - 20} ботов")
         text = (f"<b>{TE_STATS} Статистика SpamBot</b>\n{'─'*28}\n"
                 f"{TE_ROBOT} Подключённых ботов: <b>{bots_count}</b>\n"
                 f"{TE_MONEY} Выручка за всё время: <b>~{revenue} USDT</b>\n"
@@ -852,7 +874,7 @@ def register(bot: telebot.TeleBot):
             return
         lines = []
         kb    = InlineKeyboardMarkup()
-        for row in bots_list:
+        for row in bots_list[:30]:
             bot_id, owner_id, admin_id_val = row[0], row[1], row[2]
             created_at = row[3]
             expires_at = row[4] if len(row) > 4 else None
@@ -873,6 +895,8 @@ def register(bot: telebot.TeleBot):
                 _btn(f"#{bot_id}", icon='❌', style='danger',  callback_data=f'bot_delete_{bot_id}'),
             )
         kb.add(_btn('Закрыть', icon='❌', style='danger', callback_data='close'))
+        if len(bots_list) > 30:
+            lines.append(f"<i>… показаны первые 30 из {len(bots_list)} ботов</i>")
         text = f"<b>{TE_ROBOT} Управление ботами</b>\n\n" + "\n".join(lines)
         if message_id:
             _edit(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
@@ -1166,7 +1190,9 @@ def register(bot: telebot.TeleBot):
             return
         text = f"<b>{TE_MONEY} Запросы на вывод ({len(pending)}):</b>\n\n"
         kb = InlineKeyboardMarkup()
-        for wr_id, bot_id, owner_id, ton_address, usdt_amount, created_at in pending:
+        shown = 0
+        for wr_id, bot_id, owner_id, ton_address, usdt_amount, created_at in pending[:30]:
+            shown += 1
             date = str(created_at)[:16] if created_at else '—'
             text += (f"#{wr_id} | Bot #{bot_id} | Owner: <code>{owner_id}</code>\n"
                      f"Адрес: <code>{ton_address}</code>\n"
@@ -1175,6 +1201,8 @@ def register(bot: telebot.TeleBot):
                 _btn(f"#{wr_id}", icon='✔️', style='success', callback_data=f'wr_confirm_{wr_id}'),
                 _btn(f"#{wr_id}", icon='❌', style='danger',  callback_data=f'wr_reject_{wr_id}'),
             )
+        if len(pending) > 30:
+            text += f"<i>… показаны первые 30 из {len(pending)}</i>"
         kb.add(_btn('Назад', icon='🔙', callback_data='back_admin_panel'))
         if message_id:
             _edit(text, chat_id, message_id, parse_mode='HTML', reply_markup=kb)
