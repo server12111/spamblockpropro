@@ -184,7 +184,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def send_media_to_admins(m, header):
         """Forward any media type to all admins with user info header."""
         kb = pk_reply(m.from_user.id)
-        caption = header + (f"\n\n{TE_CHAT} {m.caption}" if m.caption else "")
+        caption = header + (f"\n\n{TE_CHAT} {html.escape(m.caption)}" if m.caption else "")
         ct = m.content_type
         try:
             for aid in db_get_bot_admins(db_bot_id):
@@ -1184,7 +1184,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         pstate.pop(m.from_user.id, None)
         users   = db_get_bot_users(db_bot_id)
         photo   = m.photo[-1].file_id
-        caption = m.caption or ''
+        caption = html.escape(m.caption or '')
         sent    = sum(1 for uid in users if _safe_photo(pbot, uid, photo, caption))
         pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Рассылка завершена: {sent}/{len(users)}</b>",
             parse_mode='HTML', reply_markup=pk_close())

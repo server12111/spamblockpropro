@@ -376,6 +376,7 @@ def register(bot: telebot.TeleBot):
             if os.path.exists(DB_PATH):
                 _shutil.copy2(DB_PATH, backup_path)
             os.replace(tmp_path, DB_PATH)  # атомарная замена
+            init_db()  # применяем миграции к восстановленной БД
             log.info(f'БД заменена; прежняя сохранена: {backup_path}')
             bot.send_message(m.chat.id,
                 f"<b>{TE_CHECK}  База данных восстановлена!</b>\n\n"
@@ -872,7 +873,7 @@ def register(bot: telebot.TeleBot):
         scope   = state.pop(m.from_user.id).split('_')[-1]
         users   = _broadcast_users(scope)
         photo   = m.photo[-1].file_id
-        caption = m.caption or ''
+        caption = html.escape(m.caption or '')
         sent    = sum(1 for uid in users if _safe_photo(uid, photo, caption))
         bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Рассылка завершена: {sent}/{len(users)}</b>",
             parse_mode='HTML', reply_markup=close_kb())
