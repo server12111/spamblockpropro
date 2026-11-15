@@ -156,15 +156,27 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         return bool(info and user_id == info[1])
 
     def send_to_admins(text, reply_markup=None):
+        # длинные обращения: заголовок HTML отдельно + сырой текст кусками
+        # по 3600, экранируя каждый кусок отдельно (кусок всегда валидный HTML)
+        if len(text) > 4000:
+            hdr, _, raw = text.partition('\n\n')
+            send_to_admins_long(hdr, raw, reply_markup=reply_markup)
+            return
         for aid in db_get_bot_admins(db_bot_id):
             try:
-                if len(text) > 4000:
-                    _hdr, _, _body = text.partition('\n\n')
-                    _send_long(aid, _hdr, _body, reply_markup=reply_markup)
-                else:
-                    pbot.send_message(aid, text, parse_mode='HTML', reply_markup=reply_markup)
+                pbot.send_message(aid, text, parse_mode='HTML', reply_markup=reply_markup)
             except Exception as e:
                 log.warning(f'send_to_admins bot#{db_bot_id} admin {aid}: {e}')
+
+    def send_to_admins_long(header, body_raw, reply_markup=None):
+        for aid in db_get_bot_admins(db_bot_id):
+            try:
+                pbot.send_message(aid, header, parse_mode='HTML', reply_markup=reply_markup)
+                for i in range(0, len(body_raw), 3600):
+                    pbot.send_message(aid, html.escape(body_raw[i:i + 3600]),
+                                      parse_mode='HTML')
+            except Exception as e:
+                log.warning(f'send_to_admins_long bot#{db_bot_id} admin {aid}: {e}')
 
     def send_media_to_admins(m, header):
         """Forward any media type to all admins with user info header."""
@@ -519,8 +531,16 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         db_bump_user_contact(db_bot_id, m.from_user.id)
         fs_bump_ticket(db_bot_id, m.from_user.id)   # обращение учитывается и без группы
         header = _make_header(m)
-        if not send_to_admins(f"{header}\n\n{TE_CHAT} {html.escape(m.text or '')}",
-                              reply_markup=pk_reply(m.from_user.id)):
+        user_body = m.text or ''
+        # длинные обращения: заголовок HTML отдельно + сырой текст кусками,
+        # экранируя каждый кусок отдельно (кусок всегда валидный HTML)
+        if len(header) + len(html.escape(user_body)) + 10 > 4000:
+            delivered = send_to_admins_long(header, user_body,
+                                            reply_markup=pk_reply(m.from_user.id))
+        else:
+            delivered = send_to_admins(f"{header}\n\n{TE_CHAT} {html.escape(user_body)}",
+                                       reply_markup=pk_reply(m.from_user.id))
+        if not delivered:
             # ни один админ не получил (Telegram недоступен) — не теряем сообщение
             queue_random_message(pbot, db_bot_id, m)
             pstate.pop(m.from_user.id, None)
