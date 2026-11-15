@@ -160,8 +160,8 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         return bool(info and user_id == info[1])
 
     def send_to_admins(text, reply_markup=None):
-        # длинные обращения: заголовок HTML отдельно + сырой текст кусками
-        # по 3600, экранируя каждый кусок отдельно (кусок всегда валидный HTML)
+        # длинные обращения: заголовок (до первого \n\n) отдельно, тело —
+        # в send_to_admins_long (куски через html_safe_chunks)
         if len(text) > 4000:
             hdr, _, raw = text.partition('\n\n')
             send_to_admins_long(hdr, raw, reply_markup=reply_markup)
@@ -573,8 +573,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         fs_bump_ticket(db_bot_id, m.from_user.id)   # обращение учитывается и без группы
         header = _make_header(m)
         user_body = m.text or ''
-        # длинные обращения: заголовок HTML отдельно + сырой текст кусками,
-        # экранируя каждый кусок отдельно (кусок всегда валидный HTML)
+        # длинные обращения: заголовок отдельно + тело кусками (html_safe_chunks)
         if len(header) + len(html.escape(user_body)) + 10 > 4000:
             delivered = send_to_admins_long(header, user_body,
                                             reply_markup=pk_reply(m.from_user.id))
