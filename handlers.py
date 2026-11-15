@@ -483,7 +483,7 @@ def register(bot: telebot.TeleBot):
             bot.send_message(SUPER_ADMIN, header, parse_mode='HTML',
                              reply_markup=reply_kb(m.from_user.id))
             for i in range(0, len(body), 3800):
-                bot.send_message(SUPER_ADMIN, body[i:i + 3800])
+                bot.send_message(SUPER_ADMIN, body[i:i + 3800], parse_mode='HTML')
         else:
             bot.send_message(SUPER_ADMIN, header + '\n\n' + f"{TE_CHAT} {body}",
                              parse_mode='HTML', reply_markup=reply_kb(m.from_user.id))

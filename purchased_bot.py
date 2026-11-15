@@ -123,7 +123,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         """Длинные сообщения: если header+body > 4000 символов (лимит Telegram),
         отправляет заголовок отдельно и тело кусками по 3800 (без HTML в кусках)."""
         if len(header) + len(body or '') + 4 <= 4000:
-            return pbot.send_message(chat, header + '\n\n' + (body or ''),
+            return pbot.send_message(chat, header + '\n\n' + html.escape(body or ''),
                                      parse_mode='HTML', reply_markup=reply_markup)
         pbot.send_message(chat, header, parse_mode='HTML', reply_markup=reply_markup)
         body = body or ''
