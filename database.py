@@ -89,9 +89,11 @@ def db_close_all():
     _conns_registry.clear()
 
 def _file_signature(path):
+    # только идентификация файла (inode/dev): mtime/size меняются при КАЖДОЙ
+    # записи и заставляли бы пересоздавать соединение после любого INSERT
     try:
         st = os.stat(path)
-        return (st.st_ino, st.st_mtime_ns, st.st_size)
+        return (st.st_dev, st.st_ino)
     except OSError:
         return None
 
@@ -740,13 +742,19 @@ def db_get_referrer(referred_id: int):
     c.close(); return row[0] if row else None
 
 def db_mark_referral_paid(referred_id: int):
+    """Начисляет скидку рефереру ОДИН раз: условный UPDATE по paid=0,
+    начисление только если rowcount==1 (защита от повторного зачёта)."""
     c = _conn()
-    row = c.execute('SELECT referrer_id FROM referrals WHERE referred_id=?',
-                    (referred_id,)).fetchone()
-    if row:
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        row = c.execute('SELECT referrer_id FROM referrals '
+                        'WHERE referred_id=? AND paid=0', (referred_id,)).fetchone()
+        if not row:
+            c.execute('ROLLBACK'); c.close()
+            return
         referrer_id = row[0]
-        c.execute('UPDATE referrals SET paid=1 WHERE referred_id=?', (referred_id,))
-        existing = c.execute('SELECT discount_count FROM referral_discounts WHERE user_id=?',
+        c.execute('UPDATE referrals SET paid=1 WHERE referred_id=? AND paid=0', (referred_id,))
+        existing = c.execute('SELECT 1 FROM referral_discounts WHERE user_id=?',
                              (referrer_id,)).fetchone()
         if existing:
             c.execute('UPDATE referral_discounts SET discount_count=discount_count+1 WHERE user_id=?',
@@ -754,7 +762,15 @@ def db_mark_referral_paid(referred_id: int):
         else:
             c.execute('INSERT INTO referral_discounts (user_id, discount_count) VALUES (?,1)',
                       (referrer_id,))
-    c.commit(); c.close()
+        c.commit()
+    except Exception:
+        try:
+            c.execute('ROLLBACK')
+        except Exception:
+            pass
+        raise
+    finally:
+        c.close()
 
 def db_get_discount_count(user_id: int) -> int:
     c = _conn()
@@ -857,6 +873,19 @@ def db_deduct_bot_earnings(bot_id: int, usdt: float):
               (usdt, bot_id))
     c.commit(); c.close()
 
+def db_deduct_bot_earnings_atomic(bot_id: int, usdt: float) -> bool:
+    """Атомарное списание: True только если баланса хватило.
+    Двойные конкурентные заявки на вывод не могут уйти в минус."""
+    c = _conn()
+    try:
+        cur = c.execute('UPDATE bot_earnings SET balance_usdt = balance_usdt - ? '
+                        'WHERE bot_id=? AND balance_usdt >= ?',
+                        (usdt, bot_id, usdt))
+        c.commit()
+        return cur.rowcount > 0
+    except Exception:
+        c.rollback(); c.close(); raise
+
 def db_return_bot_earnings(bot_id: int, usdt: float):
     """Return earnings (e.g. after rejected withdrawal)."""
     c = _conn()
@@ -898,6 +927,18 @@ def db_update_withdrawal_status(wr_id: int, status: str):
     c = _conn()
     c.execute('UPDATE withdrawal_requests SET status=? WHERE id=?', (status, wr_id))
     c.commit(); c.close()
+
+def db_claim_withdrawal(wr_id: int, status: str) -> bool:
+    """Атомарный перевод заявки в новый статус: True только если была 'pending'.
+    Защита от двойного confirm/reject двумя обработчиками."""
+    c = _conn()
+    try:
+        cur = c.execute("UPDATE withdrawal_requests SET status=? WHERE id=? AND status='pending'",
+                        (status, wr_id))
+        c.commit()
+        return cur.rowcount > 0
+    except Exception:
+        c.rollback(); c.close(); raise
 
 # ── Free Coupons ──────────────────────────────────────
 def db_set_free_coupon(user_id: int, days: int):

@@ -15,7 +15,7 @@ from database import (DB_PATH,
                        db_get_bot_setting, db_set_bot_setting,
                        db_renew_bot,
                        get_price, set_price,
-                       db_set_pending, db_del_pending,
+                       db_set_pending, db_del_pending, db_get_pending,
                        db_mark_paid, db_is_paid, db_clear_paid,
                        db_has_used_trial, db_mark_trial_used,
                        db_set_referral, db_get_referrer, db_mark_referral_paid,
@@ -256,6 +256,12 @@ def register(bot: telebot.TeleBot):
         if isinstance(s, dict) and s.get('step') == 'renewing':
             bot_id = s['bot_id']
             state.pop(uid, None)
+            # продление чужого бота невозможно: владелец/админ проверяется
+            _binfo = db_get_bot_info(bot_id)
+            if not _binfo or uid not in (_binfo[2], _binfo[1]):
+                bot.send_message(chat_id,
+                    f"{TE_CROSS}  У тебя нет прав на этот бот.", parse_mode='HTML')
+                return
             new_exp = db_renew_bot(bot_id, renew_days)
             info = db_get_bot_info(bot_id)
             if info:
@@ -348,11 +354,28 @@ def register(bot: telebot.TeleBot):
         try:
             file_info = bot.get_file(doc.file_id)
             downloaded = bot.download_file(file_info.file_path)
-            # закрываем все кэшированные соединения, иначе файл не подменить
-            from database import db_close_all
-            db_close_all()
-            with open(DB_PATH, 'wb') as f:
+            # валидация: загруженный файл должен быть корректной SQLite-БД
+            tmp_path = DB_PATH + '.restore_tmp'
+            with open(tmp_path, 'wb') as f:
                 f.write(downloaded)
+            import sqlite3 as _sq
+            _chk = _sq.connect(tmp_path)
+            try:
+                row = _chk.execute('PRAGMA integrity_check').fetchone()[0]
+                if row != 'ok':
+                    raise ValueError(f'integrity_check: {row}')
+                _chk.execute('SELECT COUNT(*) FROM bots')
+            finally:
+                _chk.close()
+            # бэкап текущей базы перед заменой
+            import shutil as _shutil
+            from database import db_close_all
+            backup_path = DB_PATH + f'.pre_restore_{int(time.time())}.bak'
+            db_close_all()
+            if os.path.exists(DB_PATH):
+                _shutil.copy2(DB_PATH, backup_path)
+            os.replace(tmp_path, DB_PATH)  # атомарная замена
+            log.info(f'БД заменена; прежняя сохранена: {backup_path}')
             bot.send_message(m.chat.id,
                 f"<b>{TE_CHECK}  База данных восстановлена!</b>\n\n"
                 f"Перезапусти бота на BotHost чтобы загрузились все purchased-боты.",
@@ -552,6 +575,11 @@ def register(bot: telebot.TeleBot):
     def renew_bot_cb(cb):
         uid = cb.from_user.id
         bot_id = int(cb.data.split('_')[-1])
+        # продлить можно только свой бот (владелец или админ)
+        _binfo = db_get_bot_info(bot_id)
+        if not _binfo or uid not in (_binfo[2], _binfo[1]):
+            bot.answer_callback_query(cb.id, "❌ Это не твой бот", show_alert=True)
+            return
         cur = state.get(uid)
         new_state = {'step': 'renewing', 'bot_id': bot_id}
         if isinstance(cur, dict) and 'via_bot_id' in cur:
@@ -629,8 +657,14 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data.startswith('check_payment_'))
     def check_payment_cb(cb):
         invoice_id = int(cb.data.split('_')[-1])
-        invoice    = cb_check_invoice(invoice_id)
+        # инвойс должен быть выставлен ЭТОМУ юзеру (защита от чужих/повторных)
+        bound = db_get_pending(cb.from_user.id)
+        if not bound or bound != invoice_id:
+            bot.answer_callback_query(cb.id, "❌ Инвойс не найден. Создай оплату заново.", show_alert=True)
+            return
+        invoice = cb_check_invoice(invoice_id)
         if invoice and invoice.get('status') == 'paid':
+            # одноразовое подтверждение: удаляем привязку ДО начислений
             db_del_pending(cb.from_user.id)
             _after_payment_confirmed(cb.from_user.id, cb.message.chat.id, cb.message.message_id)
         else:
@@ -1229,7 +1263,10 @@ def register(bot: telebot.TeleBot):
         if status != 'pending':
             bot.answer_callback_query(cb.id, f"⚠️ Статус уже: {status}", show_alert=True)
             return
-        db_update_withdrawal_status(wr_id, 'approved')
+        from database import db_claim_withdrawal
+        if not db_claim_withdrawal(wr_id, 'approved'):
+            bot.answer_callback_query(cb.id, f"⚠️ Заявка #{wr_id} уже обработана", show_alert=True)
+            return
         try:
             bot.send_message(owner_id,
                 f"{TE_CHECK} <b>Запрос на вывод #{wr_id} подтверждён!</b>\n\n"
@@ -1254,7 +1291,10 @@ def register(bot: telebot.TeleBot):
         if status != 'pending':
             bot.answer_callback_query(cb.id, f"⚠️ Статус уже: {status}", show_alert=True)
             return
-        db_update_withdrawal_status(wr_id, 'rejected')
+        from database import db_claim_withdrawal
+        if not db_claim_withdrawal(wr_id, 'rejected'):
+            bot.answer_callback_query(cb.id, f"⚠️ Заявка #{wr_id} уже обработана", show_alert=True)
+            return
         db_return_bot_earnings(bot_id, usdt_amount)
         try:
             bot.send_message(owner_id,

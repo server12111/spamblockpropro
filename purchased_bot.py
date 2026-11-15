@@ -1033,8 +1033,13 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                     parse_mode='HTML')
                 return
         pstate.pop(m.from_user.id, None)
-        # Заморозить баланс (вычесть сразу)
-        db_deduct_bot_earnings(db_bot_id, amount)
+        # Атомарное списание: двойные конкурентные заявки не уйдут в минус
+        from database import db_deduct_bot_earnings_atomic
+        if not db_deduct_bot_earnings_atomic(db_bot_id, amount):
+            pbot.send_message(m.chat.id,
+                f"<b>{TE_CROSS}  Недостаточно средств (баланс изменился). Заявка не создана.</b>",
+                parse_mode='HTML')
+            return
         # Получаем данные владельца бота
         info = db_get_bot_info(db_bot_id)
         owner_id = info[2] if info else m.from_user.id
@@ -1126,7 +1131,11 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if balance < cost:
             pbot.answer_callback_query(cb.id, f"❌ Недостаточно баланса. Нужно: {cost:.4f} USDT", show_alert=True)
             return
-        db_deduct_bot_earnings(db_bot_id, cost)
+        from database import db_deduct_bot_earnings_atomic
+        if not db_deduct_bot_earnings_atomic(db_bot_id, cost):
+            pbot.answer_callback_query(cb.id,
+                f"❌ Недостаточно средств (баланс изменился)", show_alert=True)
+            return
         new_exp = db_renew_bot(db_bot_id, days)
         exp_str = str(new_exp)[:10] if new_exp else '—'
         _edit(
