@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Runtime smoke: прокликивает основные сценарии главного и дочернего ботов.
-Запуск: py tests/smoke.py"""
+"""Гонки: 3 потока × 10 сообщений + кнопки — проверка lost-update в очередях.
+Запуск: py tests/race_smoke.py"""
 import os
 import sys
 import time
