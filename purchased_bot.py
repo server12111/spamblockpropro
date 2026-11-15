@@ -317,7 +317,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if not is_admin(m.from_user.id): return
         templates = db_get_templates(db_bot_id)
         if not templates:
-            pbot.send_message(m.chat.id, f"<b>{TE_NOTE} Шаблоны пусты\n\nИспользуй кнопку f'{TE_NOTE} Шаблоны' при ответе, чтобы добавить</b>",
+            pbot.send_message(m.chat.id, f"<b>{TE_NOTE} Шаблоны пусты\n\nИспользуй кнопку «{TE_NOTE} Шаблоны» при ответе, чтобы добавить</b>",
                 parse_mode='HTML', reply_markup=pk_close())
             return
         lines = [f"<b>{TE_NOTE} Сохранённые шаблоны:</b>\n"]
@@ -365,7 +365,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             preview = text[:30] + '…' if len(text) > 30 else text
             kb.row(
                 _pbtn(preview, icon='💬', style='primary', callback_data='p_noop'),
-                _pbtn(f'{TE_CROSS}', style='danger', callback_data=f'p_mgdel_tpl_{tid}'),
+                _pbtn('Удалить', icon='❌', style='danger', callback_data=f'p_mgdel_tpl_{tid}'),
             )
         kb.add(_pbtn('Добавить шаблон', style='success', callback_data='p_mgadd_tpl'))
         kb.add(_pbtn('Назад', icon='🔙', callback_data='p_back_admin'))

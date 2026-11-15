@@ -1483,7 +1483,7 @@ def menu_text(bot_id: int) -> str:
 def menu_kb(bot_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     if fs_get_group(bot_id):
-        kb.add(_fbtn(f'{TE_REFRESH} Сменить группу', callback_data='fs_connect'))
+        kb.add(_fbtn('Сменить группу', icon='🔄', callback_data='fs_connect'))
         kb.add(_fbtn('Отключить группу', icon='❌', callback_data='fs_disconnect',
                                     style='danger'))
     else:

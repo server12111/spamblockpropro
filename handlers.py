@@ -869,8 +869,8 @@ def register(bot: telebot.TeleBot):
             )
             kb.row(
                 _btn(f"⏹ #{bot_id}", style='danger',  callback_data=f'bot_stop_{bot_id}'),
-                _btn(f"{TE_REFRESH} #{bot_id}", style='primary', callback_data=f'bot_restart_{bot_id}'),
-                _btn(f"{TE_CROSS} #{bot_id}", style='danger',  callback_data=f'bot_delete_{bot_id}'),
+                _btn(f"#{bot_id}", icon='🔄', style='primary', callback_data=f'bot_restart_{bot_id}'),
+                _btn(f"#{bot_id}", icon='❌', style='danger',  callback_data=f'bot_delete_{bot_id}'),
             )
         kb.add(_btn('Закрыть', icon='❌', style='danger', callback_data='close'))
         text = f"<b>{TE_ROBOT} Управление ботами</b>\n\n" + "\n".join(lines)
@@ -947,7 +947,7 @@ def register(bot: telebot.TeleBot):
             return
         kb = InlineKeyboardMarkup()
         kb.row(
-            _btn(f"{TE_CROSS} Да, удалить Bot #{bot_id}", style='danger',
+            _btn(f"Да, удалить Bot #{bot_id}", icon='❌', style='danger',
                  callback_data=f'bot_delete_yes_{bot_id}'),
         )
         kb.add(_btn('Отмена', icon='❌', callback_data=f'bot_delete_no_{bot_id}'))
@@ -1172,8 +1172,8 @@ def register(bot: telebot.TeleBot):
                      f"Адрес: <code>{ton_address}</code>\n"
                      f"Сумма: <b>{usdt_amount} USDT</b> | {date}\n\n")
             kb.row(
-                _btn(f"{TE_CHECK} #{wr_id}", style='success', callback_data=f'wr_confirm_{wr_id}'),
-                _btn(f"{TE_CROSS} #{wr_id}", style='danger',  callback_data=f'wr_reject_{wr_id}'),
+                _btn(f"#{wr_id}", icon='✔️', style='success', callback_data=f'wr_confirm_{wr_id}'),
+                _btn(f"#{wr_id}", icon='❌', style='danger',  callback_data=f'wr_reject_{wr_id}'),
             )
         kb.add(_btn('Назад', icon='🔙', callback_data='back_admin_panel'))
         if message_id:
