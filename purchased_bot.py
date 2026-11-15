@@ -1297,7 +1297,7 @@ def launch_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None) -> bool
                         try:
                             main_bot.send_message(SUPER_ADMIN,
                                 f"{TE_EXCLAM} <b>Bot #{db_bot_id} упал!</b>\n"
-                                f"Ошибка: <code>{e}</code>\n"
+                                f"Ошибка: <code>{html.escape(str(e)[:300])}</code>\n"
                                 f"{TE_REFRESH} Перезапускаем через 5 сек...",
                                 parse_mode='HTML')
                         except Exception:
