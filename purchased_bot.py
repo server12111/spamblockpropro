@@ -1220,7 +1220,8 @@ def launch_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None) -> bool
         def polling_loop():
             while running_bot_ids.get(db_bot_id) == token:
                 try:
-                    pbot.infinity_polling(timeout=60, long_polling_timeout=5)
+                    pbot.infinity_polling(timeout=60, long_polling_timeout=5,
+                                  allowed_updates=['message', 'callback_query', 'message_reaction'])
                 except Exception as e:
                     if running_bot_ids.get(db_bot_id) != token:
                         break

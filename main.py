@@ -120,7 +120,8 @@ if __name__ == '__main__':
         signal.signal(signal.SIGTERM, _shutdown)
         signal.signal(signal.SIGINT, _shutdown)
 
-        bot.infinity_polling(skip_pending=False, timeout=60, long_polling_timeout=5)
+        bot.infinity_polling(skip_pending=False, timeout=60, long_polling_timeout=5,
+                         allowed_updates=['message', 'callback_query', 'message_reaction'])
 
     if WEBHOOK_URL:
         from urllib.parse import urlparse

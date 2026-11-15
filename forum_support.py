@@ -30,7 +30,7 @@ from telebot.types import (InlineKeyboardMarkup, InlineKeyboardButton,
                            ReplyParameters, InputMediaPhoto, InputMediaVideo,
                            Message)
 
-from database import (DB_PATH, _utc_now_str,
+from database import (DB_PATH, _utc_now_str, db_get_topic_copies_by_src,
                       db_add_user, db_get_user_info, db_bump_user_contact,
                       db_add_username_history, db_get_username_history,
                       db_is_blocked, db_get_bot_admins,
@@ -1680,6 +1680,77 @@ def start_weekly_scheduler():
     log.info('Forum support: weekly stats scheduler started')
 
 
+
+
+# ══════════════════════════════════════════════════════════════
+#  Реакции: зеркалирование тема ↔ ЛС клиента
+# ══════════════════════════════════════════════════════════════
+def _mirror_reaction_to_dm(pbot, bot_id: int, uid: int, src_msg_id: int,
+                           new_reaction: list):
+    """Ставит те же реакции на оригинальное сообщение юзера в ЛС."""
+    copies = db_get_topic_copies_by_src(bot_id, uid, src_msg_id)
+    if not copies:
+        return
+    for chat_id, group_msg_id, _thread in copies:
+        try:
+            _api(pbot.set_message_reaction, uid, message_id=src_msg_id,
+                 reaction=new_reaction)
+            return  # достаточно одного успешного
+        except Exception as e:
+            log.debug(f'reaction mirror to DM bot#{bot_id} uid={uid}: {e}')
+
+def _mirror_reaction_to_topic(pbot, bot_id: int, group_chat_id: int,
+                              dm_msg_id: int, uid: int, new_reaction: list):
+    """Ставит те же реакции на копию сообщения юзера в теме."""
+    copies = db_get_topic_copies_by_src(bot_id, uid, dm_msg_id)
+    for chat_id, group_msg_id, thread_id in copies:
+        if chat_id != group_chat_id:
+            continue
+        try:
+            _api(pbot.set_message_reaction, group_chat_id,
+                 message_id=group_msg_id, reaction=new_reaction)
+            return
+        except Exception as e:
+            log.debug(f'reaction mirror to topic bot#{bot_id} uid={uid}: {e}')
+
+def fs_handle_reaction(pbot, bot_id: int, mr, bot_self_id: int) -> None:
+    """Обрабатывает message_reaction: зеркалирует реакции между темой и ЛС."""
+    if not mr.new_reaction:
+        return  # реакция снята — зеркалировать нечего
+    chat = mr.chat
+    reactor = mr.user or mr.actor_chat
+    if not reactor:
+        return
+    reactor_id = reactor.id if hasattr(reactor, 'id') else 0
+
+    group = fs_get_group(bot_id)
+    if group and chat.id == group[1]:
+        # ── реакция в теме: админ реагирует на сообщение юзера ──
+        if not fs_is_admin(bot_id, reactor_id):
+            return
+        mp = fs_get_mapping(chat.id, mr.message_id)
+        if mp and mp[0] == bot_id:
+            # юзерское сообщение в теме → зеркалим в ЛС юзера
+            try:
+                _api(pbot.set_message_reaction, mp[1], message_id=mp[3],
+                     reaction=mr.new_reaction)
+            except Exception as e:
+                log.debug(f'reaction mirror to DM bot#{bot_id}: {e}')
+    elif chat.type == 'private':
+        # ── реакция в ЛС: юзер реагирует на сообщение бота ──
+        # сообщение бота в ЛС = копия/ответ в теме; ищем связь
+        copies = db_get_topic_copies_by_src(bot_id, reactor_id, mr.message_id)
+        if copies:
+            for chat_id, group_msg_id, _thread in copies:
+                if chat_id != group[1] if group else True:
+                    continue
+                try:
+                    _api(pbot.set_message_reaction, group[1],
+                         message_id=group_msg_id, reaction=mr.new_reaction)
+                    return
+                except Exception as e:
+                    log.debug(f'reaction mirror to topic bot#{bot_id}: {e}')
+
 # ══════════════════════════════════════════════════════════════
 #  Регистрация обработчиков дочернего бота
 # ══════════════════════════════════════════════════════════════
@@ -1719,6 +1790,14 @@ def register_forum_support(pbot, bot_id: int, pstate, is_admin, confirm_kb=_conf
 
     def route(m, _kb=confirm_kb):
         return route_user_message(pbot, bot_id, m, confirm_kb=_kb)
+
+    # ── реакции: зеркалирование тема ↔ ЛС клиента ──
+    @pbot.message_reaction_handler()
+    def _fs_reaction_cb(mr):
+        try:
+            fs_handle_reaction(pbot, bot_id, mr, bot_self_id)
+        except Exception as e:
+            log.error(f'fs reaction bot#{bot_id}: {e}', exc_info=True)
 
     # ── сообщения из групп (ответы админов, код подключения) ──
     @pbot.message_handler(func=lambda m: m.chat.type in ('group', 'supergroup'),

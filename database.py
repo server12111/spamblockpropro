@@ -1024,6 +1024,18 @@ def db_fs_users_total(bot_id: int) -> int:
     n = c.execute('SELECT COUNT(*) FROM bot_users WHERE bot_id=?', (bot_id,)).fetchone()[0]
     c.close(); return n
 
+def db_get_topic_copies_by_src(bot_id: int, user_id: int, src_msg_id: int) -> list:
+    """Обратный поиск: копии сообщения юзера в теме по оригинальному message_id.
+    Возвращает [(chat_id, group_msg_id, thread_id), ...] — может быть несколько (альбом)."""
+    c = _conn()
+    rows = c.execute(
+        'SELECT chat_id, group_msg_id, thread_id FROM fs_msgs '
+        'WHERE bot_id=? AND user_id=? AND src_msg_id=?',
+        (bot_id, user_id, src_msg_id)
+    ).fetchall()
+    c.close()
+    return rows
+
 def db_fs_user_tickets_total(bot_id: int, user_id: int) -> int:
     c = _conn()
     n = c.execute('SELECT COUNT(*) FROM fs_tickets WHERE bot_id=? AND user_id=?',
