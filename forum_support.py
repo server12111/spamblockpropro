@@ -30,7 +30,7 @@ from telebot.types import (InlineKeyboardMarkup, InlineKeyboardButton,
                            ReplyParameters, InputMediaPhoto, InputMediaVideo,
                            Message)
 
-from database import (DB_PATH, _utc_now_str, db_get_topic_copies_by_src,
+from database import (_utc_now_str, db_get_topic_copies_by_src,
                       db_add_user, db_get_user_info, db_bump_user_contact,
                       db_add_username_history, db_get_username_history,
                       db_is_blocked, db_get_bot_admins,
@@ -40,7 +40,7 @@ from database import (DB_PATH, _utc_now_str, db_get_topic_copies_by_src,
                       db_fs_new_users_range, db_fs_users_total,
                       db_fs_user_tickets_total)
 from config import STATS_TZ_OFFSET, RATE_LIMIT_SEC
-from keyboards import (_ICON, TE_BLOCK, TE_CALENDAR, TE_CHAT, TE_CHECK, TE_CLIP, TE_CLOCK, TE_CROSS, TE_EXCLAM, TE_ID, TE_LINK, TE_NOTE, TE_REFRESH, TE_SEND, TE_STATS, TE_USER)
+from keyboards import (_ICON, TE_BLOCK, TE_CALENDAR, TE_CHAT, TE_CHECK, TE_CLIP, TE_CLOCK, TE_CROSS, TE_EXCLAM, TE_ID, TE_LINK, TE_NOTE, TE_SEND, TE_STATS, TE_USER)
 
 log = logging.getLogger(__name__)
 
@@ -1696,38 +1696,29 @@ def start_weekly_scheduler():
 
 
 # ══════════════════════════════════════════════════════════════
-#  Реакции: зеркалирование тема ↔ ЛС клиента
+#  Реакции: тема ↔ ЛС клиента
+#  ОГРАНИЧЕНИЕ ПЛАТФОРМЫ: setMessageReaction работает ТОЛЬКО в
+#  супергруппах (в личных чатах Telegram отвечает «message must
+#  belong to a supergroup»). Поэтому:
+#  - админ отреагировал в теме → клиенту в ЛС уходит УВЕДОМЛЕНИЕ
+#    с эмодзи (поставить реакцию в ЛС бот не может физически);
+#  - юзер отреагировал в ЛС → реакция ставится на копию сообщения
+#    в супергруппе (это разрешено, бот там администратор).
 # ══════════════════════════════════════════════════════════════
-def _mirror_reaction_to_dm(pbot, bot_id: int, uid: int, src_msg_id: int,
-                           new_reaction: list):
-    """Ставит те же реакции на оригинальное сообщение юзера в ЛС."""
-    copies = db_get_topic_copies_by_src(bot_id, uid, src_msg_id)
-    if not copies:
-        return
-    for chat_id, group_msg_id, _thread in copies:
-        try:
-            _api(pbot.set_message_reaction, uid, message_id=src_msg_id,
-                 reaction=new_reaction)
-            return  # достаточно одного успешного
-        except Exception as e:
-            log.debug(f'reaction mirror to DM bot#{bot_id} uid={uid}: {e}')
+_reaction_sent: dict = {}   # (bot_id, uid, src_msg_id) -> последний отправленный эмодзи
+_reaction_lock = threading.Lock()
 
-def _mirror_reaction_to_topic(pbot, bot_id: int, group_chat_id: int,
-                              dm_msg_id: int, uid: int, new_reaction: list):
-    """Ставит те же реакции на копию сообщения юзера в теме."""
-    copies = db_get_topic_copies_by_src(bot_id, uid, dm_msg_id)
-    for chat_id, group_msg_id, thread_id in copies:
-        if chat_id != group_chat_id:
-            continue
-        try:
-            _api(pbot.set_message_reaction, group_chat_id,
-                 message_id=group_msg_id, reaction=new_reaction)
-            return
-        except Exception as e:
-            log.debug(f'reaction mirror to topic bot#{bot_id} uid={uid}: {e}')
+def _reaction_emoji(new_reaction: list) -> str:
+    """Эмодзи реакции для текста уведомления. Кастомный (premium) эмодзи
+    отрендерить в тексте нечем — показываем нейтральный маркер."""
+    for r in new_reaction or []:
+        em = getattr(r, 'emoji', None)
+        if em:
+            return em
+    return '❤️'
 
 def fs_handle_reaction(pbot, bot_id: int, mr, bot_self_id: int) -> None:
-    """Обрабатывает message_reaction: зеркалирует реакции между темой и ЛС."""
+    """Обрабатывает message_reaction: тема → уведомление в ЛС, ЛС → реакция в теме."""
     if not mr.new_reaction:
         return  # реакция снята — зеркалировать нечего
     chat = mr.chat
@@ -1742,27 +1733,40 @@ def fs_handle_reaction(pbot, bot_id: int, mr, bot_self_id: int) -> None:
         if not fs_is_admin(bot_id, reactor_id):
             return
         mp = fs_get_mapping(chat.id, mr.message_id)
-        if mp and mp[0] == bot_id:
-            # юзерское сообщение в теме → зеркалим в ЛС юзера
-            try:
-                _api(pbot.set_message_reaction, mp[1], message_id=mp[3],
-                     reaction=mr.new_reaction)
-            except Exception as e:
-                log.debug(f'reaction mirror to DM bot#{bot_id}: {e}')
+        if not (mp and mp[0] == bot_id):
+            return
+        uid, src_msg_id = mp[1], mp[3]
+        if db_is_blocked(bot_id, uid):
+            return
+        emoji = _reaction_emoji(mr.new_reaction)
+        key = (bot_id, uid, src_msg_id)
+        with _reaction_lock:
+            if _reaction_sent.get(key) == emoji:
+                return  # дедуп: ту же реакцию на то же сообщение уже отправляли
+            if len(_reaction_sent) > 5000:
+                _reaction_sent.clear()
+            _reaction_sent[key] = emoji
+        try:
+            pbot.send_message(uid,
+                f'{emoji} <b>Админ отреагировал на ваше сообщение</b>',
+                parse_mode='HTML')
+        except Exception as e:
+            log.warning(f'reaction notify DM bot#{bot_id} uid={uid}: {e}')
     elif chat.type == 'private':
         # ── реакция в ЛС: юзер реагирует на сообщение бота ──
-        # сообщение бота в ЛС = копия/ответ в теме; ищем связь
+        # реакция ставится на копию/оригинал в супергруппе (в ЛС нельзя)
+        if not group:
+            return
         copies = db_get_topic_copies_by_src(bot_id, reactor_id, mr.message_id)
-        if copies:
-            for chat_id, group_msg_id, _thread in copies:
-                if chat_id != group[1] if group else True:
-                    continue
-                try:
-                    _api(pbot.set_message_reaction, group[1],
-                         message_id=group_msg_id, reaction=mr.new_reaction)
-                    return
-                except Exception as e:
-                    log.debug(f'reaction mirror to topic bot#{bot_id}: {e}')
+        for chat_id, group_msg_id, _thread in copies:
+            if chat_id != group[1]:
+                continue
+            try:
+                _api(pbot.set_message_reaction, group[1],
+                     message_id=group_msg_id, reaction=mr.new_reaction)
+                return
+            except Exception as e:
+                log.warning(f'reaction mirror to topic bot#{bot_id}: {e}')
 
 # ══════════════════════════════════════════════════════════════
 #  Регистрация обработчиков дочернего бота

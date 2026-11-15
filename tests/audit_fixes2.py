@@ -240,6 +240,66 @@ check('fs_msgs переписаны на новый chat_id', mp_new is not None
 gr = fs_get_group(bots2[0][0])
 check('fs_groups.chat_id обновлён', gr and gr[1] == NEW_CID)
 
+print('── реакции: админ в теме → уведомление в ЛС (setMessageReaction в ЛС запрещён) ──')
+from forum_support import fs_handle_reaction, fs_map_message
+REACTION_LOG = []
+ORIG['set_message_reaction'] = telebot.TeleBot.set_message_reaction
+telebot.TeleBot.set_message_reaction = lambda self, chat_id, message_id=None, reaction=None, **kw: (
+    REACTION_LOG.append((chat_id, message_id, reaction)), True)[1]
+BOT2 = bots2[0][0]
+# маппинги: юзер 888, исходники 44 (уже есть после миграции) и 45
+fs_map_message(BOT2, NEW_CID, 334, 888, 5, 45, '')
+
+def mk_mr(chat_dict, msg_id, uid, reactions):
+    mr = t.MessageReactionUpdated(
+        chat=t.Chat.de_json(chat_dict), message_id=msg_id,
+        date=int(time.time()), old_reaction=[], new_reaction=reactions)
+    mr.user = t.User(id=uid, is_bot=False, first_name='A')
+    return mr
+
+# 1. админ реагирует в теме на копию сообщения юзера 888 (group_msg_id=334 ↔ src=45)
+SEND_LOG.clear()
+mr_admin = mk_mr({'id': NEW_CID, 'type': 'supergroup', 'title': 'G'}, 334, SUPER,
+                 [t.ReactionTypeEmoji(emoji='❤️')])
+fs_handle_reaction(pb, BOT2, mr_admin, 1)
+notify = [txt for cid, txt in SEND_LOG if cid == 888]
+check('клиент получил уведомление с эмодзи реакции',
+      len(notify) == 1 and '❤️' in notify[0] and 'отреагировал' in notify[0], str(notify))
+check('в ЛС НЕ вызывается set_message_reaction (запрещено платформой)',
+      not any(cid == 888 for cid, _, _ in REACTION_LOG))
+
+# 2. дедуп: та же реакция на то же сообщение — повторного уведомления нет
+SEND_LOG.clear()
+fs_handle_reaction(pb, BOT2, mr_admin, 1)
+check('дедуп: та же реакция не шлётся повторно', len(SEND_LOG) == 0, str(SEND_LOG))
+
+# 3. юзер реагирует в ЛС на СВОЁ сообщение (src=44) → реакция на копию в супергруппе
+REACTION_LOG.clear()
+mr_user = mk_mr({'id': 888, 'type': 'private', 'first_name': 'Ю'}, 44, 888,
+                [t.ReactionTypeEmoji(emoji='👍')])
+fs_handle_reaction(pb, BOT2, mr_user, 1)
+check('юзерская реакция из ЛС зеркалится в супергруппу',
+      any(cid == NEW_CID and mid == 333 for cid, mid, _ in REACTION_LOG), str(REACTION_LOG))
+
+# 4. кастомный (premium) эмодзи → нейтральное уведомление
+# (другое сообщение: дедуп по резолвнутому эмодзи подавил бы повтор на 334)
+fs_map_message(BOT2, NEW_CID, 335, 888, 5, 46, '')
+SEND_LOG.clear()
+mr_custom = mk_mr({'id': NEW_CID, 'type': 'supergroup', 'title': 'G'}, 335, SUPER,
+                  [t.ReactionTypeCustomEmoji(custom_emoji_id='555999')])
+fs_handle_reaction(pb, BOT2, mr_custom, 1)
+notify2 = [txt for cid, txt in SEND_LOG if cid == 888]
+check('кастомный эмодзи: уведомление отправлено (нейтральный маркер)',
+      len(notify2) == 1 and 'отреагировал' in notify2[0], str(notify2))
+
+# 5. реакция снята → ничего не шлём
+SEND_LOG.clear()
+mr_empty = mk_mr({'id': NEW_CID, 'type': 'supergroup', 'title': 'G'}, 334, SUPER, [])
+fs_handle_reaction(pb, BOT2, mr_empty, 1)
+check('снятая реакция не порождает уведомлений', len(SEND_LOG) == 0)
+
+telebot.TeleBot.set_message_reaction = ORIG['set_message_reaction']
+
 print()
 print(f'ИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL')
 sys.exit(1 if FAIL else 0)
