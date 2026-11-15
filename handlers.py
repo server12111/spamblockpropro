@@ -1031,10 +1031,8 @@ def register(bot: telebot.TeleBot):
                  "Включи кнопку «Купить такого бота» для нужных ботов.\n",
                  "Владелец получает 50% с каждой покупки через его бота.\n"]
         kb = InlineKeyboardMarkup()
-        for row in bots_list:
+        for row in bots_list[:30]:
             bot_id, owner_id = row[0], row[1]
-            info = db_get_bot_info(bot_id)
-            uname = info[0] if info else None
             enabled = db_is_marketplace_enabled(bot_id)
             status_icon = f'{TE_GREEN}' if enabled else f'{TE_MOON}'
             label = f"{status_icon} Bot #{bot_id} (owner {owner_id})"
@@ -1043,6 +1041,8 @@ def register(bot: telebot.TeleBot):
                 _btn(label, callback_data='noop'),
                 _btn(toggle_label, style='danger' if enabled else 'success', callback_data=f'mp_toggle_{bot_id}'),
             )
+        if len(bots_list) > 30:
+            lines.append(f"<i>… показаны первые 30 из {len(bots_list)} ботов</i>")
         kb.add(_btn('Назад', icon='🔙', callback_data='back_admin_panel'))
         text = "\n".join(lines)
         if message_id:
