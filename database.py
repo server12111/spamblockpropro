@@ -682,6 +682,14 @@ def db_mark_paid(user_id: int, days: int = 30):
               (user_id, max(int(days), 3)))
     c.commit(); c.close()
 
+def db_peek_grant_days(user_id: int):
+    """Дни из гранта БЕЗ удаления (для расчёта до успешного создания бота).
+    None — нет записи (фолбэк 30). Расход делает db_take_grant_days."""
+    c = _conn()
+    row = c.execute('SELECT days FROM bot_grants WHERE user_id=?', (user_id,)).fetchone()
+    c.close()
+    return row[0] if row else None
+
 def db_take_grant_days(user_id: int):
     """Забирает записанные дни права (однократно). None — нет записи (30 по умолчанию)."""
     c = _conn()
@@ -1082,9 +1090,14 @@ def db_backup(dest_dir: str) -> str:
     dst = sqlite3.connect(dest_path)
     try:
         src.backup(dst)   # копирует согласованное состояние, не блокируя надолго
-        dst.close()
         log.info(f'Бэкап БД создан: {dest_path}')
     finally:
+        # закрываем ОБЕ соединения: иначе при сбое дескриптор dst утечёт
+        # и файл бэкапа останется залоченным (критично на Windows)
+        try:
+            dst.close()
+        except Exception:
+            pass
         src.close()
     # ротация: оставляем последние BACKUPS_TO_KEEP
     backups = sorted(_glob.glob(os.path.join(dest_dir, 'spambots_*.db')))

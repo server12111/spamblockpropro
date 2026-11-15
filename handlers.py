@@ -16,7 +16,7 @@ from database import (DB_PATH, init_db,
                        db_renew_bot,
                        get_price, set_price,
                        db_set_pending, db_del_pending, db_get_pending,
-                       db_take_grant_days,
+                       db_take_grant_days, db_peek_grant_days,
                        db_mark_paid, db_is_paid, db_clear_paid,
                        db_has_used_trial, db_mark_trial_used,
                        db_set_referral, db_get_referrer, db_mark_referral_paid,
@@ -349,7 +349,8 @@ def register(bot: telebot.TeleBot):
         if m.from_user.id != SUPER_ADMIN: return
         state.pop(m.from_user.id, None)
         doc = m.document
-        if not doc.file_name.endswith('.db'):
+        # file_name у документа опционален (Telegram) — None сломал бы .endswith
+        if not (doc.file_name or '').endswith('.db'):
             bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Нужен файл с расширением .db</b>", parse_mode='HTML')
             return
         try:
@@ -479,15 +480,35 @@ def register(bot: telebot.TeleBot):
                   f"{TE_LINK} Username: {html.escape(username)}\n"
                   f"{TE_ID} ID: <code>{m.from_user.id}</code>")
         body = html.escape(m.text or '')
-        # длинные обращения: заголовок отдельно + тело кусками по 3800
+        # длинные обращения: заголовок отдельно + тело кусками по 3800.
+        # РЕЖЕМ СЫРОЙ ТЕКСТ и экранируем каждый кусок отдельно: разрез уже
+        # экранированной строки рвёт HTML-сущности (&amp; → "&am" + "p;")
+        # и Telegram отвечает 400 на битый HTML
+        raw = m.text or ''
         if len(header) + len(body) + 4 > 4000:
-            bot.send_message(SUPER_ADMIN, header, parse_mode='HTML',
-                             reply_markup=reply_kb(m.from_user.id))
-            for i in range(0, len(body), 3800):
-                bot.send_message(SUPER_ADMIN, body[i:i + 3800], parse_mode='HTML')
+            try:
+                bot.send_message(SUPER_ADMIN, header, parse_mode='HTML',
+                                 reply_markup=reply_kb(m.from_user.id))
+                for i in range(0, len(raw), 3800):
+                    bot.send_message(SUPER_ADMIN, html.escape(raw[i:i + 3800]), parse_mode='HTML')
+            except Exception as e:
+                log.warning(f'user_text delivery to SUPER_ADMIN failed: {e}')
+                bot.send_message(m.chat.id,
+                    f"<b>{TE_CROSS}  Не удалось доставить сообщение. Попробуй позже.</b>",
+                    parse_mode='HTML', reply_markup=close_kb())
+                state.pop(m.from_user.id, None)
+                return
         else:
-            bot.send_message(SUPER_ADMIN, header + '\n\n' + f"{TE_CHAT} {body}",
-                             parse_mode='HTML', reply_markup=reply_kb(m.from_user.id))
+            try:
+                bot.send_message(SUPER_ADMIN, header + '\n\n' + f"{TE_CHAT} {body}",
+                                 parse_mode='HTML', reply_markup=reply_kb(m.from_user.id))
+            except Exception as e:
+                log.warning(f'user_text delivery to SUPER_ADMIN failed: {e}')
+                bot.send_message(m.chat.id,
+                    f"<b>{TE_CROSS}  Не удалось доставить сообщение. Попробуй позже.</b>",
+                    parse_mode='HTML', reply_markup=close_kb())
+                state.pop(m.from_user.id, None)
+                return
         bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Сообщение отправлено</b>",
             parse_mode='HTML', reply_markup=close_kb())
         state.pop(m.from_user.id, None)
@@ -496,8 +517,19 @@ def register(bot: telebot.TeleBot):
                                         and state[m.from_user.id].startswith('await_admin_msg_'))
     def admin_text(m):
         target_id = int(state[m.from_user.id].split('_')[-1])
-        bot.send_message(target_id, f"<b>{TE_INBOX} Сообщение от администратора\n\n{TE_CHAT} {html.escape(m.text or '')}</b>",
-            parse_mode='HTML')
+        try:
+            bot.send_message(target_id, f"<b>{TE_INBOX} Сообщение от администратора\n\n{TE_CHAT} {html.escape(m.text or '')}</b>",
+                parse_mode='HTML')
+        except Exception as e:
+            # адресат недоступен (заблокировал бота / удалил аккаунт): не молчим —
+            # сообщаем и снимаем состояние, иначе админ застрянет в режиме ответа
+            log.warning(f'admin_text delivery to {target_id} failed: {e}')
+            state.pop(m.from_user.id, None)
+            bot.send_message(m.chat.id,
+                f"<b>{TE_CROSS}  Не удалось доставить ответ: пользователь недоступен "
+                f"(заблокировал бота или удалил аккаунт).</b>",
+                parse_mode='HTML', reply_markup=close_kb())
+            return
         bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Ответ отправлен</b>",
             parse_mode='HTML', reply_markup=close_kb())
         state.pop(m.from_user.id, None)
@@ -793,8 +825,10 @@ def register(bot: telebot.TeleBot):
         s         = state.pop(m.from_user.id)
         token_val = s['token']
         uname     = s.get('username', '')
-        # дни берём из гранта (однократно) — пробный/купон не превращаются в 30
-        grant_days = db_take_grant_days(m.from_user.id)
+        # дни берём из гранта (однократно) — пробный/купон не превращаются в 30.
+        # СНАЧАЛА читаем (peek): расход гранта — только после успешного db_add_bot,
+        # иначе дубль токена съедал бы грант (триал-юзер получал бы 30 дней на повторе)
+        grant_days = db_peek_grant_days(m.from_user.id)
         if grant_days is not None:
             days = grant_days
         elif s.get('free_days'):
@@ -806,9 +840,17 @@ def register(bot: telebot.TeleBot):
         try:
             bot_db_id = db_add_bot(m.from_user.id, token_val, admin_id_val, days=days)
         except Exception:
+            # токен занят: возвращаем юзера к вводу токена, грант не тронут
+            if s.get('free_days'):
+                state[m.from_user.id] = {'step': 'await_bot_token_free', 'days': s['free_days']}
+            elif s.get('trial'):
+                state[m.from_user.id] = 'await_bot_token_trial'
+            else:
+                state[m.from_user.id] = 'await_bot_token'
             bot.send_message(m.chat.id,
-                f"<b>{TE_CROSS}  Этот токен уже зарегистрирован. Используй другой.</b>", parse_mode='HTML')
+                f"<b>{TE_CROSS}  Этот токен уже зарегистрирован. Введи другой токен:</b>", parse_mode='HTML')
             return
+        db_take_grant_days(m.from_user.id)  # расходуем грант (успешная регистрация)
         if launch_bot(bot_db_id, token_val, admin_id_val, bot):
             db_clear_paid(m.from_user.id)
             kb = InlineKeyboardMarkup()

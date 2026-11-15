@@ -160,7 +160,11 @@ if __name__ == '__main__':
         webhook_ok = False
         for attempt in range(1, 4):
             try:
-                bot.set_webhook(url=f'{base}/{secret}')
+                # allowed_updates ОБЯЗАТЕЛЬНО как в polling: без него Telegram
+                # по умолчанию НЕ доставляет message_reaction — зеркалирование
+                # реакций в форум-режиме молча перестаёт работать
+                bot.set_webhook(url=f'{base}/{secret}',
+                                allowed_updates=['message', 'callback_query', 'message_reaction'])
                 webhook_ok = True
                 # секрет (производный от токена) в лог не пишем
                 log.info(f'Webhook set: {base}/***')

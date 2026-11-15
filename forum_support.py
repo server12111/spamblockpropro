@@ -951,11 +951,14 @@ def fs_handle_group_message(pbot, bot_id: int, m, bot_self_id: int, pstate) -> N
     - ответ на закреплённое инфо-сообщение = внутренняя заметка (не доставляется);
     - служебные события и сообщения не-админов игнорируются."""
     if m.content_type == 'migrate_to_chat_id':
-        # группа была преобразована: обновляем chat_id в привязке
+        # группа была преобразована: обновляем chat_id в привязке И в
+        # соответствиях сообщений, иначе fs_get_mapping по новому chat_id
+        # не найдёт старые маппинги и ответы через Reply сломаются
         new_chat_id = getattr(m, 'migrate_to_chat_id', None)
         if new_chat_id:
             c = _conn()
             c.execute('UPDATE fs_groups SET chat_id=? WHERE bot_id=?', (new_chat_id, bot_id))
+            c.execute('UPDATE fs_msgs SET chat_id=? WHERE bot_id=?', (new_chat_id, bot_id))
             c.commit(); c.close()
             log.info(f'Bot #{bot_id}: группа мигрировала → chat_id {new_chat_id}')
         return

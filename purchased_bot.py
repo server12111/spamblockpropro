@@ -315,8 +315,15 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     @pbot.message_handler(commands=['start'])
     def pstart(m):
         db_add_user(db_bot_id, m.from_user.id, m.from_user.username or '')
-        pbot.send_message(m.chat.id, get_welcome(), parse_mode='HTML',
-                          reply_markup=pk_start(is_admin(m.from_user.id)))
+        w = get_welcome()
+        try:
+            pbot.send_message(m.chat.id, w, parse_mode='HTML',
+                              reply_markup=pk_start(is_admin(m.from_user.id)))
+        except Exception:
+            # битый HTML в приветствии (введён админом) не должен «убивать» /start:
+            # отправляем как plain text — бот всегда отвечает на /start
+            pbot.send_message(m.chat.id, w,
+                              reply_markup=pk_start(is_admin(m.from_user.id)))
 
     @pbot.message_handler(commands=['admin'])
     def padmin_cmd(m):
@@ -353,7 +360,8 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             return
         lines = [f"<b>{TE_NOTE} Сохранённые шаблоны:</b>\n"]
         for tid, text in templates[:50]:
-            lines.append(f"• [{tid}] {text}")
+            # экранируем: шаблон вводит админ, '<' в нём ломал бы весь список (400)
+            lines.append(f"• [{tid}] {html.escape(str(text))}")
         pbot.send_message(m.chat.id, "\n".join(lines),
             parse_mode='HTML', reply_markup=pk_close())
 
@@ -455,12 +463,21 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
 
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_close')
     def p_close(cb):
-        pbot.delete_message(cb.message.chat.id, cb.message.message_id)
+        # сообщение может быть старше 48 ч (Telegram не даст удалить) — не роняем
+        try:
+            pbot.delete_message(cb.message.chat.id, cb.message.message_id)
+        except Exception:
+            pass
 
     @pbot.callback_query_handler(func=lambda c: c.data == 'cancel')
     def p_cancel_generic(cb):
-        pbot.delete_message(cb.message.chat.id, cb.message.message_id)
+        # состояние сбрасываем ДО удаления: упавшее delete_message
+        # (сообщение старше 48 ч) не должно оставлять юзера в состоянии
         pstate.pop(cb.from_user.id, None)
+        try:
+            pbot.delete_message(cb.message.chat.id, cb.message.message_id)
+        except Exception:
+            pass
 
     # ── Отправить сообщение ────────────────────────────
     # fs_route назначается в конце make_purchased_bot после регистрации
@@ -594,7 +611,11 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                                               'content_type': cb.message.content_type,
                                               'file_id': _get_file_id(cb.message),
                                               'caption': cb.message.html_caption or cb.message.caption or ''}
-            pbot.delete_message(cb.message.chat.id, cb.message.message_id)
+            try:
+                pbot.delete_message(cb.message.chat.id, cb.message.message_id)
+            except Exception:
+                pass  # >48 ч — Telegram не даст удалить; НЕ роняем хендлер,
+                      # иначе админ не попадёт в режим ответа
             pbot.send_message(cb.message.chat.id,
                 f"<b>{TE_CHAT}  Введи ответ или отправь фото:</b>",
                 parse_mode='HTML', reply_markup=pk_reply_input_with_templates(target))
@@ -729,8 +750,20 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def p_admin_text(m):
         if not is_admin(m.from_user.id): return
         target_id = int(pstate[m.from_user.id].split('_')[-1])
-        _send_long(target_id,
-                   f"<b>{TE_INBOX} Сообщение от администратора</b>", m.text or '')
+        try:
+            _send_long(target_id,
+                       f"<b>{TE_INBOX} Сообщение от администратора</b>", m.text or '')
+        except Exception as e:
+            # адресат недоступен: сообщаем и снимаем состояние, чтобы админ
+            # не застрял в режиме ответа без всякого фидбека
+            log.warning(f'p_admin_text bot#{db_bot_id} → {target_id}: {e}')
+            pstate.pop(m.from_user.id, None)
+            preply_cache.pop(m.from_user.id, None)
+            pbot.send_message(m.chat.id,
+                f"<b>{TE_CROSS}  Не удалось доставить ответ: пользователь недоступен "
+                f"(заблокировал бота или удалил аккаунт).</b>",
+                parse_mode='HTML', reply_markup=pk_close())
+            return
         pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Ответ отправлен</b>",
             parse_mode='HTML', reply_markup=pk_close())
         preply_cache.pop(m.from_user.id, None)
@@ -745,18 +778,23 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if not is_admin(m.from_user.id): return
         target_id = int(pstate[m.from_user.id].split('_')[-1])
         caption = m.caption or ''
-        if len(caption) > 900:
-            # подпись > лимита Telegram (1024): фото отдельно + текст отдельно
-            pbot.send_photo(target_id, m.photo[-1].file_id)
-            _send_long(target_id, f"<b>{TE_INBOX} Сообщение от администратора</b>", caption)
-        else:
-            cap_text = f"<b>{TE_INBOX} Сообщение от администратора</b>\n\n{html.escape(caption)}" if caption else f"<b>{TE_INBOX} Сообщение от администратора</b>"
-            try:
+        try:
+            if len(caption) > 900:
+                # подпись > лимита Telegram (1024): фото отдельно + текст отдельно
+                pbot.send_photo(target_id, m.photo[-1].file_id)
+                _send_long(target_id, f"<b>{TE_INBOX} Сообщение от администратора</b>", caption)
+            else:
+                cap_text = f"<b>{TE_INBOX} Сообщение от администратора</b>\n\n{html.escape(caption)}" if caption else f"<b>{TE_INBOX} Сообщение от администратора</b>"
                 pbot.send_photo(target_id, m.photo[-1].file_id, caption=cap_text, parse_mode='HTML')
-            except Exception as e:
-                log.warning(f'p_admin_photo_reply failed: {e}')
-                pbot.send_message(m.chat.id, f"<b>{TE_CROSS}  Не удалось отправить фото</b>", parse_mode='HTML')
-                return
+        except Exception as e:
+            log.warning(f'p_admin_photo_reply bot#{db_bot_id} → {target_id}: {e}')
+            pstate.pop(m.from_user.id, None)
+            preply_cache.pop(m.from_user.id, None)
+            pbot.send_message(m.chat.id,
+                f"<b>{TE_CROSS}  Не удалось отправить фото: пользователь недоступен "
+                f"(заблокировал бота или удалил аккаунт).</b>",
+                parse_mode='HTML', reply_markup=pk_close())
+            return
         pstate.pop(m.from_user.id, None)
         preply_cache.pop(m.from_user.id, None)
         pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Фото отправлено</b>",
@@ -919,10 +957,19 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def p_save_welcome(m):
         if not is_admin(m.from_user.id): return
         pstate.pop(m.from_user.id, None)
+        # валидация HTML ДО сохранения: кривой текст сделал бы /start
+        # молча падающим у ВСЕХ пользователей бота
+        try:
+            pbot.send_message(m.chat.id,
+                f"<b>{TE_CHECK}  Приветствие обновлено!</b>\n\n<b>Предпросмотр:</b>\n\n{m.text}",
+                parse_mode='HTML', reply_markup=pk_close())
+        except Exception:
+            pbot.send_message(m.chat.id,
+                f"<b>{TE_CROSS}  Приветствие НЕ сохранено: некорректный HTML "
+                f"(проверь закрытие тегов &lt;b&gt;, &lt;i&gt; и т.п.). Попробуй ещё раз.</b>",
+                parse_mode='HTML', reply_markup=pk_back_admin())
+            return
         db_set_bot_setting(db_bot_id, 'welcome', m.text)
-        pbot.send_message(m.chat.id,
-            f"<b>{TE_CHECK}  Приветствие обновлено!</b>\n\n<b>Предпросмотр:</b>\n\n{m.text}",
-            parse_mode='HTML', reply_markup=pk_close())
 
     # ── Удалить бота ───────────────────────────────────
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_delete_bot')
