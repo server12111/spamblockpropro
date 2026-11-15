@@ -1204,7 +1204,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         from database import db_deduct_bot_earnings_atomic
         if not db_deduct_bot_earnings_atomic(db_bot_id, cost):
             pbot.answer_callback_query(cb.id,
-                f"❌ Недостаточно средств (баланс изменился)", show_alert=True)
+                "❌ Недостаточно средств (баланс изменился)", show_alert=True)
             return
         new_exp = db_renew_bot(db_bot_id, days)
         exp_str = str(new_exp)[:10] if new_exp else '—'
