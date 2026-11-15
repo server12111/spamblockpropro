@@ -7,7 +7,7 @@ import logging
 from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import SUPER_ADMIN, TON_WALLET, WITHDRAWAL_CHANNEL, BOT_USERNAME
-from database import (DB_PATH,
+from database import DB_PATH, init_db,
                        db_add_user, db_get_owner_bots, db_add_bot,
                        db_get_all_users, db_get_bot_users, db_get_stats,
                        db_get_active_bots_list, db_get_bot_info,
