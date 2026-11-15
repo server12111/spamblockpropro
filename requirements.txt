@@ -1,4 +1,4 @@
-pyTelegramBotAPI>=4.33.0
+pyTelegramBotAPI>=4.33.0,<5.0.0
 requests
 python-dotenv
 flask
