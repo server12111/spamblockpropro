@@ -443,7 +443,7 @@ def register(bot: telebot.TeleBot):
                                         and state[m.from_user.id].startswith('await_admin_msg_'))
     def admin_text(m):
         target_id = int(state[m.from_user.id].split('_')[-1])
-        bot.send_message(target_id, f"<b>{TE_INBOX} Сообщение от администратора\n\n{TE_CHAT} {m.text}</b>",
+        bot.send_message(target_id, f"<b>{TE_INBOX} Сообщение от администратора\n\n{TE_CHAT} {html.escape(m.text or '')}</b>",
             parse_mode='HTML')
         bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Ответ отправлен</b>",
             parse_mode='HTML', reply_markup=close_kb())

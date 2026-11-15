@@ -841,12 +841,11 @@ def route_user_message(pbot, bot_id: int, m, confirm_kb=None) -> bool:
             log.warning(f'route album topic bot#{bot_id} uid={uid}: {e}')
             _notify_owner_error(pbot, bot_id,
                                 'Не удалось создать тему в группе техподдержки', e)
+            # сообщение не теряем — в очередь подтверждения
             try:
-                pbot.send_message(m.chat.id,
-                                  f'<b>{TE_CROSS}  Не удалось доставить сообщение в техподдержку. '
-                                  'Попробуй позже.</b>', parse_mode='HTML')
-            except Exception:
-                pass
+                queue_random_message(pbot, bot_id, m)
+            except Exception as e2:
+                log.warning(f'route album fail -> queue failed: {e2}')
             return True
         _buffer_album(pbot, bot_id, group[1], thread, m, confirm_kb)
         return True
@@ -872,12 +871,12 @@ def route_user_message(pbot, bot_id: int, m, confirm_kb=None) -> bool:
             # группа недоступна боту (удалена/потеряны права) — уведомляем владельца
             _notify_owner_error(pbot, bot_id,
                                 'Бот не может писать в группу техподдержки', e)
+        # НЕ теряем сообщение: кладём в очередь подтверждения —
+        # когда доставка восстановится, юзер отправит его одной кнопкой
         try:
-            pbot.send_message(m.chat.id,
-                              f'<b>{TE_CROSS}  Не удалось доставить сообщение в техподдержку. '
-                              'Попробуй позже.</b>', parse_mode='HTML')
-        except Exception:
-            pass
+            queue_random_message(pbot, bot_id, m)
+        except Exception as e2:
+            log.warning(f'route fail -> queue failed: {e2}')
         return True
 
 
@@ -1248,6 +1247,12 @@ def _deliver_pending_payload(pbot, bot_id: int, items: list, uid: int) -> bool:
 def confirm_send(pbot, bot_id: int, cb) -> None:
     """Обработка кнопки «Отправить администратору»."""
     uid = cb.from_user.id
+    if db_is_blocked(bot_id, uid):
+        # заблокирован после постановки в очередь — не доставляем
+        fs_delete_pending(bot_id, uid)
+        pbot.answer_callback_query(cb.id, '🚫 Вы заблокированы администратором',
+                                   show_alert=True)
+        return
     row = fs_get_pending(bot_id, uid)
     if not row or row[1] != 'pending':
         pbot.answer_callback_query(cb.id, 'Очередь пуста или уже отправляется')

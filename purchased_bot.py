@@ -30,7 +30,7 @@ from database import (db_add_user, db_get_bot_users, db_deactivate_bot, DBState,
 from keyboards import broadcast_type_kb, PE_MONEY, PE_CHECK, PE_GIFT, PE_FIRE
 from config import SUPER_ADMIN, WITHDRAWAL_CHANNEL, BOT_USERNAME
 from payments import get_ton_amount
-from forum_support import register_forum_support, RATE_LIMIT_SEC, rate_limited, fs_bump_ticket
+from forum_support import register_forum_support, RATE_LIMIT_SEC, rate_limited, fs_bump_ticket, queue_random_message
 
 log = logging.getLogger(__name__)
 
@@ -503,7 +503,12 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         db_bump_user_contact(db_bot_id, m.from_user.id)
         fs_bump_ticket(db_bot_id, m.from_user.id)   # обращение учитывается и без группы
         header = _make_header(m)
-        send_to_admins(f"{header}\n\n{TE_CHAT} {html.escape(m.text or '')}", reply_markup=pk_reply(m.from_user.id))
+        if not send_to_admins(f"{header}\n\n{TE_CHAT} {html.escape(m.text or '')}",
+                              reply_markup=pk_reply(m.from_user.id)):
+            # ни один админ не получил (Telegram недоступен) — не теряем сообщение
+            queue_random_message(pbot, db_bot_id, m)
+            pstate.pop(m.from_user.id, None)
+            return
         db_log_message(db_bot_id, m.from_user.id, m.text or '')
         pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Сообщение отправлено</b>",
             parse_mode='HTML', reply_markup=pk_close())
@@ -523,7 +528,10 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             return
         db_bump_user_contact(db_bot_id, m.from_user.id)
         fs_bump_ticket(db_bot_id, m.from_user.id)
-        send_media_to_admins(m, _make_header(m))
+        if not send_media_to_admins(m, _make_header(m)):
+            queue_random_message(pbot, db_bot_id, m)
+            pstate.pop(m.from_user.id, None)
+            return
         db_log_message(db_bot_id, m.from_user.id, f'[{m.content_type}]')
         pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Сообщение отправлено</b>",
             parse_mode='HTML', reply_markup=pk_close())
@@ -612,7 +620,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             pbot.answer_callback_query(cb.id, "❌ Шаблон не знайдено", show_alert=True)
             return
         try:
-            pbot.send_message(target_id, f"<b>{TE_INBOX} Сообщение от администратора\n\n{TE_CHAT} {text}</b>",
+            pbot.send_message(target_id, f"<b>{TE_INBOX} Сообщение от администратора\n\n{TE_CHAT} {html.escape(text)}</b>",
                 parse_mode='HTML')
         except Exception:
             pbot.answer_callback_query(cb.id, "❌ Не удалось отправить — пользователь недоступен",
@@ -682,7 +690,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def p_admin_text(m):
         if not is_admin(m.from_user.id): return
         target_id = int(pstate[m.from_user.id].split('_')[-1])
-        pbot.send_message(target_id, f"<b>{TE_INBOX} Сообщение от администратора\n\n{TE_CHAT} {m.text}</b>",
+        pbot.send_message(target_id, f"<b>{TE_INBOX} Сообщение от администратора\n\n{TE_CHAT} {html.escape(m.text or '')}</b>",
             parse_mode='HTML')
         pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Ответ отправлен</b>",
             parse_mode='HTML', reply_markup=pk_close())
@@ -698,7 +706,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if not is_admin(m.from_user.id): return
         target_id = int(pstate[m.from_user.id].split('_')[-1])
         caption = m.caption or ''
-        cap_text = f"<b>{TE_INBOX} Сообщение от администратора</b>\n\n{caption}" if caption else f"<b>{TE_INBOX} Сообщение от администратора</b>"
+        cap_text = f"<b>{TE_INBOX} Сообщение от администратора</b>\n\n{html.escape(caption)}" if caption else f"<b>{TE_INBOX} Сообщение от администратора</b>"
         try:
             pbot.send_photo(target_id, m.photo[-1].file_id, caption=cap_text, parse_mode='HTML')
         except Exception as e:
