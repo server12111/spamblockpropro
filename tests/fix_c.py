@@ -208,8 +208,10 @@ def connect():
     bid, bot = fresh(False)
     owner = db.db_get_bot_info(bid)[2]
     for gid in (-90001, -90002):
-        state = {owner: dict(step='fs_connect', code='ABC234')}
-        fs.fs_handle_group_message(bot, bid, msg(owner, text='ABC234', chat=gid), 999, state)
+        state = {}
+        fs.connect_start(bot, bid, cb(owner), state)
+        code = state[owner]['code']
+        fs.fs_handle_group_message(bot, bid, msg(owner, text=code, chat=gid), 999, state)
         assert fs.fs_get_group(bid)[1] == gid and owner not in state
 
 
