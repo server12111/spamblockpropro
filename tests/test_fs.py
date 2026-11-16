@@ -4,12 +4,11 @@
 
 Запуск:  py tests/test_fs.py
 Внешние вызовы Telegram отсутствуют — все API замоканы (FakeBot).
-БД создаётся во временном каталоге; миграция проверяется на КОПИИ реальной
-spambots.db (содержимое не выводится).
+БД создаётся во временном каталоге; миграция проверяется на синтетической
+старой схеме, без доступа к рабочим данным.
 """
 import os
 import sys
-import shutil
 import sqlite3
 import tempfile
 import threading
@@ -441,15 +440,18 @@ check('тема пользователя создана', fs.fs_get_topic(1, 555
 # закреплённое инфо-сообщение
 pins = [c for c in fb3.calls if c[0] == 'pin_chat_message']
 check('инфо-сообщение закреплено', len(pins) == 1)
-info_sends = [c for c in fb3.calls if c[0] == 'send_message' and 'Информация о пользователе' in str(c[1])]
+info_sends = [c for c in fb3.calls if c[0] == 'send_message' and '<code>555</code>' in str(c[1])]
 check('инфо-сообщение содержит данные', len(info_sends) == 1)
 check('экранирование: имя в HTML', 'Тест' in info_sends[0][1][1] and '<code>555</code>' in info_sends[0][1][1])
+check('закреп содержит только три строки личности', len(info_sends[0][1][1].splitlines()) == 3)
 # повторное обращение → та же тема, без нового пина
 calls_before = len(fb3.calls)
 msg2 = make_user_msg(uid=555, mid=112, text='второе сообщение')
 fs.route_user_message(fb3, 1, msg2)
 pins2 = [c for c in fb3.calls if c[0] == 'pin_chat_message']
 check('повторное обращение — пин не создаётся заново', len(pins2) == 1)
+check('повторное обращение — закреп не редактируется',
+      not any(c[0] == 'edit_message_text' for c in fb3.calls[calls_before:]))
 row = fs.fs_get_topic(1, 555)
 check('topic thread стабильный', row[0] == fs.fs_get_topic(1, 555)[0])
 # обращение → обращение (ticket)
@@ -859,49 +861,40 @@ expect_raises('UNIQUE(chat_id) защищает от двойной привяз
               fs.fs_bind_group, 11, -1007777777777, 'B')
 
 # ═════════════════════════════════════════════════════════════
-print('\n── 19. Миграция на копии реальной spambots.db ──')
-real_db = os.path.join(PROJ, 'spambots.db')
-if os.path.exists(real_db):
-    copy_path = os.path.join(_TMP, 'real_copy.db')
-    shutil.copy2(real_db, copy_path)
-    # считаем содержимое ДО
-    src = sqlite3.connect(real_db)
-    bots_before = src.execute('SELECT COUNT(*) FROM bots').fetchone()[0]
-    users_before = src.execute('SELECT COUNT(*) FROM bot_users').fetchone()[0]
-    src.close()
-    # миграция на копии (DATABASE_PATH указывает на копию)
-    import database as db2
-    orig_path = db2.DB_PATH
-    db2.DB_PATH = copy_path
-    conn = None
-    dst = None
-    try:
-        conn = sqlite3.connect(copy_path, timeout=15)
-        conn.execute('PRAGMA journal_mode=WAL')
-        conn.close(); conn = None
-        # init_db работает с DB_PATH — подменили, но init_db создаёт через DB_PATH
-        db2.init_db()
-        dst = sqlite3.connect(copy_path)
-        bots_after = dst.execute('SELECT COUNT(*) FROM bots').fetchone()[0]
-        users_after = dst.execute('SELECT COUNT(*) FROM bot_users').fetchone()[0]
+print('\n── 19. Миграция синтетической старой схемы ──')
+copy_path = os.path.join(_TMP, 'legacy_fixture.db')
+with sqlite3.connect(copy_path) as legacy:
+    legacy.executescript('''
+        CREATE TABLE bots (
+            id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL,
+            token TEXT UNIQUE NOT NULL, admin_id INTEGER NOT NULL,
+            active INTEGER DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE bot_users (
+            bot_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            username TEXT DEFAULT '', PRIMARY KEY (bot_id, user_id)
+        );
+        INSERT INTO bots (id, owner_id, token, admin_id) VALUES (1, 777, 'test', 777);
+        INSERT INTO bot_users VALUES (1, 555, 'legacy_user');
+    ''')
+orig_path = db.DB_PATH
+db.DB_PATH = copy_path
+try:
+    db.init_db()
+    db.init_db()  # повторный запуск миграции также сохраняет данные
+    with sqlite3.connect(copy_path) as dst:
+        bots_after = dst.execute('SELECT id, owner_id, admin_id FROM bots').fetchall()
+        users_after = dst.execute('SELECT bot_id, user_id, username FROM bot_users').fetchall()
         cols = {r[1] for r in dst.execute('PRAGMA table_info(bot_users)').fetchall()}
         tables2 = {r[0] for r in dst.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-        check('миграция копии: bots сохранены', bots_before == bots_after)
-        check('миграция копии: bot_users сохранены', users_before == users_after)
-        check('миграция копии: новые поля добавлены',
+        check('миграция старой схемы: bots сохранены', bots_after == [(1, 777, 777)])
+        check('миграция старой схемы: bot_users сохранены', users_after == [(1, 555, 'legacy_user')])
+        check('миграция старой схемы: новые поля добавлены',
               {'registered_at', 'first_contact_at', 'contact_count'} <= cols)
-        check('миграция копии: fs_* таблицы созданы', need <= tables2)
-    finally:
-        db2.DB_PATH = orig_path
-        if conn: conn.close()
-        if dst: dst.close()
-        try:
-            os.remove(copy_path)
-        except PermissionError:
-            pass
-else:
-    print('  [SKIP] spambots.db не найден')
+        check('миграция старой схемы: fs_* таблицы созданы', need <= tables2)
+finally:
+    db.DB_PATH = orig_path
 
 # ═════════════════════════════════════════════════════════════
 print('\n── 20. Нагрузка: конкурентные обращения разных пользователей ──')

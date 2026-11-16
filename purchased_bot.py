@@ -31,7 +31,8 @@ from keyboards import broadcast_type_kb, PE_MONEY, PE_CHECK, PE_GIFT, PE_FIRE
 from config import SUPER_ADMIN, WITHDRAWAL_CHANNEL, BOT_USERNAME
 from payments import get_ton_amount
 from forum_support import (register_forum_support, RATE_LIMIT_SEC, rate_limited,
-                           fs_bump_ticket, queue_random_message, html_safe_chunks)
+                           fs_bump_ticket, queue_random_message, html_safe_chunks,
+                           fs_refresh_pin_markup)
 
 log = logging.getLogger(__name__)
 
@@ -829,6 +830,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if not is_admin(cb.from_user.id): return
         target = int(cb.data.split('_')[-1])
         db_block_user(db_bot_id, target)
+        fs_refresh_pin_markup(pbot, db_bot_id, target)
         pbot.answer_callback_query(cb.id, f"🚫 Пользователь {target} заблокирован", show_alert=True)
         kb = InlineKeyboardMarkup()
         kb.row(
@@ -844,6 +846,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if not is_admin(cb.from_user.id): return
         target = int(cb.data.split('_')[-1])
         db_unblock_user(db_bot_id, target)
+        fs_refresh_pin_markup(pbot, db_bot_id, target)
         pbot.answer_callback_query(cb.id, f"✅ Пользователь {target} разблокирован", show_alert=True)
         kb = InlineKeyboardMarkup()
         kb.row(
@@ -876,6 +879,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if not is_admin(cb.from_user.id): return
         target = int(cb.data.split('_')[-1])
         db_unblock_user(db_bot_id, target)
+        fs_refresh_pin_markup(pbot, db_bot_id, target)
         pbot.answer_callback_query(cb.id, "✅ Разблокирован", show_alert=True)
         _show_blocked(cb.message.chat.id, cb.message.message_id)
 

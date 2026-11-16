@@ -32,13 +32,13 @@ from telebot.types import (InlineKeyboardMarkup, InlineKeyboardButton,
 
 from database import (_utc_now_str, db_get_topic_copies_by_src,
                       db_add_user, db_get_user_info, db_bump_user_contact,
-                      db_add_username_history, db_get_username_history,
-                      db_is_blocked, db_get_bot_admins,
+                      db_add_username_history,
+                      db_is_blocked, db_block_user, db_unblock_user, db_get_bot_admins,
+                      db_get_templates, db_get_template,
                       db_get_bot_setting, db_set_bot_setting,
                       db_get_bot_info, db_log_message,
                       db_fs_count_range, db_fs_tickets_total,
-                      db_fs_new_users_range, db_fs_users_total,
-                      db_fs_user_tickets_total)
+                      db_fs_new_users_range, db_fs_users_total)
 from config import STATS_TZ_OFFSET, RATE_LIMIT_SEC
 from keyboards import (_ICON, TE_BLOCK, TE_CALENDAR, TE_CHAT, TE_CHECK, TE_CLIP, TE_CLOCK, TE_CROSS, TE_EXCLAM, TE_ID, TE_LINK, TE_NOTE, TE_SEND, TE_STATS, TE_USER)
 
@@ -49,7 +49,6 @@ TICKET_GAP_SEC = 6 * 3600                              # пауза между �
 PENDING_MAX = 20                                       # максимум сообщений в очереди подтверждения
 TOPIC_NAME_LIMIT = 128                                 # лимит Telegram на название темы
 ADMIN_TTL = 30                                         # TTL кэша списка админов (сек)
-INFO_HIST_MAX = 10                                     # сколько username показывать в инфо-сообщении
 
 # ── Единый rate limit (используется и purchased_bot._is_rate_limited) ──
 # RATE_LIMIT_SEC импортируется из config (FS_RATE_LIMIT, по умолчанию 3 сек)
@@ -454,32 +453,38 @@ def _fmt_num(n) -> str:
 
 def fs_info_text(bot_id: int, u) -> str:
     """Закрепляемая информация о пользователе (все данные экранированы)."""
-    esc = html.escape
-    uid = u.id
-    info = db_get_user_info(bot_id, uid) or {}
-    username = f"@{u.username}" if getattr(u, 'username', None) else 'нет'
+    username = f"@{u.username}" if getattr(u, 'username', None) else 'нет username'
+    return (f"<b>{TE_USER} {html.escape(_full_name(u))}</b>\n"
+            f"{TE_LINK} {html.escape(username)}\n"
+            f"{TE_ID} <code>{u.id}</code>")
 
-    hist = db_get_username_history(bot_id, uid)
-    if hist:
-        lines = [f"• {esc('@' + h)}" for h in hist[-INFO_HIST_MAX:]]
-        hist_block = '\n'.join(lines)
-    else:
-        hist_block = '—'
 
-    reg = _fmt_dt_utc(info.get('registered_at')) or 'Неизвестно'
-    first = _fmt_dt_utc(info.get('first_contact_at')) or 'Неизвестно'
-    tickets = db_fs_user_tickets_total(bot_id, uid)
-    msgs_cnt = info.get('contact_count', 0)
+def fs_pin_markup(bot_id: int, user_id: int):
+    kb = InlineKeyboardMarkup()
+    blocked = db_is_blocked(bot_id, user_id)
+    kb.row(
+        _fbtn('Шаблоны', style='primary', callback_data=f'fs_pin_tpl_{user_id}'),
+        _fbtn('Разблокировать' if blocked else 'Заблокировать',
+              icon='✔️' if blocked else '🚫', style='success' if blocked else 'danger',
+              callback_data=f'fs_pin_unblock_{user_id}' if blocked else f'fs_pin_block_{user_id}'),
+    )
+    return kb
 
-    return (f"<b>{TE_USER} Информация о пользователе</b>\n\n"
-            f"{TE_USER} Имя: <b>{esc(_full_name(u))}</b>\n"
-            f"{TE_LINK} Username: {esc(username)}\n"
-            f"{TE_ID} Telegram ID: <code>{uid}</code>\n\n"
-            f"{TE_NOTE} Ранее известные username:\n{hist_block}\n\n"
-            f"{TE_CALENDAR} Зарегистрирован в боте: {reg}\n"
-            f"{TE_SEND} Первое обращение: {first}\n"
-            f"{TE_STATS} Всего обращений: {_fmt_num(tickets)}\n"
-            f"{TE_CHAT} Сообщений от пользователя: {_fmt_num(msgs_cnt)}")
+
+def fs_refresh_pin_markup(pbot, bot_id: int, user_id: int):
+    """Best effort после изменения блокировки, в том числе из личной панели.
+
+    Хеш текста не меняем: следующая сверка также обновит старый формат закрепа,
+    если блокировку нажали до его миграции.
+    """
+    try:
+        group = fs_get_group(bot_id)
+        topic = fs_get_topic(bot_id, user_id)
+        if group and topic and topic[2]:
+            _api(pbot.edit_message_reply_markup, group[1], topic[2],
+                 reply_markup=fs_pin_markup(bot_id, user_id))
+    except Exception as e:
+        log.warning(f'fs pin markup bot#{bot_id} uid={user_id}: {e}')
 
 
 # ══════════════════════════════════════════════════════════════
@@ -539,23 +544,30 @@ def _get_or_create_topic(pbot, bot_id: int, gid: int, u, depth: int = 0) -> int:
 def _ensure_pinned_info(pbot, bot_id: int, gid: int, thread: int, u, trow):
     """Создаёт или обновляет закреплённое инфо-сообщение (без повторного пина)."""
     info_text = fs_info_text(bot_id, u)
-    h = hashlib.md5(info_text.encode('utf-8')).hexdigest()
+    blocked = db_is_blocked(bot_id, u.id)
+    h = hashlib.md5(f'{info_text}\n{int(blocked)}'.encode('utf-8')).hexdigest()
+    markup = fs_pin_markup(bot_id, u.id)
     pinned = trow[2] if trow else None
     if pinned and trow and trow[3] == h:
         return  # актуально
     if pinned:
         try:
-            _api(pbot.edit_message_text, info_text, gid, pinned, parse_mode='HTML')
+            _api(pbot.edit_message_text, info_text, gid, pinned, parse_mode='HTML',
+                 reply_markup=markup)
             fs_set_topic_pinned(bot_id, u.id, pinned, h)
             return
-        except ApiTelegramException:
+        except ApiTelegramException as e:
+            if 'message is not modified' in _err_low(e):
+                # Кнопки уже обновлены из панели/закрепа; сохраняем новый хеш.
+                fs_set_topic_pinned(bot_id, u.id, pinned, h)
+                return
             pass  # сообщение удалено — создадим заново ниже
         except Exception as e:
             log.warning(f'fs pin edit bot#{bot_id}: {e}')
             return
     try:
         msg = _api(pbot.send_message, gid, info_text, parse_mode='HTML',
-                   message_thread_id=thread)
+                   message_thread_id=thread, reply_markup=markup)
         try:
             _api(pbot.pin_chat_message, gid, msg.message_id, disable_notification=True)
         except Exception as e:
@@ -1011,11 +1023,22 @@ def fs_handle_group_message(pbot, bot_id: int, m, bot_self_id: int, pstate) -> N
         _buffer_admin_album(pbot, bot_id, m.chat.id, target_uid, thread, m)
         return
 
+    _deliver_admin_reply(pbot, bot_id, m, target_uid, thread, reply_ctx)
+
+
+def _deliver_admin_reply(pbot, bot_id: int, m, target_uid: int, thread: int,
+                         reply_ctx=None):
+    """Общий путь обычного ответа и шаблона: доставка, ошибки, учёт ответа."""
+    if db_is_blocked(bot_id, target_uid):
+        _topic_notice(pbot, m.chat.id, thread,
+                      f'{TE_BLOCK} Пользователь заблокирован — ответ не доставлен.')
+        return None
     try:
         mid = _relay_single(pbot, target_uid, m.chat.id, m.message_id,
                             reply_msg_id=reply_ctx, src_msg=m)
         if mid:
             fs_log_admin_msg(bot_id, target_uid)
+            return mid
         else:
             _topic_notice(pbot, m.chat.id, thread,
                           f'{TE_EXCLAM} Не удалось доставить ответ: тип сообщения не поддерживается.')
@@ -1093,6 +1116,77 @@ def _flush_admin_album(pbot, bot_id: int, key):
             log.warning(f'admin album bot#{bot_id} → {target_uid}: {e}')
     except Exception as e:
         log.warning(f'admin album bot#{bot_id} → {target_uid}: {e}')
+
+def fs_pin_callback(pbot, bot_id: int, cb):
+    """Любое действие закрепа ограничено ботом, группой, темой и админом."""
+    parts = (cb.data or '').split('_')
+    action = parts[2] if len(parts) >= 3 else ''
+    expected = 5 if action == 'send' else 4
+    uid = tid = None
+    if (action in ('tpl', 'send', 'close', 'block', 'unblock')
+            and len(parts) == expected and len(cb.data.encode('utf-8')) <= 64):
+        numbers = parts[3:]
+        if all(n.isascii() and n.isdecimal() and len(n) <= 19
+               and 0 < int(n) < 2**63 for n in numbers):
+            uid = int(parts[3])
+            tid = int(parts[4]) if action == 'send' else None
+    m = cb.message
+    group = fs_get_group(bot_id)
+    topic = fs_get_topic(bot_id, uid) if uid else None
+    if not (m and m.chat.type in ('group', 'supergroup')
+            and group and m.chat.id == group[1]
+            and topic and topic[0] > 0 and getattr(m, 'message_thread_id', None) == topic[0]
+            and fs_is_admin(bot_id, cb.from_user.id)):
+        pbot.answer_callback_query(cb.id, 'Недостаточно прав', show_alert=True)
+        return
+
+    if action in ('block', 'unblock'):
+        (db_block_user if action == 'block' else db_unblock_user)(bot_id, uid)
+        fs_refresh_pin_markup(pbot, bot_id, uid)
+        text = 'Пользователь заблокирован' if action == 'block' else 'Пользователь разблокирован'
+        pbot.answer_callback_query(cb.id, text, show_alert=True)
+        _topic_notice(pbot, group[1], topic[0], f'{TE_BLOCK if action == "block" else TE_CHECK} {text}')
+    elif action == 'close':
+        _api(pbot.delete_message, group[1], m.message_id)
+        pbot.answer_callback_query(cb.id)
+    elif action == 'tpl':
+        templates = db_get_templates(bot_id)[:50]
+        if not templates:
+            pbot.answer_callback_query(cb.id,
+                'Шаблонов пока нет. Добавь их в личной панели бота: «Шаблоны» → «Добавить шаблон»',
+                show_alert=True)
+            return
+        kb = InlineKeyboardMarkup()
+        for template_id, text in templates:
+            preview = text[:35] + '…' if len(text) > 35 else text
+            kb.add(_fbtn(preview, callback_data=f'fs_pin_send_{uid}_{template_id}'))
+        kb.add(_fbtn('Закрыть', callback_data=f'fs_pin_close_{uid}'))
+        _api(pbot.send_message, group[1], f'{TE_NOTE} Выбери шаблон',
+             parse_mode='HTML', message_thread_id=topic[0], reply_markup=kb)
+        pbot.answer_callback_query(cb.id)
+    elif action == 'send':
+        if db_is_blocked(bot_id, uid):
+            pbot.answer_callback_query(cb.id, 'Пользователь заблокирован', show_alert=True)
+            return
+        text = db_get_template(tid, bot_id)
+        if not text:
+            pbot.answer_callback_query(cb.id, 'Шаблон не найден', show_alert=True)
+            return
+        # Сначала текст в теме: копируем его тем же путём, что ответ админа.
+        sent = _api(pbot.send_message, group[1], text, parse_mode=None,
+                    message_thread_id=topic[0])
+        mid = _deliver_admin_reply(pbot, bot_id, sent, uid, topic[0])
+        if mid:
+            fs_map_message(bot_id, group[1], sent.message_id, uid, topic[0], mid)
+            _api(pbot.delete_message, group[1], m.message_id)
+        else:
+            # Не оставляем недоставленный шаблон как успешный ответ.
+            try:
+                _api(pbot.delete_message, group[1], sent.message_id)
+            except Exception as e:
+                log.warning(f'fs template cleanup bot#{bot_id}: {e}')
+        pbot.answer_callback_query(cb.id)
+
 
 def _topic_notice(pbot, chat_id: int, thread: int, text: str):
     """Служебное сообщение в теме (не попадает в fs_msgs → на него нельзя «ответить»)."""
@@ -1872,6 +1966,15 @@ def register_forum_support(pbot, bot_id: int, pstate, is_admin, confirm_kb=_conf
             queue_random_message(pbot, bot_id, m)
         except Exception as e:
             log.error(f'fs random msg bot#{bot_id}: {e}', exc_info=True)
+
+    # ── действия закрепа (здесь же остальные fs_* callback дочернего бота) ──
+    @pbot.callback_query_handler(func=lambda c: c.data.startswith('fs_pin_'))
+    def _fs_pin_cb(cb):
+        try:
+            fs_pin_callback(pbot, bot_id, cb)
+        except Exception as e:
+            log.warning(f'fs pin action bot#{bot_id}: {e}')
+            pbot.answer_callback_query(cb.id, 'Ошибка, попробуй ещё раз', show_alert=True)
 
     # ── меню группы ──
     @pbot.callback_query_handler(func=lambda c: c.data == 'fs_group_menu')
