@@ -582,6 +582,8 @@ def _init_db_connection(conn, *, schema=False):
         'ALTER TABLE fs_groups ADD COLUMN mgmt_wait_admin INTEGER',
         'ALTER TABLE fs_groups ADD COLUMN mgmt_claim TEXT',
         'ALTER TABLE fs_groups ADD COLUMN mgmt_claim_at REAL',
+        'ALTER TABLE fs_groups ADD COLUMN stats_style_thread INTEGER',
+        'ALTER TABLE fs_groups ADD COLUMN mgmt_style_thread INTEGER',
         'ALTER TABLE fs_pending ADD COLUMN claim_session TEXT',
         'ALTER TABLE fs_pending ADD COLUMN prompt_next_at REAL NOT NULL DEFAULT 0',
         'ALTER TABLE fs_pending ADD COLUMN prompt_attempts INTEGER NOT NULL DEFAULT 0',
@@ -891,7 +893,8 @@ def validate_faq_text(text):
 
 def db_faq_add(bot_id, parent_id, title, text=''):
     validate_faq_text(text)
-    if not 1 <= len(title.strip()) <= 40:
+    from telegram_text import stored_plain
+    if not 1 <= len(stored_plain(title).strip()) <= 40:
         raise ValueError('Название должно содержать от 1 до 40 символов')
     c = _conn()
     try:
@@ -919,7 +922,8 @@ def db_faq_add(bot_id, parent_id, title, text=''):
 def db_faq_edit(bot_id, node_id, field, value):
     if field == 'text': validate_faq_text(value)
     if field not in ('title', 'text'): raise ValueError('Неизвестное поле')
-    if field == 'title' and not 1 <= len(value.strip()) <= 40:
+    from telegram_text import stored_plain
+    if field == 'title' and not 1 <= len(stored_plain(value).strip()) <= 40:
         raise ValueError('Название должно содержать от 1 до 40 символов')
     c = _conn()
     try:

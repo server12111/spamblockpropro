@@ -55,6 +55,8 @@ def api(name):
     def call(self, *args, **kwargs):
         global SEQ
         CALLS.append((name, args, kwargs)); HISTORY.append((name, args, kwargs)); SEQ += 1
+        if name == 'get_forum_topic_icon_stickers':
+            return [types.SimpleNamespace(emoji='⚙️', custom_emoji_id='test_gear')]
         if name == 'get_me': return t.User(SELF, True, 'Бот', username='support_bot')
         if name == 'get_chat':
             if BAD_CHAT: raise ValueError('chat not found')
@@ -408,6 +410,7 @@ try:
     with ExitStack() as stack:
         stack.enter_context(patch('telebot.apihelper._make_request', side_effect=AssertionError('Сеть запрещена')))
         for name in ('get_me', 'get_chat', 'get_chat_member', 'send_message', 'edit_message_text',
+                     'get_forum_topic_icon_stickers',
                      'edit_message_reply_markup', 'answer_callback_query', 'create_forum_topic',
                      'pin_chat_message', 'edit_forum_topic'):
             stack.enter_context(patch.object(telebot.TeleBot, name, api(name)))

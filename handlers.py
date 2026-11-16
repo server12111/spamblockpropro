@@ -11,7 +11,7 @@ from input_validation import bounded_number
 import re
 import database as db
 from safe_logging import register_secret
-from telegram_text import send_html, send_long, edit_html, protect_text_lengths
+from telegram_text import send_html, edit_html, protect_text_lengths, message_html
 from purchase_store import (db_get_payment, db_register_paid_bot, db_activate_trial,
                             db_use_purchase_discount, purchase_context, db_claim_coupon, claim_ton_transfer)
 from datetime import datetime
@@ -704,17 +704,18 @@ def register(bot: telebot.TeleBot):
         bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Сообщение отправлено</b>",
             parse_mode='HTML', reply_markup=close_kb())
 
-    @bot.message_handler(func=lambda m: isinstance(state.get(m.from_user.id), str)
+    @bot.message_handler(content_types=['text', 'photo', 'video', 'document', 'audio', 'voice', 'animation'], func=lambda m: isinstance(state.get(m.from_user.id), str)
                                         and state[m.from_user.id].startswith('await_admin_msg_'))
     def admin_text(m):
         if not _is_super_admin(m):
             _reset_flow(m.from_user.id)
             return
+        if not (m.text or m.caption): return
         captured = state.take(m.from_user.id, lambda v: isinstance(v, str) and v.startswith('await_admin_msg_'))
         if captured is None: return
         target_id = int(captured.split('_')[-1])
         try:
-            send_long(bot, target_id, f"<b>{TE_INBOX} Сообщение от администратора</b>", m.text)
+            send_html(bot, target_id, f"<b>{TE_INBOX} Сообщение от администратора</b>\n\n" + message_html(m))
         except Exception as e:
             # адресат недоступен (заблокировал бота / удалил аккаунт): не молчим —
             # сообщаем и снимаем состояние, иначе админ застрянет в режиме ответа

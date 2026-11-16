@@ -42,6 +42,8 @@ def patch(name):
     def call(self, *args, **kw):
         global MID
         API.append((name, args, kw))
+        if name == 'get_forum_topic_icon_stickers':
+            return [types.SimpleNamespace(emoji='⚙️', custom_emoji_id='test_gear')]
         if name == 'get_me':
             return t.User(999, True, 'Бот', username='test_bot')
         if name == 'get_chat':
@@ -81,7 +83,7 @@ def patch(name):
     setattr(telebot.TeleBot, name, call)
 
 
-for method in ('get_me', 'get_chat', 'get_chat_member', 'create_forum_topic',
+for method in ('get_me', 'get_chat', 'get_chat_member', 'get_forum_topic_icon_stickers', 'create_forum_topic',
                'send_message', 'pin_chat_message', 'edit_message_text',
                'answer_callback_query', 'copy_message', 'copy_messages',
                'forward_message', 'delete_message', 'edit_message_reply_markup'):

@@ -159,8 +159,11 @@ def send(bot, job_id, bid, uid):
             return
         m = messages[0]
         if m.content_type == 'text':
-            bot.send_message(uid, m.text, entities=m.entities, parse_mode=None,
-                             link_preview_options=getattr(m, 'link_preview_options', None))
+            from telegram_text import send_html
+            # Исходные entities уже сохранены целиком. Оставляем одну отправку:
+            # HTML-обёртки длинного текста иначе разбивают её и меняют повтор 429.
+            send_html(bot, uid, m.text, entities=m.entities, parse_mode=None,
+                      link_preview_options=getattr(m, 'link_preview_options', None))
             return
         source = _source(m)
         if source:

@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 
 from telebot.apihelper import ApiTelegramException
 from telebot.types import (InlineKeyboardMarkup, InlineKeyboardButton,
-                           ReplyParameters, InputMediaPhoto, InputMediaVideo,
+                           ReplyParameters, InputMediaPhoto, InputMediaVideo, ReactionTypeEmoji,
                            ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton,
                            KeyboardButtonRequestChat, ChatAdministratorRights)
 
@@ -148,9 +148,12 @@ def fs_bind_group(bot_id: int, chat_id: int, title: str):
     finally:
         c.close()
 
-def fs_set_stats_thread(bot_id: int, thread_id: int):
+def fs_set_stats_thread(bot_id: int, thread_id: int, styled=False):
     c = _conn()
     c.execute('UPDATE fs_groups SET thread_stats=? WHERE bot_id=?', (thread_id, bot_id))
+    if styled:
+        c.execute('UPDATE fs_groups SET stats_style_thread=? WHERE bot_id=?',
+                  (thread_id, bot_id))
     c.commit(); c.close()
 
 @_group_guard
@@ -176,6 +179,90 @@ _mgmt_locks = tuple(threading.RLock() for _ in range(64))
 
 def _mgmt_lock(bot_id):
     return _mgmt_locks[bot_id % len(_mgmt_locks)]
+
+
+# Только служебные темы; набор разрешённых иконок общий для всех ботов процесса.
+_SERVICE_TOPIC_STYLES = {
+    'stats': ('Статистика', '📊', ('📊', '📈'), 0xFF93B2),
+    'mgmt': ('Управление', '⚙️', ('⚙️', '🛠', '📝'), 0x6FB9F0),
+}
+_service_icon_cache = None
+_service_icon_lock = threading.Lock()
+
+
+def _service_topic_style(pbot, kind):
+    global _service_icon_cache
+    with _service_icon_lock:
+        if _service_icon_cache is None:
+            try:
+                stickers = _api(pbot.get_forum_topic_icon_stickers)
+                _service_icon_cache = {
+                    s.emoji.replace('\ufe0f', ''): s.custom_emoji_id
+                    for s in stickers if s.emoji and s.custom_emoji_id
+                }
+            except Exception as e:
+                _service_icon_cache = {}
+                log.warning('fs service topic icons: %s', type(e).__name__)
+        icons = _service_icon_cache
+    title, emoji, choices, color = _SERVICE_TOPIC_STYLES[kind]
+    icon = next((icons[em.replace('\ufe0f', '')] for em in choices
+                 if em.replace('\ufe0f', '') in icons), None)
+    if not icon:
+        log.warning('fs service topic %s: подходящая иконка недоступна', kind)
+    return title if icon else f'{emoji} {title}', icon, color
+
+
+def _create_service_topic(pbot, gid, kind):
+    name, icon, color = _service_topic_style(pbot, kind)
+    try:
+        if icon:
+            try:
+                return _api(pbot.create_forum_topic, gid, name, icon_color=color,
+                            icon_custom_emoji_id=icon)
+            except ApiTelegramException as e:
+                log.warning('fs service topic %s icon chat=%s: %s',
+                            kind, gid, type(e).__name__)
+        title, emoji, _choices, _color = _SERVICE_TOPIC_STYLES[kind]
+        return _api(pbot.create_forum_topic, gid, f'{emoji} {title}', icon_color=color)
+    except Exception as e:
+        log.warning('fs service topic %s create chat=%s: %s', kind, gid, type(e).__name__)
+        raise
+
+
+def fs_style_service_topics(pbot, bot_id):
+    """По одной попытке на служебную тему, включая отказы Telegram в правах.
+
+    Отметка содержит thread_id, поэтому пересозданная тема оформляется заново.
+    Claim коммитится до сети: параллельный запуск также не повторит правку.
+    """
+    with _mgmt_lock(bot_id):
+        for kind in _SERVICE_TOPIC_STYLES:
+            thread_col = 'thread_stats' if kind == 'stats' else 'thread_mgmt'
+            mark_col = f'{kind}_style_thread'
+            c = _conn()
+            try:
+                row = c.execute(f'SELECT chat_id, {thread_col} FROM fs_groups '
+                                'WHERE bot_id=?', (bot_id,)).fetchone()
+                if not row or not row[1]:
+                    continue
+                gid, thread = row
+                cur = c.execute(f'UPDATE fs_groups SET {mark_col}=? '
+                                f'WHERE bot_id=? AND chat_id=? AND {thread_col}=? '
+                                f'AND ({mark_col} IS NULL OR {mark_col}!=?)',
+                                (thread, bot_id, gid, thread, thread))
+                c.commit()
+                claimed = cur.rowcount > 0
+            finally:
+                c.close()
+            if not claimed:
+                continue
+            try:
+                name, icon, _color = _service_topic_style(pbot, kind)
+                _api(pbot.edit_forum_topic, gid, thread, name=name,
+                     icon_custom_emoji_id=icon or '')
+            except Exception as e:
+                log.warning('fs service topic %s style bot#%s chat=%s thread=%s: %s',
+                            kind, bot_id, gid, thread, type(e).__name__)
 
 
 def _mgmt_row(bot_id):
@@ -212,6 +299,8 @@ def _mgmt_ensure_thread(pbot, bot_id):
     for _ in range(100):
         row = _mgmt_row(bot_id)
         if not row or row[1]:
+            if row:
+                fs_style_service_topics(pbot, bot_id)
             return row
         gid = row[0]
         c = _conn()
@@ -228,13 +317,13 @@ def _mgmt_ensure_thread(pbot, bot_id):
             time.sleep(0.1)
             continue
         try:
-            topic = _api(pbot.create_forum_topic, gid, 'Управление')
+            topic = _create_service_topic(pbot, gid, 'mgmt')
             c = _conn()
             try:
-                c.execute('UPDATE fs_groups SET thread_mgmt=?, mgmt_msg_id=NULL, '
+                c.execute('UPDATE fs_groups SET thread_mgmt=?, mgmt_style_thread=?, mgmt_msg_id=NULL, '
                           'mgmt_wait_admin=NULL, mgmt_claim=NULL, mgmt_claim_at=NULL '
                           'WHERE bot_id=? AND chat_id=? AND mgmt_claim=?',
-                          (topic.message_thread_id, bot_id, gid, claim))
+                          (topic.message_thread_id, topic.message_thread_id, bot_id, gid, claim))
                 c.commit()
             finally:
                 c.close()
@@ -252,12 +341,16 @@ def _mgmt_ensure_thread(pbot, bot_id):
     raise RuntimeError('management topic creation in progress')
 
 
+from telegram_text import message_html, send_html, store_message_text, stored_html, stored_plain, is_formatted, html_chunks
+
+
 def _mgmt_list(bot_id):
     templates = db_get_templates(bot_id)
     text = (f'<b>{TE_NOTE} Шаблоны ответов ({len(templates)})</b>' if templates
             else f'<b>{TE_NOTE} Шаблонов пока нет</b>')
     kb = InlineKeyboardMarkup()
     for tid, body in templates[:MGMT_TEMPLATE_LIMIT]:
+        body = stored_plain(body)
         preview = body[:35] + '…' if len(body) > 35 else body
         kb.add(_fbtn(preview, callback_data=f'fs_mgmt_view_{tid}'))
     kb.add(_fbtn('Добавить шаблон', icon='➕', callback_data='fs_mgmt_add'))
@@ -315,6 +408,7 @@ def fs_refresh_management(pbot, bot_id):
         with _mgmt_lock(bot_id):
             row = _mgmt_row(bot_id)
             if row:
+                fs_style_service_topics(pbot, bot_id)
                 _mgmt_update(bot_id, row[0], 'mgmt_wait_admin=NULL')
                 _mgmt_render(pbot, bot_id)
     except Exception as e:
@@ -361,7 +455,8 @@ def fs_management_callback(pbot, bot_id, cb):
                 kb = InlineKeyboardMarkup()
                 kb.add(_fbtn('Удалить', icon='❌', style='danger', callback_data=f'fs_mgmt_delete_{tid}'))
                 kb.add(_fbtn('Назад', icon='🔙', callback_data='fs_mgmt_back'))
-                screen = (_mgmt_preview(body), kb, None)  # шаблон — обычный текст
+                screen = ((html_chunks(stored_html(body), MGMT_TEXT_LIMIT)[0] if is_formatted(body)
+                           else _mgmt_preview(body)), kb, 'HTML' if is_formatted(body) else None)
         elif data == 'fs_mgmt_add':
             if len(db_get_templates(bot_id)) >= MGMT_TEMPLATE_LIMIT:
                 pbot.answer_callback_query(cb.id, 'Можно сохранить не больше 50 шаблонов', show_alert=True)
@@ -388,6 +483,8 @@ def _mgmt_is_message(pbot, bot_id, m):
     if not row[1]:
         fs_refresh_management(pbot, bot_id)  # ленивая миграция старой привязки
         row = _mgmt_row(bot_id)
+    elif getattr(m, 'message_thread_id', None) == row[1]:
+        fs_style_service_topics(pbot, bot_id)
     return bool(row and row[1] and getattr(m, 'message_thread_id', None) == row[1])
 
 
@@ -397,15 +494,15 @@ def _mgmt_handle_message(pbot, bot_id, m):
         if not (row and m.chat.id == row[0] and m.message_thread_id == row[1]
                 and m.from_user and row[3] == m.from_user.id
                 and _mgmt_is_primary(bot_id, m.from_user.id)
-                and m.content_type == 'text' and m.text):
+                and (m.text or m.caption)):
             return
-        if _mgmt_text_units(m.text) > MGMT_TEXT_LIMIT:
+        if _mgmt_text_units(message_html(m)) > MGMT_TEXT_LIMIT:
             _topic_notice(pbot, row[0], row[1], 'Текст шаблона должен быть не длиннее 4096 символов')
             return
         if len(db_get_templates(bot_id)) >= MGMT_TEMPLATE_LIMIT:
             _topic_notice(pbot, row[0], row[1], 'Можно сохранить не больше 50 шаблонов')
             return
-        db_add_template(bot_id, m.text)
+        db_add_template(bot_id, store_message_text(m))
         _mgmt_update(bot_id, row[0], 'mgmt_wait_admin=NULL')
         fs_refresh_management(pbot, bot_id)
         _topic_notice(pbot, row[0], row[1], 'Шаблон сохранён')
@@ -945,8 +1042,10 @@ def _resend_by_type(pbot, to_chat, thread, m, reply_msg_id=None, *, api=None):
     kw = {'message_thread_id': thread} if thread else {}
     ct = m.content_type
     if ct == 'text':
-        return call(pbot.send_message, to_chat, m.text, entities=m.entities,
-                    reply_parameters=rp, **kw).message_id
+        # Пересылаем исходные entities: HTML-обёртки не должны разбивать
+        # допустимое сообщение 4096 символов и менять соответствие Reply.
+        return send_html(pbot, to_chat, m.text, entities=m.entities, parse_mode=None, api=call,
+                         reply_parameters=rp, **kw).message_id
     if ct == 'photo':
         return call(pbot.send_photo, to_chat, m.photo[-1].file_id, caption=m.caption,
                     caption_entities=m.caption_entities, reply_parameters=rp, **kw).message_id
@@ -1373,14 +1472,14 @@ def fs_handle_group_message(pbot, bot_id: int, m, bot_self_id: int, pstate) -> N
 
 
 def _deliver_admin_reply(pbot, bot_id: int, m, target_uid: int, thread: int,
-                         reply_ctx=None):
+                          reply_ctx=None, template=None):
     """Общий путь обычного ответа и шаблона: доставка, ошибки, учёт ответа."""
     from delivery_queue import current_sender
     if current_sender() is None:
         from reply_queue import enqueue
         status, result = enqueue(pbot, bot_id, f'forum:{m.chat.id}:{m.message_id}:{target_uid}',
                                  dict(mode='forum', target=target_uid, message=m.json,
-                                      thread=thread, reply=reply_ctx))
+                                       thread=thread, reply=reply_ctx, template=template))
         return True if status == 'pending' else result
     if db_is_blocked(bot_id, target_uid):
         _topic_notice(pbot, m.chat.id, thread,
@@ -1552,6 +1651,7 @@ def fs_pin_callback(pbot, bot_id: int, cb):
             return
         kb = InlineKeyboardMarkup()
         for template_id, text in templates:
+            text = stored_plain(text)
             preview = text[:35] + '…' if len(text) > 35 else text
             kb.add(_fbtn(preview, callback_data=f'fs_pin_send_{uid}_{template_id}'))
         kb.add(_fbtn('Закрыть', icon='❌', callback_data=f'fs_pin_close_{uid}'))
@@ -1567,9 +1667,10 @@ def fs_pin_callback(pbot, bot_id: int, cb):
             pbot.answer_callback_query(cb.id, 'Шаблон не найден', show_alert=True)
             return
         # Сначала текст в теме: копируем его тем же путём, что ответ админа.
-        sent = _api(pbot.send_message, group[1], text, parse_mode=None,
-                    message_thread_id=topic[0])
-        mid = _deliver_admin_reply(pbot, bot_id, sent, uid, topic[0])
+        sent = send_html(pbot, group[1], stored_html(text) if is_formatted(text) else text,
+                         parse_mode='HTML' if is_formatted(text) else None,
+                         api=_api, message_thread_id=topic[0])
+        mid = _deliver_admin_reply(pbot, bot_id, sent, uid, topic[0], template=stored_html(text))
         if mid is True:
             pass  # Источник сохранённого ответа нужен после retry_after
         elif mid:
@@ -2019,8 +2120,9 @@ def _finish_connect(pbot, bot_id: int, uid: int, chat_id, title: str, pstate,
     old = fs_get_group(bot_id)
     try:
         stats = old[3] if old and old[1] == chat_id else None
+        stats_created = not stats
         if not stats:
-            stats = _api(pbot.create_forum_topic, chat_id, '📊 Статистика').message_thread_id
+            stats = _create_service_topic(pbot, chat_id, 'stats').message_thread_id
     except Exception:
         _connect_error(pbot, uid, 'Не удалось создать тему «Статистика» — проверь права бота и повтори проверку', request_id)
         return
@@ -2034,7 +2136,7 @@ def _finish_connect(pbot, bot_id: int, uid: int, chat_id, title: str, pstate,
     except sqlite3.IntegrityError:
         _connect_error(pbot, uid, 'Группа уже подключена к другому боту — сначала отключи её в том боте', request_id)
         return
-    fs_set_stats_thread(bot_id, stats)
+    fs_set_stats_thread(bot_id, stats, styled=stats_created)
     fs_refresh_management(pbot, bot_id)
     if pending:
         c = _conn()
@@ -2235,6 +2337,7 @@ def _publish_period(pbot, bot_id: int, chat_id: int, thread_stats,
     current = fs_get_group(bot_id)
     if not current or current[1] != chat_id: return
     thread_stats = current[3]
+    fs_style_service_topics(pbot, bot_id)
     ps_key = start_tz.strftime('%Y-%m-%d')
     pe_key = end_tz.strftime('%Y-%m-%d')
     row = fs_report_get(bot_id, ps_key)
@@ -2252,8 +2355,8 @@ def _publish_period(pbot, bot_id: int, chat_id: int, thread_stats,
         except ApiTelegramException as e:
             if not _is_topic_gone(e):
                 raise
-            t = _api(pbot.create_forum_topic, chat_id, '📊 Статистика')
-            fs_set_stats_thread(bot_id, t.message_thread_id)
+            t = _create_service_topic(pbot, chat_id, 'stats')
+            fs_set_stats_thread(bot_id, t.message_thread_id, styled=True)
             msg = _api(pbot.send_message, chat_id, text, parse_mode='HTML',
                        message_thread_id=t.message_thread_id)
         fs_report_mark_sent(bot_id, ps_key, getattr(msg, 'message_id', None))
@@ -2333,36 +2436,92 @@ def start_weekly_scheduler():
 
 # ══════════════════════════════════════════════════════════════
 #  Реакции: тема ↔ ЛС клиента
-#  ОГРАНИЧЕНИЕ ПЛАТФОРМЫ: setMessageReaction работает ТОЛЬКО в
-#  супергруппах (в личных чатах Telegram отвечает «message must
-#  belong to a supergroup»). Поэтому:
-#  - админ отреагировал в теме → клиенту в ЛС уходит УВЕДОМЛЕНИЕ
-#    с эмодзи (поставить реакцию в ЛС бот не может физически);
-#  - юзер отреагировал в ЛС → реакция ставится на копию сообщения
-#    в супергруппе (это разрешено, бот там администратор).
 # ══════════════════════════════════════════════════════════════
-_reaction_sent: dict = {}   # (bot_id, uid, src_msg_id) -> последний отправленный эмодзи
+_reaction_sent: dict = {}   # (bot_id, uid, src_msg_id) -> успешно установленный эмодзи / ''
 _reaction_lock = threading.Lock()
 
-def _reaction_emoji(new_reaction: list) -> str:
-    """Эмодзи реакции для текста уведомления. Кастомный (premium) эмодзи
-    отрендерить в тексте нечем — показываем нейтральный маркер."""
-    for r in new_reaction or []:
-        em = getattr(r, 'emoji', None)
-        if em:
-            return em
-    return '❤️'
+# Обычные реакции: https://core.telegram.org/bots/api#reactiontypeemoji
+_REACTION_EMOJI = set(('❤ 👍 👎 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 '
+                       '🕊 🤡 🥱 🥴 😍 🐳 ❤‍🔥 🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 🍓 🍾 '
+                       '💋 🖕 😈 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 🤝 ✍ 🤗 🫡 🎅 🎄 '
+                       '☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡').split())
+_REACTION_NEAREST = {
+    **dict.fromkeys(('🧡', '💛', '💚', '💙', '💜', '🖤', '🤍', '🤎', '🩷', '🩵', '🩶',
+                     '💖', '💗', '💓', '💕', '💞', '💝', '❤‍🔥', '❤‍🩹', '😍', '🥰', '💘'), '❤️'),
+    '😀': '😁', '😃': '😁', '😄': '😁', '😊': '😁', '🙂': '😁', '😂': '🤣',
+    '😞': '😢', '😥': '😢', '😿': '😢', '😭': '😢', '😠': '😡', '🤬': '😡',
+}
+
+
+def _ordinary_reaction(emoji):
+    if not emoji:
+        return None
+    plain = re.sub('[\ufe0e\ufe0f\U0001f3fb-\U0001f3ff]', '', emoji)
+    if plain in _REACTION_EMOJI:
+        return emoji if plain == emoji.replace('\ufe0f', '').replace('\ufe0e', '') else plain
+    return _REACTION_NEAREST.get(plain)
+
+
+def _reaction_emoji(pbot, new_reaction: list):
+    """Одна обычная реакция, '' для снятия, None при неизвестной замене."""
+    if not new_reaction:
+        return ''
+    for r in new_reaction:
+        emoji = getattr(r, 'emoji', None)
+        custom_id = getattr(r, 'custom_emoji_id', None)
+        if custom_id:
+            stickers = _api(pbot.get_custom_emoji_stickers, [custom_id])
+            emoji = next((s.emoji for s in stickers if s.custom_emoji_id == custom_id), None)
+        ordinary = _ordinary_reaction(emoji)
+        if ordinary:
+            return ordinary
+    return None
+
+
+def _mirror_admin_reaction(pbot, bot_id, uid, src_msg_id, new_reaction):
+    if not src_msg_id or db_is_blocked(bot_id, uid):
+        return
+    try:
+        emoji = _reaction_emoji(pbot, new_reaction)
+        if emoji is None:
+            return
+        key = (bot_id, uid, src_msg_id)
+        with _reaction_lock:
+            if _reaction_sent.get(key) == emoji:
+                return
+        # Обработчик сериализован по bot_id через _group_guard;
+        # общий lock кэша не держим во время запросов Telegram.
+        try:
+            _api(pbot.set_message_reaction, uid, message_id=src_msg_id,
+                 reaction=[ReactionTypeEmoji(emoji)] if emoji else [])
+        except ApiTelegramException as e:
+            fallback = _REACTION_NEAREST.get(emoji.replace('\ufe0f', ''))
+            if 'reaction_invalid' not in _err_low(e) or not fallback or fallback == emoji:
+                raise
+            log.warning('reaction fallback bot#%s uid=%s: REACTION_INVALID', bot_id, uid)
+            _api(pbot.set_message_reaction, uid, message_id=src_msg_id,
+                 reaction=[ReactionTypeEmoji(fallback)])
+            emoji = fallback
+        # Ошибка не должна подавлять следующую попытку установки/снятия.
+        with _reaction_lock:
+            if len(_reaction_sent) > 5000:
+                _reaction_sent.clear()
+            _reaction_sent[key] = emoji
+    except Exception as e:
+        from safe_logging import mask_secrets
+        log.warning('reaction mirror to DM bot#%s uid=%s mid=%s: %s',
+                    bot_id, uid, src_msg_id, mask_secrets(e))
 
 @_group_guard
 def fs_handle_reaction(pbot, bot_id: int, mr, bot_self_id: int) -> None:
-    """Обрабатывает message_reaction: тема → уведомление в ЛС, ЛС → реакция в теме."""
-    if not mr.new_reaction:
-        return  # реакция снята — зеркалировать нечего
+    """Зеркалирует реакцию админа на исходник в ЛС, пользователя — в тему."""
     chat = mr.chat
     reactor = mr.user or mr.actor_chat
     if not reactor:
         return
     reactor_id = reactor.id if hasattr(reactor, 'id') else 0
+    if reactor_id == bot_self_id:
+        return
 
     group = fs_get_group(bot_id)
     if group and chat.id == group[1]:
@@ -2372,27 +2531,15 @@ def fs_handle_reaction(pbot, bot_id: int, mr, bot_self_id: int) -> None:
         mp = fs_get_mapping(chat.id, mr.message_id)
         if not (mp and mp[0] == bot_id):
             return
-        uid, src_msg_id = mp[1], mp[3]
-        if db_is_blocked(bot_id, uid):
-            return
-        emoji = _reaction_emoji(mr.new_reaction)
-        key = (bot_id, uid, src_msg_id)
-        with _reaction_lock:
-            if _reaction_sent.get(key) == emoji:
-                return  # дедуп: ту же реакцию на то же сообщение уже отправляли
-            if len(_reaction_sent) > 5000:
-                _reaction_sent.clear()
-            _reaction_sent[key] = emoji
-        try:
-            pbot.send_message(uid,
-                f'{emoji} <b>Админ отреагировал на ваше сообщение</b>',
-                parse_mode='HTML')
-        except Exception as e:
-            log.warning(f'reaction notify DM bot#{bot_id} uid={uid}: {e}')
+        _mirror_admin_reaction(pbot, bot_id, mp[1], mp[3], mr.new_reaction)
     elif chat.type == 'private':
+        if not group and chat.id == reactor_id and fs_is_admin(bot_id, reactor_id):
+            mp = fs_get_mapping(chat.id, mr.message_id)
+            if mp and mp[0] == bot_id:
+                _mirror_admin_reaction(pbot, bot_id, mp[1], mp[3], mr.new_reaction)
+            return
         # ── реакция в ЛС: юзер реагирует на сообщение бота ──
-        # реакция ставится на копию/оригинал в супергруппе (в ЛС нельзя)
-        if not group:
+        if not group or not mr.new_reaction:
             return
         copies = db_get_topic_copies_by_src(bot_id, reactor_id, mr.message_id)
         for chat_id, group_msg_id, _thread in copies:

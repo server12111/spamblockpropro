@@ -9,6 +9,7 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location('queue_harness', Path(__file__).with_name('delivery_queue.py'))
 q = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(q)
+from telegram_text import stored_html
 db, pb, fs = q.db, q.pb, q.fs
 check = q.check
 
@@ -80,15 +81,17 @@ def run():
     q.click(bot, 777, 'p_add_tpl_8000')
     enter()
     template = db.db_get_templates(bid)[0][1]
-    check('шаблон из лички: исходный текст без дубля', template == text)
-    # Редактор шаблонов в группе тоже сохраняет исходный m.text.
+    check('шаблон из лички: исходный текст и все стили без дубля',
+          plain(stored_html(template)) == text and stored_html(template) == rule['text'])
+    # Оба редактора сохраняют тот же форматированный текст, что автоответ.
     row = fs._mgmt_row(bid)
     cb = q.callback(777, 'fs_mgmt_add')
     cb.message = q.message(row[0], row[2], message_thread_id=row[1])
     fs.fs_management_callback(bot, bid, cb)
     m = q.message(row[0], 5, text, message_thread_id=row[1], entities=entities)
     q.dispatch(bot, m)
-    check('шаблон из темы: исходный текст без дубля', [body for tid, body in db.db_get_templates(bid)] == [text, text])
+    check('шаблон из темы: исходный текст и все стили без дубля',
+          [stored_html(body) for tid, body in db.db_get_templates(bid)] == [rule['text'], rule['text']])
     db.db_set_bot_setting(bid, 'txt_sent', pb.DEFAULT_SENT)
     for group in (True, False):
         if not group:

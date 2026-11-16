@@ -6,8 +6,8 @@ import time
 from telebot.types import Message
 import database as db
 import delivery_queue as dq
-from telegram_text import html_chunks, message_html
-from keyboards import TE_INBOX, TE_CHECK, TE_EXCLAM
+from telegram_text import html_chunks, message_html, send_html, stored_html
+from keyboards import TE_INBOX, TE_CHECK, TE_EXCLAM, TE_NOTE
 
 _guard = threading.RLock()
 
@@ -125,11 +125,16 @@ class ReplySender(dq.DeliverySender):
             raise ValueError('Пользователь заблокирован')
         mode = payload['mode']
         if mode == 'text':
-            import html
-            result = None
-            body = message_html(payload['message']) if payload.get('message') else html.escape(payload['text'])
-            for part in html_chunks(f'<b>{TE_INBOX} Сообщение от администратора</b>\n\n' + body,4096):
-                result = self.api(self.bot.send_message,target,part,parse_mode='HTML').message_id
+            body = message_html(payload['message']) if payload.get('message') else stored_html(payload['text'])
+            text = body if payload.get('template') else f'<b>{TE_INBOX} Сообщение от администратора</b>\n\n' + body
+            result = send_html(self.bot, target, text, api=self.api).message_id
+            if payload.get('template'):
+                try:
+                    send_html(self.bot, payload['notify'], f'{TE_NOTE} <b>Шаблон</b>\n' + body, api=self.api)
+                except Exception:
+                    # Как у уведомления ниже: отказ копии не отменяет доставку.
+                    # RetryDelivery/StopDelivery проходят через этот блок.
+                    pass
             return result
         if mode in ('album', 'forum_album'):
             if mode == 'forum_album':
@@ -152,7 +157,23 @@ class ReplySender(dq.DeliverySender):
             return result[0].message_id if result else None
         m = Message.de_json(payload['message'])
         if mode == 'forum':
-            return fs._deliver_admin_reply(self.bot,self.bot_id,m,target,payload['thread'],payload.get('reply'))
+            result = self.progress.get('template_result') or fs._deliver_admin_reply(
+                self.bot,self.bot_id,m,target,payload['thread'],payload.get('reply'))
+            if result and payload.get('template'):
+                # Источник остаётся чистым до копирования. При повторе после 429
+                # на правке нельзя повторно копировать уже помеченное сообщение.
+                self.progress['template_result'] = result
+                self._save()
+                fs.fs_map_message(self.bot_id, m.chat.id, m.message_id, target, payload['thread'], result)
+                marked = f'{TE_NOTE} <b>Шаблон</b>\n' + payload['template']
+                parts = html_chunks(marked, 4096)
+                self.api(self.bot.edit_message_text, parts[0], m.chat.id, m.message_id, parse_mode='HTML')
+                for part in parts[1:]:
+                    continuation = send_html(self.bot, m.chat.id, part, api=self.api,
+                                             message_thread_id=payload['thread'])
+                    fs.fs_map_message(self.bot_id, m.chat.id, continuation.message_id,
+                                      target, payload['thread'], result)
+            return result
         if m.content_type == 'photo':
             header=f'<b>{TE_INBOX} Сообщение от администратора</b>'
             body=message_html(m.json, caption=True)

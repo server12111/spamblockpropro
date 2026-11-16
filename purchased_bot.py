@@ -13,7 +13,7 @@ from html.parser import HTMLParser
 from datetime import timedelta, timezone
 import database as db
 from safe_logging import register_secret
-from telegram_text import edit_html, protect_text_lengths, message_html, html_chunks
+from telegram_text import edit_html, protect_text_lengths, message_html, html_chunks, send_html, store_message_text, stored_html, stored_plain, is_formatted
 from datetime import datetime
 from functools import wraps
 from types import SimpleNamespace
@@ -101,7 +101,7 @@ def _retry_send(send):
 
 
 def _safe_send(b, uid, text):
-    return _retry_send(lambda: b.send_message(uid, text, parse_mode='HTML'))
+    return _retry_send(lambda: send_html(b, uid, text))
 
 def _safe_photo(b, uid, photo, caption):
     return _retry_send(lambda: b.send_photo(uid, photo, caption=caption, parse_mode='HTML'))
@@ -428,6 +428,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         templates = db_get_templates(db_bot_id)
         kb = InlineKeyboardMarkup()
         for tid, text in templates:
+            text = stored_plain(text)
             preview = text[:35] + '…' if len(text) > 35 else text
             kb.add(_pbtn(preview, icon='💬', style='primary', callback_data=f'p_use_tpl_{target_id}_{tid}'))
         kb.add(_pbtn('Добавить шаблон', icon='➕', style='success', callback_data=f'p_add_tpl_{target_id}'))
@@ -628,7 +629,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                     db.db_auto_save(db_bot_id, rule['phrases'], rule['text'], rid, rule['offhours'])
                 show_rule(cb, rule)
 
-    @pbot.message_handler(func=lambda m: isinstance(pstate.get(m.from_user.id), dict)
+    @pbot.message_handler(content_types=['text', 'photo', 'video', 'document', 'audio', 'voice', 'animation'], func=lambda m: isinstance(pstate.get(m.from_user.id), dict)
                          and pstate[m.from_user.id].get('step') == 'support_input'
                          and (m.text or '').split(' ', 1)[0].split('@', 1)[0]
                          not in ('/start', '/admin', '/status', '/templates'))
@@ -659,7 +660,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                 if action == 'text' and state['key'] == 'txt_offhours':
                     validate_support_html(re.sub(r'\{(start|end|wait)\}',
                         lambda m: '999 часов' if m[1] == 'wait' else '23:00', text))
-                pbot.send_message(m.chat.id, text, parse_mode='HTML')
+                send_html(pbot, m.chat.id, text)
                 def save():
                     if action == 'text': db_set_bot_setting(db_bot_id, state['key'], text)
                     elif action == 'new_answer': db.db_auto_save(db_bot_id, state['phrases'], text)
@@ -710,7 +711,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                 continue
             try:
                 if row[6] == 0:
-                    pbot.send_message(row[1], row[3], parse_mode='HTML')
+                    send_html(pbot, row[1], row[3])
                     db.db_support_notification_sent(db_bot_id, row, time.time())
                 remaining = json.loads(row[4])
                 while remaining:
@@ -743,8 +744,10 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         children = db.db_faq_nodes(db_bot_id, node_id or None)
         pages = max(1, (len(children) + 7) // 8)
         page = max(0, min(page, pages - 1))
-        text = f"<b>{html.escape(node['title'])}</b>" + ('\n\n' + node['text'] if node['text'] else '') if node else f'<b>{TE_NOTE} FAQ</b>\n\nВыбери вопрос'
-        rows = [[(n['title'], f"fq_{mode}_{n['id']}_0")] for n in children[page*8:page*8+8]]
+        title = (stored_html(node['title']) if is_formatted(node['title']) else
+                 f"<b>{stored_html(node['title'])}</b>") if node else ''
+        text = title + ('\n\n' + node['text'] if node['text'] else '') if node else f'<b>{TE_NOTE} FAQ</b>\n\nВыбери вопрос'
+        rows = [[(stored_plain(n['title']), f"fq_{mode}_{n['id']}_0")] for n in children[page*8:page*8+8]]
         if pages > 1:
             nav = []
             if page: nav.append(('◀️', f'fq_{mode}_{node_id}_{page-1}'))
@@ -819,7 +822,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                 kb = InlineKeyboardMarkup()
                 kb.row(_pbtn('Да, удалить', icon='❌', callback_data=f'fq_yes_{node_id}', style='danger'),
                        _pbtn('Отмена', icon='❌', callback_data=f'fq_e_{node_id}_0'))
-                _edit(f"Удалить «{html.escape(node['title'])}» и всё, что внутри ({count})?", cb.message.chat.id, cb.message.message_id, kb)
+                _edit(f"Удалить «{html.escape(stored_plain(node['title']))}» и всё, что внутри ({count})?", cb.message.chat.id, cb.message.message_id, kb)
             elif action == 'yes' and node:
                 parent = node['parent_id'] or 0
                 db.db_faq_subtree(db_bot_id, node_id, delete=True)
@@ -833,7 +836,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         cb = SimpleNamespace(message=SimpleNamespace(chat=m.chat, message_id=sent.message_id))
         faq_show(cb, node_id, mode='e')
 
-    @pbot.message_handler(func=lambda m: _faq_pending(m.from_user.id) is not None and not m.reply_to_message
+    @pbot.message_handler(content_types=['text', 'photo', 'video', 'document', 'audio', 'voice', 'animation'], func=lambda m: _faq_pending(m.from_user.id) is not None and not m.reply_to_message
                          and (m.text or '').split(' ', 1)[0].split('@', 1)[0]
                          not in ('/start', '/admin', '/status', '/templates'))
     def faq_save_input(m):
@@ -843,8 +846,8 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         action, node_id = state['action'], state['node_id']
         try:
             if action in ('add', 'name'):
-                title = (m.text or '').strip()
-                if not 1 <= len(title) <= 40: raise ValueError('Название должно содержать от 1 до 40 символов')
+                title = store_message_text(m)
+                if not 1 <= len(stored_plain(title).strip()) <= 40: raise ValueError('Название должно содержать от 1 до 40 символов')
                 if action == 'add':
                     sent = pbot.send_message(m.chat.id, 'Название принято')
                     cb = SimpleNamespace(from_user=m.from_user, message=SimpleNamespace(chat=m.chat, message_id=sent.message_id))
@@ -876,7 +879,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         db_add_user(db_bot_id, m.from_user.id, m.from_user.username or '')
         w = get_welcome()
         try:
-            pbot.send_message(m.chat.id, w, parse_mode='HTML',
+            send_html(pbot, m.chat.id, w,
                               reply_markup=pk_start(is_admin(m.from_user.id)))
         except Exception:
             # битый HTML в приветствии (введён админом) не должен «убивать» /start:
@@ -921,7 +924,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         lines = [f"<b>{TE_NOTE} Сохранённые шаблоны:</b>\n"]
         for tid, text in templates[:50]:
             # экранируем: шаблон вводит админ, '<' в нём ломал бы весь список (400)
-            lines.append(f"• [{tid}] {html.escape(str(text))}")
+            lines.append(f"• [{tid}] {stored_html(text)}")
         pbot.send_message(m.chat.id, "\n".join(lines),
             parse_mode='HTML', reply_markup=pk_close())
 
@@ -962,6 +965,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         templates = db_get_templates(db_bot_id)[:50]
         kb = InlineKeyboardMarkup()
         for tid, text in templates:
+            text = stored_plain(text)
             preview = text[:30] + '…' if len(text) > 30 else text
             kb.row(
                 _pbtn(preview, icon='💬', style='primary', callback_data='p_noop'),
@@ -989,11 +993,16 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         _edit(f"<b>{TE_PLUS} Введи текст нового шаблона:</b>",
             cb.message.chat.id, cb.message.message_id, parse_mode='HTML', reply_markup=kb)
 
-    @pbot.message_handler(func=lambda m: pstate.get(m.from_user.id) == 'mgadd_tpl')
+    @pbot.message_handler(content_types=['text', 'photo', 'video', 'document', 'audio', 'voice', 'animation'], func=lambda m: pstate.get(m.from_user.id) == 'mgadd_tpl')
     def p_mgadd_tpl_save(m):
         if not is_admin(m.from_user.id): return
+        if not (m.text or m.caption): return
+        text = message_html(m)
+        if len(text.encode('utf-16-le')) // 2 > 4096:
+            pbot.send_message(m.chat.id, 'Текст шаблона должен быть не длиннее 4096 символов')
+            return
         if _take_flow(m.from_user.id, 'mgadd_tpl') is None: return
-        db_add_template(db_bot_id, m.text)
+        db_add_template(db_bot_id, store_message_text(m))
         fs_refresh_management(pbot, db_bot_id)
         kb, templates = pk_manage_templates()
         pbot.send_message(m.chat.id,
@@ -1193,7 +1202,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         _take_flow(cb.from_user.id, 'await_reply_')
         from reply_queue import enqueue
         status, _ = enqueue(pbot, db_bot_id, f'template:{cb.id}',
-                            dict(mode='text', target=target_id, text=text, notify=cb.from_user.id))
+                            dict(mode='text', target=target_id, text=text, template=True, notify=cb.from_user.id))
         if status == 'pending':
             pbot.answer_callback_query(cb.id, 'Ответ сохранён, отправлю позже')
 
@@ -1206,14 +1215,18 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=pk_reply_input_with_templates(target))
 
-    @pbot.message_handler(func=lambda m: isinstance(pstate.get(m.from_user.id), str)
+    @pbot.message_handler(content_types=['text', 'photo', 'video', 'document', 'audio', 'voice', 'animation'], func=lambda m: isinstance(pstate.get(m.from_user.id), str)
                                          and pstate[m.from_user.id].startswith('await_add_tpl_'))
     def p_save_template(m):
         if not is_admin(m.from_user.id): return
+        if not (m.text or m.caption): return
         state, revision = pstate.snapshot(m.from_user.id)
         if not isinstance(state, str) or not state.startswith('await_add_tpl_'): return
         target = int(state.split('_')[-1])
-        if not _commit_input(m.from_user.id, state, lambda: db_add_template(db_bot_id, m.text),
+        if len(message_html(m).encode('utf-16-le')) // 2 > 4096:
+            pbot.send_message(m.chat.id, 'Текст шаблона должен быть не длиннее 4096 символов')
+            return
+        if not _commit_input(m.from_user.id, state, lambda: db_add_template(db_bot_id, store_message_text(m)),
                              revision, next_state=f'await_reply_{target}'): return
         fs_refresh_management(pbot, db_bot_id)
         pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Шаблон сохранён</b>",
@@ -1226,6 +1239,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         templates = db_get_templates(db_bot_id)[:50]
         kb = InlineKeyboardMarkup()
         for tid, text in templates:
+            text = stored_plain(text)
             preview = text[:35] + '…' if len(text) > 35 else text
             kb.add(_pbtn(preview, icon='❌', style='danger', callback_data=f'p_del_tpl_{target}_{tid}'))
         kb.add(_pbtn('Назад', icon='🔙', callback_data=f'p_templates_{target}'))
@@ -1246,6 +1260,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         templates = db_get_templates(db_bot_id)[:50]
         kb = InlineKeyboardMarkup()
         for t_id, text in templates:
+            text = stored_plain(text)
             preview = text[:35] + '…' if len(text) > 35 else text
             kb.add(_pbtn(preview, icon='❌', style='danger', callback_data=f'p_del_tpl_{target}_{t_id}'))
         kb.add(_pbtn('Назад', icon='🔙', callback_data=f'p_templates_{target}'))
@@ -1766,12 +1781,13 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             _edit(f"<b>{TE_PICTURE} Отправь фото с подписью (или без):</b>",
                 cb.message.chat.id, cb.message.message_id, parse_mode='HTML')
 
-    @pbot.message_handler(func=lambda m: pstate.get(m.from_user.id) == 'p_bcast_text')
+    @pbot.message_handler(content_types=['text', 'photo', 'video', 'document', 'audio', 'voice', 'animation'], func=lambda m: pstate.get(m.from_user.id) == 'p_bcast_text')
     def p_bcast_text(m):
         if not is_admin(m.from_user.id): return
+        if not (m.text or m.caption): return
         if _take_flow(m.from_user.id, 'p_bcast_text') is None: return
         users = db_get_bot_users(db_bot_id)
-        sent  = sum(1 for uid in users if _safe_send(pbot, uid, m.text))
+        sent  = sum(1 for uid in users if _safe_send(pbot, uid, message_html(m)))
         pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Рассылка завершена: {sent}/{len(users)}</b>",
             parse_mode='HTML', reply_markup=pk_close())
 

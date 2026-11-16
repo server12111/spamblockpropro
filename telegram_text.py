@@ -6,13 +6,17 @@ from functools import wraps
 from html.parser import HTMLParser
 
 
-def message_html(raw, caption=False):
+def message_html(raw, caption=None):
     """Один проход по UTF-16: пересекающиеся entities не повторяют текст.
 
     На границах пересечений закрываем и переоткрываем теги, чтобы HTML
     оставался вложенным, а каждый исходный символ выводился ровно один раз.
     """
+    if hasattr(raw, 'json'):
+        raw = raw.json
     raw = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    if caption is None:
+        caption = not bool(raw.get('text'))
     text = raw.get('caption' if caption else 'text') or ''
     encoded = text.encode('utf-16-le')
     size = len(encoded) // 2
@@ -61,6 +65,40 @@ def message_html(raw, caption=False):
         previous = active
     result.extend(spans[i][3] for i in reversed(previous))
     return ''.join(result)
+
+
+# В старых шаблонах и названиях FAQ HTML был буквальным текстом.
+# Метка различает их и новые форматированные значения без изменения схемы БД.
+_FORMATTED = '<!--formatted:v1-->\n'
+
+
+def store_message_text(message):
+    raw = message.json
+    text = raw.get('text') or raw.get('caption') or ''
+    formatted = message_html(message)
+    return _FORMATTED + formatted if formatted != html.escape(text, quote=False) else text
+
+
+def stored_html(text):
+    return text[len(_FORMATTED):] if text.startswith(_FORMATTED) else html.escape(text, quote=False)
+
+
+def stored_plain(text):
+    if not text.startswith(_FORMATTED):
+        return text
+    class Plain(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.parts = []
+        def handle_data(self, data):
+            self.parts.append(data)
+    parser = Plain()
+    parser.feed(stored_html(text))
+    return ''.join(parser.parts)
+
+
+def is_formatted(text):
+    return text.startswith(_FORMATTED)
 
 
 def ordered_album(items, key=lambda message: message.message_id):
@@ -140,12 +178,15 @@ def protect_text_lengths(bot):
     bot.send_message = send
 
 
-def send_html(bot, chat_id, text, reply_markup=None, parse_mode='HTML'):
-    chunks = html_chunks(text, 4096) if parse_mode == 'HTML' else [text[i:i+1900] for i in range(0, len(text), 1900)]
+def send_html(bot, chat_id, text, reply_markup=None, parse_mode='HTML', *, api=None, **kwargs):
+    chunks = html_chunks(text, 4096) if parse_mode == 'HTML' else (
+        [text] if len(text.encode('utf-16-le')) // 2 <= 4096 else
+        [text[i:i+1900] for i in range(0, len(text), 1900)])
     result = None
     for i, chunk in enumerate(chunks):
-        result = bot.send_message(chat_id, chunk, parse_mode=parse_mode,
-                                  reply_markup=reply_markup if i == len(chunks) - 1 else None)
+        call = api or (lambda method, *a, **kw: method(*a, **kw))
+        result = call(bot.send_message, chat_id, chunk, parse_mode=parse_mode,
+                      reply_markup=reply_markup if i == len(chunks) - 1 else None, **kwargs)
     return result
 
 
