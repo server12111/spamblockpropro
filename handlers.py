@@ -6,6 +6,7 @@ import time
 import threading
 import logging
 import uuid
+from functools import wraps
 from input_validation import bounded_number
 import re
 import database as db
@@ -97,10 +98,25 @@ def _is_super_admin(event):
     return event.from_user.id == SUPER_ADMIN
 
 
-def _is_private_super_admin(event):
+def _is_private_dialog(event):
     message = getattr(event, 'message', None) or event
-    return (_is_super_admin(event) and message.chat.type == 'private'
-            and message.chat.id == SUPER_ADMIN)
+    chat = getattr(message, 'chat', None)
+    return bool(chat and chat.type == 'private' and chat.id == event.from_user.id)
+
+
+def _guard_private_dialogs(bot):
+    """Главный бот ведёт диалоги только в личке, включая команды и старые кнопки"""
+    for handler in bot.message_handlers + bot.callback_query_handlers:
+        original = handler['function']
+        @wraps(original)
+        def checked(event, original=original):
+            if _is_private_dialog(event):
+                return original(event)
+        handler['function'] = checked
+
+
+def _is_private_super_admin(event):
+    return _is_super_admin(event) and _is_private_dialog(event)
 
 
 def _restore_database(tmp_path, main_bot):
@@ -624,8 +640,7 @@ def register(bot: telebot.TeleBot):
         if not _is_super_admin(cb):
             return
         target = int(cb.data.split('_')[-1])
-        _edit(f"<b>{TE_CHAT}  Введи ответ:</b>",
-            cb.message.chat.id, cb.message.message_id,
+        bot.send_message(cb.message.chat.id, f"<b>{TE_CHAT}  Введи ответ</b>",
             parse_mode='HTML', reply_markup=cancel_kb())
         state[cb.from_user.id] = f'await_admin_msg_{target}'
 
@@ -1164,7 +1179,6 @@ def register(bot: telebot.TeleBot):
             previous = value.get('job_id') if isinstance(value, dict) else None
             jid = svc.append(bot, m.from_user.id, m.chat.id, scope, m, previous)
             state[m.from_user.id] = dict(step='service_broadcast', job_id=jid, scope=scope, album=m.media_group_id)
-            _, revision = state.snapshot(m.from_user.id)
         if m.media_group_id:
             svc.schedule_preview(bot, jid)
         else:
@@ -1172,7 +1186,6 @@ def register(bot: telebot.TeleBot):
             except Exception as exc:
                 log.warning('service preview failed: %s', exc)
                 svc.fail_preview(bot, jid)
-                state.transition(m.from_user.id, revision, 'bcast_any_' + scope)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith('bcast_') and not c.data.endswith('_p'))
     def broadcast_type(cb):
@@ -1646,3 +1659,4 @@ def register(bot: telebot.TeleBot):
 
     from input_validation import guard_numeric_callbacks
     guard_numeric_callbacks(bot)
+    _guard_private_dialogs(bot)

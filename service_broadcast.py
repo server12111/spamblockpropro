@@ -236,9 +236,19 @@ def schedule_preview(main_bot, job_id):
 
 
 def fail_preview(main_bot, job_id):
-    # Неподходящий файл не должен запускать бесконечные предпросмотры и уведомления
-    query("UPDATE service_broadcasts SET status='failed' WHERE id=? AND status='draft'", (job_id,), write=True)
-    retry_telegram(lambda: main_bot.send_message(job(job_id)['chat_id'],
+    # Единое восстановление ввода для таймера, обычного сообщения и resume
+    with _lock:
+        current = job(job_id)
+        if not current or current['status'] != 'draft': return
+        query("UPDATE service_broadcasts SET status='failed' WHERE id=? AND status='draft'", (job_id,), write=True)
+        state = db.DBState(0)
+        value, revision = state.snapshot(current['creator'])
+        if (isinstance(value, dict) and value.get('step') == 'service_broadcast'
+                and value.get('job_id') == job_id):
+            # Отмена и новый диалог побеждают запоздавший сбой
+            state.transition(current['creator'], revision, 'bcast_any_' + current['scope'])
+    # Сбой уведомления не должен мешать повторному вводу
+    retry_telegram(lambda: main_bot.send_message(current['chat_id'],
         f'{TE_CROSS} Не удалось подготовить рассылку, отправь ещё раз', parse_mode='HTML'))
 
 
