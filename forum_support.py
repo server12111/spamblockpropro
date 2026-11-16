@@ -685,27 +685,19 @@ def fs_is_admin(bot_id: int, user_id: int) -> bool:
 #  Telegram API: вызовы с обработкой 429 и классификация ошибок
 # ══════════════════════════════════════════════════════════════
 def _api(fn, *args, **kwargs):
-    """Вызов Telegram API с ограниченным числом повторов при 429 Too Many Requests."""
+    """Очередь сохраняет повтор; служебные вызовы ждут полный retry_after"""
     from delivery_queue import current_sender
     sender = current_sender()
     if sender is not None:
         return sender.api(fn, *args, **kwargs)
-    attempts = 0
-    while True:
+    from telegram_text import retry_telegram
+    def call():
         try:
             return fn(*args, **kwargs)
         except ApiTelegramException as e:
-            if 'not modified' in str(e).lower():
-                return True
-            if e.error_code == 429 and attempts < 3:
-                try:
-                    ra = int(e.result_json['parameters']['retry_after'])
-                except Exception:
-                    ra = 5
-                time.sleep(min(ra + 1, 30))
-                attempts += 1
-                continue
+            if 'not modified' in str(e).lower(): return True
             raise
+    return retry_telegram(call)
 
 def _err_low(e) -> str:
     return str(e).lower()
@@ -933,51 +925,55 @@ def _reply_params(reply_msg_id):
         return None
     return ReplyParameters(message_id=reply_msg_id, allow_sending_without_reply=True)
 
-def _resend_by_type(pbot, to_chat, thread, m, reply_msg_id=None):
+def _resend_by_type(pbot, to_chat, thread, m, reply_msg_id=None, *, api=None):
     """Третий способ передачи: повторная отправка содержимого через Bot API."""
+    call = api or _api
     rp = _reply_params(reply_msg_id)
     kw = {'message_thread_id': thread} if thread else {}
     ct = m.content_type
     if ct == 'text':
-        return _api(pbot.send_message, to_chat, m.text, entities=m.entities,
+        return call(pbot.send_message, to_chat, m.text, entities=m.entities,
                     reply_parameters=rp, **kw).message_id
     if ct == 'photo':
-        return _api(pbot.send_photo, to_chat, m.photo[-1].file_id, caption=m.caption,
+        return call(pbot.send_photo, to_chat, m.photo[-1].file_id, caption=m.caption,
                     caption_entities=m.caption_entities, reply_parameters=rp, **kw).message_id
     if ct == 'video':
-        return _api(pbot.send_video, to_chat, m.video.file_id, caption=m.caption,
+        return call(pbot.send_video, to_chat, m.video.file_id, caption=m.caption,
                     caption_entities=m.caption_entities, reply_parameters=rp, **kw).message_id
     if ct == 'document':
-        return _api(pbot.send_document, to_chat, m.document.file_id, caption=m.caption,
+        return call(pbot.send_document, to_chat, m.document.file_id, caption=m.caption,
                     caption_entities=m.caption_entities, reply_parameters=rp, **kw).message_id
     if ct == 'audio':
-        return _api(pbot.send_audio, to_chat, m.audio.file_id, caption=m.caption,
+        return call(pbot.send_audio, to_chat, m.audio.file_id, caption=m.caption,
                     caption_entities=m.caption_entities, reply_parameters=rp, **kw).message_id
     if ct == 'voice':
-        return _api(pbot.send_voice, to_chat, m.voice.file_id, caption=m.caption,
+        return call(pbot.send_voice, to_chat, m.voice.file_id, caption=m.caption,
                     caption_entities=m.caption_entities, reply_parameters=rp, **kw).message_id
     if ct == 'video_note':
-        return _api(pbot.send_video_note, to_chat, m.video_note.file_id, **kw).message_id
+        return call(pbot.send_video_note, to_chat, m.video_note.file_id, **kw).message_id
     if ct == 'sticker':
-        return _api(pbot.send_sticker, to_chat, m.sticker.file_id, reply_parameters=rp, **kw).message_id
+        return call(pbot.send_sticker, to_chat, m.sticker.file_id, reply_parameters=rp, **kw).message_id
     if ct == 'animation':
-        return _api(pbot.send_animation, to_chat, m.animation.file_id, caption=m.caption,
+        return call(pbot.send_animation, to_chat, m.animation.file_id, caption=m.caption,
                     caption_entities=m.caption_entities, reply_parameters=rp, **kw).message_id
     if ct == 'contact':
         c = m.contact
-        return _api(pbot.send_contact, to_chat, c.phone_number, c.first_name,
-                    last_name=c.last_name, reply_parameters=rp, **kw).message_id
+        return call(pbot.send_contact, to_chat, c.phone_number, c.first_name,
+                    last_name=c.last_name, vcard=c.vcard, reply_parameters=rp, **kw).message_id
     if ct == 'location':
-        return _api(pbot.send_location, to_chat, m.location.latitude,
+        return call(pbot.send_location, to_chat, m.location.latitude,
                     m.location.longitude, reply_parameters=rp, **kw).message_id
     if ct == 'venue':
         v = m.venue
-        return _api(pbot.send_venue, to_chat, v.location.latitude, v.location.longitude,
+        return call(pbot.send_venue, to_chat, v.location.latitude, v.location.longitude,
                     v.title, v.address, reply_parameters=rp, **kw).message_id
     if ct == 'poll' and m.poll:
         opts = [o.text for o in m.poll.options]
-        return _api(pbot.send_poll, to_chat, m.poll.question, opts,
+        return call(pbot.send_poll, to_chat, m.poll.question, opts,
                     is_anonymous=m.poll.is_anonymous, type=m.poll.type,
+                    allows_multiple_answers=m.poll.allows_multiple_answers,
+                    correct_option_id=m.poll.correct_option_id,
+                    explanation=m.poll.explanation, explanation_entities=m.poll.explanation_entities,
                     reply_parameters=rp, **kw).message_id
     return None
 
@@ -1079,7 +1075,7 @@ def _relay_to_topic(pbot, bot_id: int, group_row, u, from_chat, msg_id,
 def _relay_batch_to_topic(pbot, bot_id: int, group_row, u, from_chat, ids,
                           msgs=None, thread=None):
     """Передача альбома: copy_messages → forward_messages → пересборка
-    медиагруппы → по одному. Возвращает только полный, однозначный результат."""
+    медиагруппы → по одному. Частичный успех не запускает повторную отправку"""
     _require_current_group(bot_id, group_row)
     gid = group_row[1]
     tries = 0
@@ -1136,11 +1132,13 @@ def _relay_batch_to_topic(pbot, bot_id: int, group_row, u, from_chat, ids,
 def _batch_message_ids(result, source_ids):
     """Telegram может пропускать сообщения, не указывая исходные ID.
 
-    Неполный результат нельзя сопоставлять через zip или считать успехом
+    Неполный результат нельзя сопоставлять через zip или считать полной доставкой
     """
     mids = [message.message_id for message in result]
-    if len(mids) != len(source_ids):
-        raise RuntimeError('incomplete batch delivery')
+    if len(mids) > len(source_ids):
+        raise RuntimeError('invalid batch delivery')
+    # Успешный частичный результат окончателен: повтор создаст дубликаты
+    # Соответствия исходным ID допустимы только для полного результата
     return mids
 
 
@@ -1190,7 +1188,7 @@ def _flush_album(pbot, bot_id: int, key):
         u = buf['msgs'][0].from_user
         sent, thread = _relay_batch_to_topic(
             pbot, bot_id, group, u, buf['chat_id'], buf['ids'], buf['msgs'], buf['thread'])
-        for src_id, gm_id in zip(buf['ids'], sent):
+        for src_id, gm_id in (zip(buf['ids'], sent) if len(sent) == len(buf['ids']) else []):
             fs_map_message(bot_id, buf['gid'], gm_id, uid, thread, src_id, media_group=key[2])
         fs_bump_ticket(bot_id, uid)
         db_bump_user_contact(bot_id, uid)
@@ -1364,6 +1362,13 @@ def fs_handle_group_message(pbot, bot_id: int, m, bot_self_id: int, pstate) -> N
 def _deliver_admin_reply(pbot, bot_id: int, m, target_uid: int, thread: int,
                          reply_ctx=None):
     """Общий путь обычного ответа и шаблона: доставка, ошибки, учёт ответа."""
+    from delivery_queue import current_sender
+    if current_sender() is None:
+        from reply_queue import enqueue
+        status, result = enqueue(pbot, bot_id, f'forum:{m.chat.id}:{m.message_id}:{target_uid}',
+                                 dict(mode='forum', target=target_uid, message=m.json,
+                                      thread=thread, reply=reply_ctx))
+        return True if status == 'pending' else result
     if db_is_blocked(bot_id, target_uid):
         _topic_notice(pbot, m.chat.id, thread,
                       f'{TE_BLOCK} Пользователь заблокирован — ответ не доставлен.')
@@ -1444,8 +1449,11 @@ def _flush_admin_album(pbot, bot_id: int, key):
             _topic_notice(pbot, buf['gid'], thread,
                           f'{TE_BLOCK} Пользователь заблокирован — ответ не доставлен.')
             return
-        _batch_message_ids(_api(pbot.copy_messages, target_uid, buf['gid'], buf['ids']), buf['ids'])
-        fs_log_admin_msg(bot_id, target_uid)
+        from reply_queue import enqueue
+        enqueue(pbot, bot_id, f"forum_album:{buf['gid']}:{buf['ids']}:{target_uid}",
+                dict(mode='forum_album', target=target_uid, chat=buf['gid'], ids=buf['ids'],
+                     notify=buf['gid'], notice_thread=thread))
+        return
     except ApiTelegramException as e:
         if _is_bot_blocked(e):
             _topic_notice(pbot, buf['gid'], thread,
@@ -1522,7 +1530,9 @@ def fs_pin_callback(pbot, bot_id: int, cb):
         sent = _api(pbot.send_message, group[1], text, parse_mode=None,
                     message_thread_id=topic[0])
         mid = _deliver_admin_reply(pbot, bot_id, sent, uid, topic[0])
-        if mid:
+        if mid is True:
+            pass  # Источник сохранённого ответа нужен после retry_after
+        elif mid:
             fs_map_message(bot_id, group[1], sent.message_id, uid, topic[0], mid)
             _api(pbot.delete_message, group[1], m.message_id)
         else:

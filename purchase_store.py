@@ -255,11 +255,17 @@ def db_clear_paid(user_id):
     c.commit(); c.close()
 
 
-def db_register_paid_bot(user_id, token, admin_id):
+def db_register_paid_bot(user_id, token, admin_id, *, revision=None):
     """Создание бота и расход одного гранта неделимы, запуск выполняется после"""
     c = _conn()
     try:
         c.execute('BEGIN IMMEDIATE')
+        if revision is not None and not c.execute(
+                'DELETE FROM states WHERE bot_id=0 AND user_id=? AND revision=?',
+                (user_id, revision)).rowcount:
+            return None
+        from database import ensure_bot_identity
+        ensure_bot_identity(c, token)
         days = _take_grant(c, user_id)
         if days is None:
             raise ValueError('Setup grant missing')
@@ -267,7 +273,8 @@ def db_register_paid_bot(user_id, token, admin_id):
         cur = c.execute('INSERT INTO bots (owner_id, token, admin_id, expires_at) VALUES (?,?,?,?)',
                         (user_id, token, admin_id, expires))
         bot_id = cur.lastrowid
-        c.execute('DELETE FROM states WHERE bot_id=0 AND user_id=?', (user_id,))
+        if revision is None:
+            c.execute('DELETE FROM states WHERE bot_id=0 AND user_id=?', (user_id,))
         c.commit()
         return bot_id
     finally:

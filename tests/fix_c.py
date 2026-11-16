@@ -347,8 +347,10 @@ def incomplete_album():
                                   gid=-bid, thread=77, chat_id=701)
     bot.fail['copy_messages'] = lambda *a, **kw: [types.SimpleNamespace(message_id=222)]
     fs._flush_album(bot, bid, key)
-    assert [it['mid'] for it in payload(bid)] == [1, 2]
+    assert not payload(bid)  # Успешный частичный результат нельзя отправлять повторно
     assert fs.fs_get_mapping(-bid, 222) is None
+    assert len([1 for n,a,k in bot.calls if n == 'copy_messages']) == 1
+    assert not any(n == 'forward_messages' for n,a,k in bot.calls)
 
 
 def admin_incomplete_album():
@@ -399,7 +401,7 @@ with patch.object(telebot.TeleBot, 'get_me', return_value=t.User(999, True, 'Б�
     check('Повтор только недоступному администратору', recipients)
     check('Из очереди можно ответить клиенту кнопкой', reply_button)
     check('Прогресс получателей переживает остановку процесса', restart_progress)
-    check('Неполный альбом остаётся без неверных соответствий', incomplete_album)
+    check('Неполный альбом не повторяется и не создаёт неверных соответствий', incomplete_album)
     check('Неполный ответ альбомом не считается успехом', admin_incomplete_album)
     check('Сбой кнопки не повторяет пересылку', markup_retry)
 print(f'ИТОГО: {OK} OK, {FAIL} FAIL')

@@ -72,8 +72,8 @@ for name in ('send_message', 'edit_message_text', 'answer_callback_query', 'dele
 telebot.TeleBot.get_me = lambda *a, **k: t.User(1, True, 'Бот', username='testbot')
 H.launch_bot = lambda *a, **k: True
 H.cb_check_invoice = lambda iid: {'invoice_id': iid, 'status': 'paid', 'amount': '10', 'asset': 'USDT'}
-H.get_ton_amount = lambda: 1
-PB.get_ton_amount = lambda: 1
+H.get_ton_amount = lambda quoted_price=None: 1
+PB.get_ton_amount = lambda quoted_price=None: 1
 bot = telebot.TeleBot('111:FAKE', threaded=False)
 H.register(bot)
 
@@ -99,8 +99,11 @@ def invoice(uid, iid, amount='10'):
                                     'amount': amount, 'expiration_date': (datetime.utcnow() + timedelta(hours=1)).isoformat()}
     callback(uid, 'pay_cryptobot')
 
+SETUP_ID = 777777
 def setup(uid, suffix=''):
-    message(uid, '777777:' + 'B' * 32 + suffix)
+    global SETUP_ID
+    SETUP_ID += 1  # Каждая новая покупка подключает другого Telegram-бота
+    message(uid, str(SETUP_ID) + ':' + 'B' * 32 + suffix)
     message(uid, str(uid))
 
 PASS = FAIL = 0
@@ -404,9 +407,10 @@ def startup_updates():
         runpy.run_path(str(ROOT / 'main.py'), run_name='__main__')
     assert all(k.get('drop_pending_updates') is False for n, a, k in API if n == 'delete_webhook')
     API.clear()
+    bid = db.db_add_bot(999, '999:test', 999)
     with patch.object(threading.Thread, 'start'):
-        assert PB.launch_bot(999, '999:test', 999, bot)
-    PB.running_bots.pop('999:test', None); PB.running_bot_ids.pop(999, None)
+        assert PB.launch_bot(bid, '999:test', 999, bot)
+    PB.running_bots.pop('999:test', None); PB.running_bot_ids.pop(bid, None)
     assert any(n == 'delete_webhook' and k.get('drop_pending_updates') is False for n, a, k in API)
 
 def webhook_routes():

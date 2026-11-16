@@ -105,6 +105,7 @@ class DeliverySender:
         self.last_cleanup = 0
         self.payload_phase = False
         self.fallback_recovered = False
+        self.operation_counts = {}
         # При аварии подтверждение пользователю могло не завершиться.
         abandoned = [r['id'] for r in db_delivery_rows(bot_id) if r['status'] == 'accepting']
         if abandoned:
@@ -198,6 +199,11 @@ class DeliverySender:
             if until > time.time():
                 raise RetryDelivery(until - time.time(), chat)
         key = _operation_key(name, args, kwargs)
+        if name != 'create_forum_topic':
+            occurrence = self.operation_counts.get(key, 0)
+            self.operation_counts[key] = occurrence + 1
+            if occurrence:
+                key += ':' + str(occurrence)
         receipt = self.progress.setdefault('ops', {}).get(key)
         if receipt is not None:
             return ([SimpleNamespace(message_id=i) for i in receipt] if isinstance(receipt, list)
@@ -293,6 +299,7 @@ class DeliverySender:
 
     def _deliver(self):
         import forum_support as fs
+        self.operation_counts = {}
         with fs._mgmt_lock(self.bot_id):
             return self._deliver_locked()
 
@@ -329,7 +336,8 @@ class DeliverySender:
                 self._seal()
                 mids, thread = fs._relay_batch_to_topic(self.bot, self.bot_id, group,
                     m.from_user, m.chat.id, sources, msgs=messages, thread=thread)
-                mappings.extend((group[1], mid, thread, [src]) for mid, src in zip(mids, sources))
+                if len(mids) == len(sources):
+                    mappings.extend((group[1], mid, thread, [src]) for mid, src in zip(mids, sources))
             else:
                 self._seal()
                 mid, thread = fs._relay_to_topic(self.bot, self.bot_id, group, m.from_user,
@@ -341,13 +349,16 @@ class DeliverySender:
             self.payload_phase = True
             self._seal()
             failures = self.progress.setdefault('unavailable', [])
+            completed = False
             for aid in db_get_bot_admins(self.bot_id):
                 if aid in failures:
                     continue
                 try:
                     mids = self._private(aid, messages)
+                    completed = True
                     if rows[0]['media_group_id'] and len(rows) > 1:
-                        mappings.extend((aid, mid, 0, [src]) for mid, src in zip(mids, sources))
+                        if len(mids) == len(sources):
+                            mappings.extend((aid, mid, 0, [src]) for mid, src in zip(mids, sources))
                     else:
                         mappings.extend((aid, mid, 0, sources) for mid in mids)
                 except Exception as exc:
@@ -355,7 +366,7 @@ class DeliverySender:
                         raise
                     failures.append(aid)
                     self._save()
-            if not mappings:
+            if not completed:
                 raise BrokenDestination('Все администраторы недоступны')
         db_delivery_finish(rows, mappings)
         # Следующие функции (рабочее время/автоответы) подключаются сюда:
@@ -410,6 +421,8 @@ class DeliverySender:
     def pump(self, limit=1000):
         import forum_support as fs
         with self.lock:
+            from reply_queue import pump as pump_replies
+            pump_replies(self.bot, self.bot_id)
             if not self.fallback_recovered:
                 # Авария могла случиться между commit страховки и показом окна.
                 recovered = set()

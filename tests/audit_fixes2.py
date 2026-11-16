@@ -105,7 +105,7 @@ import payments
 payments.cb_create_invoice = lambda uid: None
 payments.cb_check_invoice = lambda iid: None
 payments.ton_check_transfer = lambda *a, **kw: False
-payments.get_ton_amount = lambda: 0.5
+payments.get_ton_amount = lambda quoted_price=None: 0.5
 H.cb_create_invoice = payments.cb_create_invoice
 H.cb_check_invoice = payments.cb_check_invoice
 H.ton_check_transfer = payments.ton_check_transfer
@@ -158,7 +158,7 @@ dcb(main_bot, ucb('buy_bot'))
 dmsg(main_bot, umsg(SUPER, TOKEN_TAKEN, 201))
 dmsg(main_bot, umsg(SUPER, str(SUPER), 202))
 check('при дубле токена показано «введи другой токен»',
-      any('уже зарегистрирован' in (txt or '') for _, txt in SEND_LOG))
+      any('Этот бот уже подключён, введи токен другого бота' in (txt or '') for _, txt in SEND_LOG))
 check('грант 3 дня НЕ израсходован после неудачи с дублем',
       db_peek_grant_days(SUPER) == 3, str(db_peek_grant_days(SUPER)))
 

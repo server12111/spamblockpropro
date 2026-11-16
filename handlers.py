@@ -72,6 +72,8 @@ def _replace_owned_token(owner_id, bot_id, expected, token, me, main_bot):
             try:
                 snapshot = db.db_replace_bot_token(bot_id, expected, token, me.username or '',
                                                     reset_group=str(me.id) != expected.split(':', 1)[0])
+                if not db.db_bot_can_run(bot_id):
+                    return f'{TE_CHECK} Токен обновлён, для запуска продли подписку'
                 if launch_bot(bot_id, token, info[1], main_bot):
                     return f'{TE_CHECK} Токен обновлён, бот @{me.username} запущен'
             except Exception:
@@ -81,7 +83,8 @@ def _replace_owned_token(owner_id, bot_id, expected, token, me, main_bot):
                 stop_bot(token)
                 if snapshot is not None:
                     db.db_restore_bot_token(bot_id, token, snapshot)
-                launch_bot(bot_id, expected, info[1], main_bot)
+                if db.db_bot_can_run(bot_id):
+                    launch_bot(bot_id, expected, info[1], main_bot)
             except Exception:
                 log.error('Не удалось восстановить запуск бота #%s', bot_id)
             return 'Не удалось запустить бота с новым токеном, оставлен прежний'
@@ -513,6 +516,7 @@ def register(bot: telebot.TeleBot):
                 _chk.execute('SELECT COUNT(*) FROM bots')
             finally:
                 _chk.close()
+            db.validate_restore(tmp_path)
             # бэкап текущей базы перед заменой.
             # Гейт: на время подмены файла доступ к БД всех остальных потоков
             # приостановлен (ждут в _conn), иначе параллельные операции писали
@@ -525,16 +529,20 @@ def register(bot: telebot.TeleBot):
                 if os.path.exists(DB_PATH):
                     _shutil.copy2(DB_PATH, backup_path)
                 os.replace(tmp_path, DB_PATH)  # атомарная замена
-                init_db()  # применяем миграции к восстановленной БД
+                try:
+                    init_db()
+                except Exception:
+                    db_close_all()
+                    _shutil.copy2(backup_path, DB_PATH)
+                    raise
             log.info(f'БД заменена; прежняя сохранена: {backup_path}')
             bot.send_message(m.chat.id,
-                f"<b>{TE_CHECK}  База данных восстановлена!</b>\n\n"
-                f"Перезапусти бота на BotHost чтобы загрузились все purchased-боты.",
+                f"<b>{TE_CHECK} База данных восстановлена</b>",
                 parse_mode='HTML', reply_markup=close_kb())
             log.info(f'DB restored from upload by SUPER_ADMIN, size={len(downloaded)} bytes')
         except Exception as e:
             log.error(f'DB restore error: {e}')
-            bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Ошибка восстановления: {e}</b>", parse_mode='HTML')
+            bot.send_message(m.chat.id, f"<b>{TE_CROSS} Не удалось восстановить базу данных</b>", parse_mode='HTML')
 
     # ── Backup / Restore через кнопки ────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'backup_db')
@@ -870,7 +878,7 @@ def register(bot: telebot.TeleBot):
         cur = state.get(cb.from_user.id)
         quoted_price = get_price()
         bot.answer_callback_query(cb.id, "⏳ Получаю курс TON...")
-        ton_amount = get_ton_amount()
+        ton_amount = get_ton_amount(quoted_price)
         if ton_amount <= 0:
             bot.answer_callback_query(cb.id, "❌ Не удалось получить курс TON.", show_alert=True)
             return
@@ -964,11 +972,12 @@ def register(bot: telebot.TeleBot):
                                         or (isinstance(state.get(m.from_user.id), dict)
                                             and state[m.from_user.id].get('step') == 'await_bot_token_free'))
     def get_bot_token(m):
+        if m.chat.type != 'private': return
         if not db_is_paid(m.from_user.id):
             _reset_flow(m.from_user.id)
             bot.send_message(m.chat.id, "Сначала оплати настройку бота")
             return
-        s = state.get(m.from_user.id)
+        s, revision = state.snapshot(m.from_user.id)
         is_trial = (s == 'await_bot_token_trial')
         is_free_coupon = isinstance(s, dict) and s.get('step') == 'await_bot_token_free'
         free_days = s.get('days', 30) if is_free_coupon else None
@@ -985,10 +994,10 @@ def register(bot: telebot.TeleBot):
             bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Токен недействителен. Проверь и введи правильный:</b>",
                 parse_mode='HTML')
             return
-        state[m.from_user.id] = {'step': 'await_admin_id', 'token': token_val,
+        if not state.transition(m.from_user.id, revision, {'step': 'await_admin_id', 'token': token_val,
                                   'username': me.username or '',
                                   'trial': is_trial,
-                                  'free_days': free_days}
+                                  'free_days': free_days}): return
         bot.send_message(m.chat.id,
             f"<b>{TE_USER} Теперь введи свой Telegram ID\n"
             "(сообщения от пользователей будут приходить именно тебе)\n\n"
@@ -998,39 +1007,40 @@ def register(bot: telebot.TeleBot):
     @bot.message_handler(func=lambda m: isinstance(state.get(m.from_user.id), dict)
                                         and state[m.from_user.id].get('step') == 'await_admin_id')
     def get_admin_id(m):
+        if m.chat.type != 'private': return
+        s, revision = state.snapshot(m.from_user.id)
+        if not isinstance(s, dict) or s.get('step') != 'await_admin_id': return
         try:
             admin_id_val = int(m.text.strip())
         except ValueError:
             bot.send_message(m.chat.id, f"<b>{TE_CROSS}  ID должен быть числом. Попробуй ещё раз:</b>",
                 parse_mode='HTML')
             return
-        s         = state.pop(m.from_user.id)
         token_val = s['token']
         uname     = s.get('username', '')
         if not db_is_paid(m.from_user.id):
             bot.send_message(m.chat.id, "Сначала оплати настройку бота")
             return
         try:
-            bot_db_id = db_register_paid_bot(m.from_user.id, token_val, admin_id_val)
+            bot_db_id = db_register_paid_bot(m.from_user.id, token_val, admin_id_val, revision=revision)
+            if bot_db_id is None: return
         except sqlite3.IntegrityError:
             # именно занятый токен (UNIQUE): возвращаем юзера к вводу, грант не тронут
             if s.get('free_days'):
-                state[m.from_user.id] = {'step': 'await_bot_token_free', 'days': s['free_days']}
+                retry_state = {'step': 'await_bot_token_free', 'days': s['free_days']}
             elif s.get('trial'):
-                state[m.from_user.id] = 'await_bot_token_trial'
+                retry_state = 'await_bot_token_trial'
             else:
-                state[m.from_user.id] = 'await_bot_token'
+                retry_state = 'await_bot_token'
+            if not state.transition(m.from_user.id, revision, retry_state): return
             bot.send_message(m.chat.id,
-                f"<b>{TE_CROSS}  Этот токен уже зарегистрирован. Введи другой токен:</b>", parse_mode='HTML')
+                f"<b>{TE_CROSS} Этот бот уже подключён, введи токен другого бота</b>", parse_mode='HTML')
             return
         except Exception as e:
             # другая причина (сбой БД и т.п.) — не вводим юзера в заблуждение;
             # возвращаем состояние await_admin_id, чтобы ID можно было отправить снова
             log.warning(f'db_add_bot failed for {m.from_user.id}: {e}')
-            state[m.from_user.id] = {
-                'step': 'await_admin_id', 'token': token_val,
-                'username': uname, 'trial': s.get('trial', False),
-                'free_days': s.get('free_days')}
+            if not state.transition(m.from_user.id, revision, s): return
             bot.send_message(m.chat.id,
                 f"<b>{TE_CROSS} Не удалось подключить бота — отправь ID ещё раз через минуту</b>",
                 parse_mode='HTML')

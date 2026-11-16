@@ -146,8 +146,11 @@ def send(bot, job_id, bid, uid):
             sent = getattr(bot, 'send_' + m.content_type)(uid, _file(job_id, bid, source), **options)
             _remember(job_id, bid, m, sent)
             return
-        # Типы без файлов также остаются доступны (контакт, геопозиция, опрос)
-        bot.copy_message(uid, m.chat.id, m.message_id)
+        # ID сообщений принадлежат истории конкретного бота
+        # Типы без файлов восстанавливаем из сохранённого содержимого
+        from forum_support import _resend_by_type
+        if _resend_by_type(bot, uid, None, m, api=lambda fn, *a, **k: fn(*a, **k)) is None:
+            raise ValueError('Этот тип сообщения недоступен для рассылки')
     # У купленных ботов общий premium guard; главный бот тоже может получить отказ
     try:
         deliver()

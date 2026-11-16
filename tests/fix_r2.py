@@ -217,8 +217,9 @@ def construction_cleanup():
     original = q.telebot.TeleBot
     def create(*a, **kw):
         bot = original(*a, **kw); pool.append(bot); return bot
+    bid = db.db_add_bot(777, '190000:FAKE', 777)
     with patch.object(pb.telebot, 'TeleBot', side_effect=create), patch.object(pb, 'register_forum_support', side_effect=RuntimeError):
-        assert not pb.launch_bot(90000, '190000:FAKE', 777)
+        assert not pb.launch_bot(bid, '190000:FAKE', 777)
     assert pool and all(not w.is_alive() for b in pool for w in b.worker_pool.workers)
 
 

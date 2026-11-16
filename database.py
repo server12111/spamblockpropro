@@ -194,8 +194,15 @@ def subscription_days_left(expires_at, now=None):
     expires = datetime.fromisoformat(str(expires_at))
     return math.ceil((expires - (now or datetime.now())).total_seconds() / 86400)
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH, timeout=15)
+def init_db(path=None, *, schema=False):
+    conn = sqlite3.connect(path or DB_PATH, timeout=15)
+    try:
+        return _init_db_connection(conn, schema=schema)
+    finally:
+        conn.close()
+
+
+def _init_db_connection(conn, *, schema=False):
     try:
         # WAL требует mmap (-shm) и на некоторых хостингах даёт 'disk I/O error' —
         # используем классический journal-режим: надёжно на любом хранилище.
@@ -514,6 +521,11 @@ def init_db():
             PRIMARY KEY(job_id,bot_id,source_id));
     ''')
     conn.commit()
+    conn.execute('CREATE TABLE IF NOT EXISTS reply_queue ('
+                 'id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER NOT NULL, '
+                 'source_key TEXT NOT NULL, payload TEXT NOT NULL, progress TEXT DEFAULT "{}", '
+                 'next_at REAL DEFAULT 0, attempts INTEGER DEFAULT 0, status TEXT DEFAULT "pending", '
+                 'UNIQUE(bot_id,source_key))')
     # Миграции для старых схем (безопасны и повторяемы)
     for stmt in [
         'ALTER TABLE bots ADD COLUMN username TEXT DEFAULT ""',
@@ -560,7 +572,33 @@ def init_db():
                  'LEFT JOIN bot_grants g ON g.user_id=p.user_id '
                  'WHERE NOT EXISTS (SELECT 1 FROM setup_grants s WHERE s.user_id=p.user_id)')
     conn.commit()
-    conn.close()
+    result = {name: {r[1] for r in conn.execute('PRAGMA table_info("' + name + '")')}
+              for name, in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if schema:
+        return result
+
+
+def validate_restore(path):
+    """Миграции и проверка всех столбцов выполняются до замены рабочей БД"""
+    expected = init_db(':memory:', schema=True)
+    actual = init_db(path, schema=True)
+    if any(not columns <= actual.get(table, set()) for table, columns in expected.items()):
+        raise ValueError('Несовместимая база данных')
+
+
+def db_bot_can_run(bot_id):
+    c = _conn()
+    try:
+        row = c.execute('SELECT active,expires_at FROM bots WHERE id=?', (bot_id,)).fetchone()
+        if not row or not row[0]: return False
+        return not row[1] or datetime.fromisoformat(str(row[1])) > datetime.now()
+    finally: c.close()
+
+
+def ensure_bot_identity(c, token, exclude=0):
+    if c.execute('SELECT 1 FROM bots WHERE id<>? AND (token=? OR token LIKE ?)',
+                 (exclude, token, token.split(':', 1)[0] + ':%')).fetchone():
+        raise sqlite3.IntegrityError('Этот бот уже подключён')
 
 # ── Устойчивая очередь доставки ─────────────────────────
 def db_delivery_rows(bot_id, active=True):
@@ -743,9 +781,7 @@ def db_replace_bot_token(bot_id, expected, token, username, reset_group=False):
         c.execute('BEGIN IMMEDIATE')
         previous = c.execute('SELECT token,username FROM bots WHERE id=?', (bot_id,)).fetchone()
         if not previous or previous[0] != expected: raise ValueError('Токен уже изменён. Открой список ботов заново')
-        if c.execute('SELECT 1 FROM bots WHERE id<>? AND (token=? OR token LIKE ?)',
-                     (bot_id, token, token.split(':', 1)[0] + ':%')).fetchone():
-            raise ValueError('Этот бот уже подключён')
+        ensure_bot_identity(c, token, bot_id)
         snapshot = dict(previous=previous, tables={})
         if reset_group:
             for table in ('fs_groups', 'fs_topics', 'fs_msgs', 'delivery_sources'):
@@ -988,13 +1024,14 @@ def db_support_notification_retry(bot_id, row, next_at):
 def db_add_bot(owner_id, token, admin_id, days: int = 30):
     expires = datetime.now() + timedelta(days=days)
     c = _conn()
-    c.execute(
-        'INSERT INTO bots (owner_id, token, admin_id, expires_at) VALUES (?,?,?,?)',
-        (owner_id, token, admin_id, expires.isoformat())
-    )
-    row_id = c.execute('SELECT last_insert_rowid()').fetchone()[0]
-    c.commit(); c.close()
-    return row_id
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        ensure_bot_identity(c, token)
+        cur = c.execute('INSERT INTO bots (owner_id, token, admin_id, expires_at) VALUES (?,?,?,?)',
+                        (owner_id, token, admin_id, expires.isoformat()))
+        c.commit()
+        return cur.lastrowid
+    finally: c.close()
 
 def db_get_all_bots():
     c = _conn()
@@ -1292,6 +1329,17 @@ class DBState:
         try:
             cur = c.execute('DELETE FROM states WHERE bot_id=? AND user_id=? AND revision=?',
                             (self.bot_id, user_id, revision))
+            c.commit()
+            return bool(cur.rowcount)
+        finally: c.close()
+
+    def transition(self, user_id, revision, value):
+        """CAS переход: запоздавшая операция не восстанавливает отменённый диалог"""
+        c = _conn()
+        try:
+            cur = c.execute('UPDATE states SET state=?,revision=?,updated_at=CURRENT_TIMESTAMP '
+                            'WHERE bot_id=? AND user_id=? AND revision=?',
+                            (json.dumps(value), uuid.uuid4().hex, self.bot_id, user_id, revision))
             c.commit()
             return bool(cur.rowcount)
         finally: c.close()
@@ -1644,8 +1692,8 @@ def db_spend_balance(bot_id, owner_id, amount, operation_key, *, address=None, d
             current = c.execute('SELECT state FROM states WHERE bot_id=? AND user_id=?', (bot_id, owner_id)).fetchone()
             if not current or json.loads(current[0]) != state:
                 return None
-        if not c.execute('UPDATE bot_earnings SET balance_usdt=balance_usdt-? '
-                         'WHERE bot_id=? AND balance_usdt>=?', (amount, bot_id, amount)).rowcount:
+        if not c.execute('UPDATE bot_earnings SET balance_usdt=ROUND(balance_usdt-?,10) '
+                         'WHERE bot_id=? AND ROUND(balance_usdt,10)>=?', (amount, bot_id, amount)).rowcount:
             return None
         if days is not None:
             result = renew_in_transaction(c, bot_id, days).isoformat()

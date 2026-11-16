@@ -7,11 +7,12 @@ import math
 import re
 import json
 import uuid
+from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 from html.parser import HTMLParser
 from datetime import timedelta, timezone
 import database as db
 from safe_logging import register_secret
-from telegram_text import send_long, edit_html, protect_text_lengths
+from telegram_text import edit_html, protect_text_lengths
 from datetime import datetime
 from functools import wraps
 from types import SimpleNamespace
@@ -63,6 +64,16 @@ def _is_rate_limited(bot_id: int, user_id: int) -> bool:
     """Единый rate limit (кэш и логика в forum_support.rate_limited)."""
     return rate_limited(bot_id, user_id, mark=True)
 
+
+def balance_renewal_quote(balance, price, days=None):
+    balance = Decimal(str(round(balance, 10)))
+    price = Decimal(str(price))
+    if price <= 0: return 0, 0.0
+    if days is None:
+        days = int((balance * 30 / price).to_integral_value(rounding=ROUND_FLOOR))
+    cost = (price * days / 30).quantize(Decimal('0.0000000001'), rounding=ROUND_CEILING)
+    return days, float(cost)
+
 def _retry_send(send):
     """Лимит Telegram откладывает доставку, а не пропускает получателя"""
     from telegram_text import retry_telegram
@@ -85,6 +96,9 @@ def _close_bot(bot):
     sender = getattr(bot, '_delivery_sender', None)
     if sender is not None:
         sender.stop()
+    replies = getattr(bot, '_reply_sender', None)
+    if replies is not None:
+        replies.stop_event.set()
     bot.stop_bot()
 
 @_serialize_lifecycle
@@ -207,10 +221,14 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
     flow_lock = threading.RLock()
     faq_input = {}
 
-    def _set_flow(uid, state):
+    def _set_flow(uid, state, revision=None):
         with flow_lock:
+            if revision is not None and not pstate.transition(uid, revision, state):
+                return False
             faq_input.pop(uid, None)
-            pstate[uid] = state
+            if revision is None:
+                pstate[uid] = state
+            return True
 
     def _reset_flow(uid):
         with flow_lock:
@@ -260,9 +278,6 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             log.error(f'Bot #{db_bot_id} handler exception: {e}', exc_info=True)
             return True
     pbot.exception_handler = _ChildEH()
-
-    def _send_long(chat, header, body, reply_markup=None):
-        return send_long(pbot, chat, header, body, reply_markup)
 
     def get_welcome():
         return db_get_bot_setting(db_bot_id, 'welcome', DEFAULT_WELCOME)
@@ -545,7 +560,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             elif action in ('new_phrases', 'phrases'):
                 phrases = parse_phrases(m.text)
                 if action == 'new_phrases':
-                    _set_flow(m.from_user.id, dict(step='support_input', action='new_answer', phrases=phrases, back='ps_rules_0'))
+                    if not _set_flow(m.from_user.id, dict(step='support_input', action='new_answer', phrases=phrases, back='ps_rules_0'), revision): return
                     kb = InlineKeyboardMarkup(); kb.add(_pbtn('Отмена', icon='❌', callback_data='ps_rules_0'))
                     pbot.send_message(m.chat.id, 'Введи текст ответа. Форматирование сохраняется', reply_markup=kb)
                     return
@@ -1069,18 +1084,14 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         tpl_id    = int(parts[4])
         text = db_get_template(tpl_id, db_bot_id)
         if not text:
-            pbot.answer_callback_query(cb.id, "❌ Шаблон не знайдено", show_alert=True)
+            pbot.answer_callback_query(cb.id, "❌ Шаблон не найден", show_alert=True)
             return
         _take_flow(cb.from_user.id, 'await_reply_')
-        try:
-            _send_long(target_id, f"<b>{TE_INBOX} Сообщение от администратора</b>", text)
-        except Exception:
-            pbot.answer_callback_query(cb.id, "❌ Не удалось отправить — пользователь недоступен",
-                show_alert=True)
-            return
-        _edit(f"<b>{TE_CHECK}  Ответ по шаблону отправлен</b>",
-            cb.message.chat.id, cb.message.message_id,
-            parse_mode='HTML', reply_markup=pk_close())
+        from reply_queue import enqueue
+        status, _ = enqueue(pbot, db_bot_id, f'template:{cb.id}',
+                            dict(mode='text', target=target_id, text=text, notify=cb.from_user.id))
+        if status == 'pending':
+            pbot.answer_callback_query(cb.id, 'Ответ сохранён, отправлю позже')
 
     @pbot.callback_query_handler(func=lambda c: c.data.startswith('p_add_tpl_'))
     def p_add_template_start(cb):
@@ -1149,20 +1160,11 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         state = _take_flow(m.from_user.id, 'await_reply_')
         if state is None: return
         target_id = int(state.split('_')[-1])
-        try:
-            _send_long(target_id,
-                       f"<b>{TE_INBOX} Сообщение от администратора</b>", m.text or '')
-        except Exception as e:
-            # адресат недоступен: сообщаем и снимаем состояние, чтобы админ
-            # не застрял в режиме ответа без всякого фидбека
-            log.warning(f'p_admin_text bot#{db_bot_id} → {target_id}: {e}')
-            pbot.send_message(m.chat.id,
-                f"<b>{TE_CROSS}  Не удалось доставить ответ: пользователь недоступен "
-                f"(заблокировал бота или удалил аккаунт).</b>",
-                parse_mode='HTML', reply_markup=pk_close())
-            return
-        pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Ответ отправлен</b>",
-            parse_mode='HTML', reply_markup=pk_close())
+        from reply_queue import enqueue
+        status, _ = enqueue(pbot, db_bot_id, f'private:{m.chat.id}:{m.message_id}',
+                            dict(mode='text', target=target_id, text=m.text or '', notify=m.chat.id))
+        if status == 'pending':
+            pbot.send_message(m.chat.id, 'Ответ сохранён, отправлю позже', reply_markup=pk_close())
 
     reply_albums = {}
     reply_album_routes = {}
@@ -1178,17 +1180,14 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                 continue
             from telegram_text import ordered_album
             ids = ordered_album(set(batch['ids']), key=int)
-            from forum_support import _batch_message_ids
-            ok = _retry_send(lambda: _batch_message_ids(
-                pbot.copy_messages(batch['target'], batch['admin'], ids), ids))
-            pbot.send_message(batch['admin'],
-                f'{TE_CHECK} Ответ отправлен' if ok else f'{TE_EXCLAM} Не удалось доставить альбом, отправь ещё раз',
-                parse_mode='HTML', reply_markup=pk_close())
+            from reply_queue import enqueue
+            enqueue(pbot, db_bot_id, f"album:{batch['admin']}:{ids}",
+                    dict(mode='album', target=batch['target'], chat=batch['admin'], ids=ids, notify=batch['admin']))
 
     pbot._flush_reply_albums = flush_reply_albums
 
     @pbot.message_handler(
-        content_types=['photo'],
+        content_types=['photo', 'video', 'document', 'audio', 'animation', 'voice', 'video_note', 'sticker', 'contact', 'location', 'venue', 'poll'],
         func=lambda m: isinstance(pstate.get(m.from_user.id), str)
                        and pstate[m.from_user.id].startswith('await_reply_')
                        or (m.from_user.id, m.media_group_id) in reply_album_routes
@@ -1218,24 +1217,9 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         state = _take_flow(m.from_user.id, 'await_reply_')
         if state is None: return
         target_id = int(state.split('_')[-1])
-        caption = m.caption or ''
-        try:
-            if len(caption) > 900:
-                # подпись > лимита Telegram (1024): фото отдельно + текст отдельно
-                pbot.send_photo(target_id, m.photo[-1].file_id)
-                _send_long(target_id, f"<b>{TE_INBOX} Сообщение от администратора</b>", caption)
-            else:
-                cap_text = f"<b>{TE_INBOX} Сообщение от администратора</b>\n\n{html.escape(caption)}" if caption else f"<b>{TE_INBOX} Сообщение от администратора</b>"
-                pbot.send_photo(target_id, m.photo[-1].file_id, caption=cap_text, parse_mode='HTML')
-        except Exception as e:
-            log.warning(f'p_admin_photo_reply bot#{db_bot_id} → {target_id}: {e}')
-            pbot.send_message(m.chat.id,
-                f"<b>{TE_CROSS}  Не удалось отправить фото: пользователь недоступен "
-                f"(заблокировал бота или удалил аккаунт).</b>",
-                parse_mode='HTML', reply_markup=pk_close())
-            return
-        pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Фото отправлено</b>",
-            parse_mode='HTML', reply_markup=pk_close())
+        from reply_queue import enqueue
+        enqueue(pbot, db_bot_id, f'private:{m.chat.id}:{m.message_id}',
+                dict(mode='media', target=target_id, message=m.json, notify=m.chat.id))
 
     # ── Блокировка ─────────────────────────────────────
     @pbot.callback_query_handler(func=lambda c: c.data.startswith('p_block_'))
@@ -1541,11 +1525,11 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             return
         from database import get_price as _get_price
         price = _get_price()
-        max_days_full = int((balance / price) * 30) if price > 0 else 0
+        max_days_full, _ = balance_renewal_quote(balance, price)
         kb = InlineKeyboardMarkup()
         options = []
         for days_opt in [30, 90, 180]:
-            cost = round(price * days_opt / 30, 4)
+            _, cost = balance_renewal_quote(balance, price, days_opt)
             if balance >= cost:
                 kb.add(_pbtn(
                     f'{days_opt} дней ({cost} USDT)',
@@ -1554,7 +1538,10 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                 options.append(days_opt)
         if balance > 0 and max_days_full > 0:
             kb.add(_pbtn(
-                f'На весь баланс (~{max_days_full} дней)',
+                f'На весь баланс ({max_days_full} ' + (
+                    'день' if max_days_full % 10 == 1 and max_days_full % 100 != 11 else
+                    'дня' if 2 <= max_days_full % 10 <= 4 and not 12 <= max_days_full % 100 <= 14 else
+                    'дней') + ')',
                 icon='💰',
                 style='success',
                 callback_data='p_renew_bal_all'))
@@ -1573,6 +1560,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             parse_mode='HTML', reply_markup=kb)
 
     @pbot.callback_query_handler(func=lambda c: c.data.startswith('p_renew_bal_'))
+    @_serialize_lifecycle
     def p_renew_bal_cb(cb):
         if not _require_owner(cb): return
         from database import get_price as _get_price
@@ -1580,11 +1568,10 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         price = _get_price()
         arg = cb.data.split('_')[-1]
         if arg == 'all':
-            days = int((balance / price) * 30) if price > 0 else 0
-            cost = balance
+            days, cost = balance_renewal_quote(balance, price)
         else:
-            days = int(arg)
-            cost = round(price * days / 30, 4)
+            if arg not in ('30', '90', '180'): return
+            days, cost = balance_renewal_quote(balance, price, int(arg))
         if days <= 0:
             pbot.answer_callback_query(cb.id, "❌ Недостаточно средств", show_alert=True)
             return
@@ -1597,6 +1584,9 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             if new_exp is None:
                 pbot.answer_callback_query(cb.id, '❌ Недостаточно средств', show_alert=True)
                 return
+            info = db_get_bot_info(db_bot_id)
+            if info and info[0] not in running_bots:
+                launch_bot(db_bot_id, info[0], info[1], main_bot)
         except Exception as e:
             log.warning(f'p_renew_bal renew failed bot#{db_bot_id}: {e}')
             pbot.answer_callback_query(cb.id,
@@ -1653,6 +1643,22 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             parse_mode='HTML', reply_markup=pk_close())
 
     # ── Forum Topics: техподдержка через группу с темами ─────────
+    def revoked_input(m):
+        current = pstate.get(m.from_user.id)
+        privileged = (isinstance(current, str) and (
+            current in ('mgadd_tpl','p_bcast_text','p_bcast_photo','p_await_new_admin','p_await_primary')
+            or current.startswith(('await_reply_', 'await_add_tpl_')))
+            or isinstance(current, dict) and current.get('step') == 'support_input')
+        if not privileged: return False
+        return not is_admin(m.from_user.id)
+
+    def release_revoked_input(m):
+        _reset_flow(m.from_user.id)
+        _deliver_direct(m)
+
+    pbot.message_handlers.insert(0, dict(function=release_revoked_input,
+        filters=dict(func=revoked_input, content_types=['text','photo','video','document','audio','voice','video_note','sticker','animation','contact','location','venue','poll']),
+        pass_bot=False))
     # Все обработчики личной панели ограничены личным чатом одним правилом
     # Группы и темы всегда проходят через форумную маршрутизацию
     for handler in pbot.message_handlers:
@@ -1675,6 +1681,7 @@ cb_from_user_id_placeholder = -1
 
 @_serialize_lifecycle
 def launch_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None) -> bool:
+    if not db.db_bot_can_run(db_bot_id): return False
     existing_token = running_bot_ids.get(db_bot_id)
     if existing_token is not None and existing_token != token:
         return False

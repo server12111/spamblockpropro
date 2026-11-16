@@ -64,10 +64,11 @@ def get_ton_price_usd() -> float:
         log.error(f'get_ton_price_usd error: {e}')
     return 0.0
 
-def get_ton_amount() -> float:
+def get_ton_amount(quoted_price=None) -> float:
+    quoted_price = get_price() if quoted_price is None else quoted_price
     price = get_ton_price_usd()
     if price <= 0: return 0.0
-    return round(get_price() / price, 4)
+    return round(quoted_price / price, 4)
 
 def ton_payment_link(ton_amount: float, payment_code: str) -> str:
     nanotons = int(ton_amount * 1_000_000_000)
