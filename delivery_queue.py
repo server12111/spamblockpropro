@@ -351,7 +351,12 @@ class DeliverySender:
         # обращение уже доставлено и зафиксировано до любого ответа пользователю.
         after = getattr(self.bot, '_after_delivery', None)
         if after:
-            after(messages, group, mappings)
+            try:
+                after(messages, group, mappings)
+            except Exception:
+                # Служебный ответ никогда не возвращает доставленное обращение
+                # в pending и не создаёт повторной доставки администраторам.
+                log.warning('Не удалось подготовить автоответ бота #%s', self.bot_id)
 
     def _private(self, aid, messages):
         import forum_support as fs
@@ -409,6 +414,9 @@ class DeliverySender:
             _context.sender = self
             processed = 0
             try:
+                notifications = getattr(self.bot, '_pump_notifications', None)
+                if notifications:
+                    notifications()
                 if time.time() - self.last_cleanup > 3600:
                     db_delivery_cleanup(self.bot_id)
                     self.last_cleanup = time.time()
@@ -434,6 +442,8 @@ class DeliverySender:
                     try:
                         self._deliver()
                         processed += len(ids)
+                        if notifications:
+                            notifications()
                     except RetryDelivery as retry:
                         # Если payload ещё не доставляли, разрешаем склейку с
                         # поступившими за retry_after текстами. Квитанции служебных

@@ -1486,11 +1486,13 @@ def fs_pin_callback(pbot, bot_id: int, cb):
         pbot.answer_callback_query(cb.id)
 
 
-def _topic_notice(pbot, chat_id: int, thread: int, text: str):
+def _topic_notice(pbot, chat_id: int, thread: int, text: str, *, strict=False):
     """Служебное сообщение в теме (не попадает в fs_msgs → на него нельзя «ответить»)."""
     try:
-        pbot.send_message(chat_id, text, parse_mode='HTML', message_thread_id=thread)
+        return pbot.send_message(chat_id, text, parse_mode='HTML', message_thread_id=thread)
     except Exception as e:
+        if strict:
+            raise
         log.warning(f'topic notice {chat_id}/{thread}: {e}')
 
 

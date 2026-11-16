@@ -4,10 +4,16 @@ import threading
 import time
 import logging
 import math
+import re
+import json
+from html.parser import HTMLParser
+from datetime import timedelta, timezone
+import database as db
 from safe_logging import register_secret
 from telegram_text import send_long, edit_html, protect_text_lengths
 from datetime import datetime
 from functools import wraps
+from types import SimpleNamespace
 from database import subscription_days_left
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from keyboards import _ICON, TE_ANNOUNCE, TE_BLOCK, TE_CALENDAR, TE_CHART, TE_CHAT, TE_CHECK, TE_CLOCK, TE_CROSS, TE_CROWN, TE_DIAMOND, TE_DOLLAR, TE_EXCLAM, TE_FIRE, TE_GIFT, TE_GREEN, TE_HOURGLASS, TE_ID, TE_INBOX, TE_KEYBOARD, TE_LINK, TE_MAIL, TE_MASKS, TE_MIC, TE_MONEY, TE_NOTE, TE_PENCIL, TE_PICTURE, TE_PLUS, TE_REFRESH, TE_ROBOT, TE_ROCKET, TE_SEND, TE_STATS, TE_USER, TE_USERS, TE_VIDEO
@@ -102,6 +108,88 @@ def stop_bot(token: str) -> bool:
 
 DEFAULT_WELCOME = (f"<b>{TE_ROBOT} Привет! Это бот обратной связи.\n\n"
                    f"{TE_CHAT} Отправь своё сообщение и администратор обязательно его прочитает.</b>")
+DEFAULT_SENT = f'<b>{TE_CHECK}  Сообщение отправлено</b>'
+DEFAULT_OFFHOURS = f'{TE_CLOCK} Поддержка работает с {{start}} до {{end}}\nОжидайте ответ в течение {{wait}}'
+TEXTS = {'welcome': ('Приветствие', DEFAULT_WELCOME),
+         'txt_sent': ('Сообщение отправлено', DEFAULT_SENT),
+         'txt_offhours': ('Нерабочее время', DEFAULT_OFFHOURS)}
+
+
+def validate_support_html(text, limit=4096):
+    if not text or len(text.encode('utf-16-le')) // 2 > limit:
+        raise ValueError(f'Текст должен содержать от 1 до {limit} символов')
+    class Validator(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=False)
+            self.stack = []
+        def handle_starttag(self, tag, attrs):
+            if tag not in ('b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del',
+                           'a', 'code', 'pre', 'span', 'tg-spoiler', 'tg-emoji', 'blockquote'):
+                raise ValueError('Некорректный HTML: проверь теги и их закрытие')
+            self.stack.append(tag)
+        def handle_endtag(self, tag):
+            if not self.stack or self.stack.pop() != tag:
+                raise ValueError('Некорректный HTML: проверь теги и их закрытие')
+        def handle_startendtag(self, tag, attrs):
+            raise ValueError('Некорректный HTML: проверь теги и их закрытие')
+    parser = Validator()
+    parser.feed(text)
+    parser.close()
+    if parser.stack:
+        raise ValueError('Некорректный HTML: проверь теги и их закрытие')
+
+
+def support_schedule(bot_id, now=None):
+    """Интервалы начинаются в отмеченный день, ночные заканчиваются на следующий."""
+    get = lambda key, default: db_get_bot_setting(bot_id, 'hours_' + key, default)
+    tz = timezone(timedelta(hours=int(get('tz', '3'))))
+    local = datetime.fromtimestamp(time.time() if now is None else now, tz)
+    days = {int(d) for d in get('days', '0,1,2,3,4').split(',') if d}
+    start, end = int(get('start', '10')), int(get('end', '19'))
+    intervals = []
+    for delta in range(-1, 9):
+        date = local.date() + timedelta(days=delta)
+        if date.weekday() in days:
+            begin = datetime.combine(date, datetime.min.time(), tz) + timedelta(hours=0 if start == end else start)
+            finish = begin + timedelta(hours=(end - start) % 24 or 24)
+            intervals.append((begin, finish))
+    enabled = get('enabled', '0') == '1'
+    working = not enabled or any(a <= local < b for a, b in intervals)
+    next_start = next((a for a, b in intervals if a > local), None)
+    hours = math.ceil(((next_start - local).total_seconds() if next_start else 0) / 3600 + 6)
+    return dict(enabled=enabled, working=working, days=days, start=f'{start:02}:00', end=f'{end:02}:00',
+                tz=int(get('tz', '3')), wait=hour_words(hours))
+
+
+def hour_words(n):
+    word = 'час' if n % 10 == 1 and n % 100 != 11 else (
+        'часа' if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else 'часов')
+    return f'{n} {word}'
+
+
+def offhours_text(bot_id, schedule):
+    text = db_get_bot_setting(bot_id, 'txt_offhours', DEFAULT_OFFHOURS)
+    # Только известные подстановки: скобки пользователя не интерпретируются.
+    return re.sub(r'\{(start|end|wait)\}', lambda m: schedule[m[1]], text)
+
+
+def normalize_phrase(text):
+    return ' '.join(re.findall(r'[^\W_]+', (text or '').casefold().replace('ё', 'е'), re.UNICODE))
+
+
+def parse_phrases(text):
+    phrases = [s.strip() for s in re.split(r'[,\n]', text or '') if s.strip()]
+    if not 1 <= len(phrases) <= 20 or any(not 2 <= len(s) <= 50 or not normalize_phrase(s) for s in phrases):
+        raise ValueError('Укажи от 1 до 20 фраз по 2–50 символов через запятую или с новой строки')
+    return phrases
+
+
+def matching_rules(bot_id, text, schedule=None):
+    schedule = schedule or support_schedule(bot_id)
+    normalized = ' ' + normalize_phrase(text) + ' '
+    return [r for r in db.db_auto_rules(bot_id)
+            if (not r['offhours'] or (schedule['enabled'] and not schedule['working']))
+            and any(' ' + normalize_phrase(s) + ' ' in normalized for s in r['phrases'])]
 
 def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None):
     register_secret(token)
@@ -109,13 +197,16 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     pstate = DBState(db_bot_id)
     protect_text_lengths(pbot)
     flow_lock = threading.RLock()
+    faq_input = {}
 
     def _set_flow(uid, state):
         with flow_lock:
+            faq_input.pop(uid, None)
             pstate[uid] = state
 
     def _reset_flow(uid):
         with flow_lock:
+            faq_input.pop(uid, None)
             state = pstate.pop(uid, None)
             return state
 
@@ -204,6 +295,8 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     # ── Клавиатуры ─────────────────────────────────────
     def pk_start(show_admin: bool = False):
         kb = InlineKeyboardMarkup()
+        if db.db_faq_nodes(db_bot_id):
+            kb.add(_pbtn('FAQ', callback_data='fq_u_0_0'))
         kb.add(_pbtn('Отправить сообщение', icon='📤', style='primary', callback_data='p_send'))
         if show_admin:
             kb.add(_pbtn('Панель админа', style='primary', callback_data='p_open_admin'))
@@ -255,17 +348,21 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         )
         return kb
 
-    def pk_admin():
+    def pk_admin(uid=None):
         kb = InlineKeyboardMarkup()
         kb.row(
             _pbtn('Статистика',  style='primary', callback_data='p_stats'),
             _pbtn('Мой баланс',  style='success', callback_data='p_balance'),
         )
         kb.add(_pbtn('Рассылка', style='primary', callback_data='p_broadcast'))
-        kb.row(
-            _pbtn('Приветствие', style='primary', callback_data='p_edit_welcome'),
-            _pbtn('Шаблоны',     style='primary', callback_data='p_admin_templates'),
-        )
+        if is_primary_admin(uid):
+            kb.row(_pbtn('Тексты', callback_data='ps_texts'),
+                   _pbtn('Рабочее время', callback_data='ps_hours'))
+            kb.row(_pbtn('Автоответы', callback_data='ps_rules_0'),
+                   _pbtn('Шаблоны', callback_data='p_admin_templates'))
+            kb.add(_pbtn('FAQ', callback_data='fq_e_0_0'))
+        else:
+            kb.add(_pbtn('Шаблоны', callback_data='p_admin_templates'))
         kb.add(_pbtn('Группа техподдержки', icon='💬', style='primary', callback_data='fs_group_menu'))
         kb.add(_pbtn('Заблокированные',     style='primary', callback_data='p_blocked_list'))
         kb.add(_pbtn('Управление админами', style='primary', callback_data='p_admins'))
@@ -279,6 +376,360 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             _pbtn('Отмена',      icon='❌', style='primary', callback_data='p_cancel_delete'),
         )
         return kb
+
+    def settings_access(event):
+        if is_primary_admin(event.from_user.id):
+            return True
+        _reset_flow(event.from_user.id)
+        if isinstance(event, telebot.types.CallbackQuery):
+            pbot.answer_callback_query(event.id, 'Доступно только главному админу', show_alert=True)
+        else:
+            pbot.send_message(event.chat.id, 'Доступно только главному админу')
+        return False
+
+    def settings_show(cb, text, rows):
+        kb = InlineKeyboardMarkup()
+        for row in rows:
+            kb.row(*[_pbtn(label, callback_data=data) for label, data in row])
+        _edit(text, cb.message.chat.id, cb.message.message_id, kb)
+
+    def settings_input(cb, step, prompt, back, **values):
+        _set_flow(cb.from_user.id, dict(step='support_input', action=step, back=back, **values))
+        settings_show(cb, prompt, [[('Отмена', back)]])
+
+    def show_text(cb, key):
+        title, default = TEXTS[key]
+        current = db_get_bot_setting(db_bot_id, key, default)
+        from telegram_text import html_chunks
+        preview = html_chunks(current, 3500)[0]
+        settings_show(cb, f'<b>{title}</b>\n\n{preview}', [
+            [('Изменить', 'ps_edit_' + key), ('Сбросить', 'ps_reset_' + key)], [('Назад', 'ps_texts')]])
+
+    def show_hours(cb):
+        s = support_schedule(db_bot_id)
+        rows = [[('Включено' if s['enabled'] else 'Выключено', 'ps_hours_toggle')]]
+        labels = ('Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс')
+        for i in range(0, 7, 4):
+            rows.append([(('✅ ' if d in s['days'] else '') + labels[d], f'ps_day_{d}') for d in range(i, min(i + 4, 7))])
+        rows += [[('С ' + s['start'], 'ps_grid_start'), ('До ' + s['end'], 'ps_grid_end')],
+                 [(f"Часовой пояс: UTC{s['tz']:+}", 'ps_grid_tz')], [('Назад', 'p_back_admin')]]
+        settings_show(cb, '<b>Рабочее время</b>\n' + ('Включено' if s['enabled'] else 'Выключено'), rows)
+
+    def show_rules(cb, page=0):
+        rules = db.db_auto_rules(db_bot_id)
+        page = max(0, min(page, max(0, (len(rules) - 1) // 8)))
+        rows = [[(', '.join(r['phrases'])[:40], f"ps_rule_{r['id']}")] for r in rules[page*8:page*8+8]]
+        nav = []
+        if page: nav.append(('◀️', f'ps_rules_{page-1}'))
+        if (page+1)*8 < len(rules): nav.append(('▶️', f'ps_rules_{page+1}'))
+        if nav: rows.append(nav)
+        rows += [[('Добавить', 'ps_add'), ('Проверить фразу', 'ps_test')], [('Назад', 'p_back_admin')]]
+        settings_show(cb, f'<b>Автоответы ({len(rules)}/30)</b>', rows)
+
+    def show_rule(cb, rule):
+        from telegram_text import html_chunks
+        rid = rule['id']
+        text = '<b>Фразы:</b> ' + html.escape(', '.join(rule['phrases'])) + '\n\n' + rule['text']
+        settings_show(cb, html_chunks(text, 3800)[0], [
+            [('Изменить фразы', f'ps_phrases_{rid}'), ('Изменить текст', f'ps_answer_{rid}')],
+            [('Только в нерабочее время: ' + ('да' if rule['offhours'] else 'нет'), f'ps_flag_{rid}')],
+            [('Удалить', f'ps_delete_{rid}')], [('Назад', 'ps_rules_0')]])
+
+    @pbot.callback_query_handler(func=lambda c: c.data.startswith('ps_') or c.data == 'p_edit_welcome')
+    def support_settings_cb(cb):
+        if not settings_access(cb): return
+        _reset_flow(cb.from_user.id)
+        data = cb.data
+        if data == 'p_edit_welcome': data = 'ps_edit_welcome'
+        if data == 'ps_texts':
+            settings_show(cb, '<b>Тексты</b>', [[(title, 'ps_text_' + key)] for key, (title, _) in TEXTS.items()] + [[('Назад', 'p_back_admin')]])
+        elif data.startswith(('ps_text_', 'ps_edit_', 'ps_reset_')):
+            action, key = data[3:].split('_', 1)
+            if key not in TEXTS: return
+            if action == 'reset': db_set_bot_setting(db_bot_id, key, TEXTS[key][1])
+            if action == 'edit':
+                hint = '\nПодстановки: {start}, {end}, {wait}' if key == 'txt_offhours' else ''
+                settings_input(cb, 'text', f'Введи новый текст: «{TEXTS[key][0]}». Форматирование сохраняется.{hint}', 'ps_text_' + key, key=key)
+            else: show_text(cb, key)
+        elif data.startswith('ps_hours'):
+            if data.endswith('_toggle'):
+                old = db_get_bot_setting(db_bot_id, 'hours_enabled', '0')
+                db_set_bot_setting(db_bot_id, 'hours_enabled', '0' if old == '1' else '1')
+            show_hours(cb)
+        elif data.startswith('ps_day_'):
+            day = int(data[7:])
+            if day not in range(7): return
+            days = support_schedule(db_bot_id)['days']
+            days.symmetric_difference_update({day})
+            if not days:
+                pbot.answer_callback_query(cb.id, 'Выбери хотя бы один рабочий день', show_alert=True)
+            else: db_set_bot_setting(db_bot_id, 'hours_days', ','.join(map(str, sorted(days))))
+            show_hours(cb)
+        elif data.startswith('ps_grid_'):
+            key = data[8:]
+            if key not in ('start', 'end', 'tz'): return
+            vals = list(range(-12, 15)) if key == 'tz' else list(range(24))
+            buttons = [(f'UTC{v:+}' if key == 'tz' else f'{v:02}', f'ps_set_{key}_{v}') for v in vals]
+            settings_show(cb, 'Выбери часовой пояс' if key == 'tz' else 'Выбери час',
+                          [buttons[i:i+6] for i in range(0, len(buttons), 6)] + [[('Назад', 'ps_hours')]])
+        elif data.startswith('ps_set_'):
+            key, val = data[7:].rsplit('_', 1)
+            if key not in ('start', 'end', 'tz'): return
+            if int(val) not in (range(-12, 15) if key == 'tz' else range(24)): return
+            db_set_bot_setting(db_bot_id, 'hours_' + key, val)
+            show_hours(cb)
+        elif data.startswith('ps_rules_'): show_rules(cb, int(data[9:]))
+        elif data == 'ps_add':
+            if len(db.db_auto_rules(db_bot_id)) >= 30:
+                pbot.answer_callback_query(cb.id, 'Можно добавить не больше 30 правил', show_alert=True)
+                return
+            settings_input(cb, 'new_phrases', 'Введи фразы через запятую или с новой строки (до 20, по 2–50 символов)', 'ps_rules_0')
+        elif data == 'ps_test':
+            settings_input(cb, 'test', 'Введи текст для проверки автоответа', 'ps_rules_0')
+        else:
+            try: action, rid = data[3:].rsplit('_', 1); rid = int(rid)
+            except ValueError: return
+            rule = next((r for r in db.db_auto_rules(db_bot_id) if r['id'] == rid), None)
+            if not rule:
+                pbot.answer_callback_query(cb.id, 'Правило больше недоступно', show_alert=True)
+                show_rules(cb)
+                return
+            if action in ('phrases', 'answer'):
+                settings_input(cb, action, 'Введи фразы через запятую или с новой строки' if action == 'phrases' else 'Введи текст ответа. Форматирование сохраняется.', f'ps_rule_{rid}', rid=rid)
+            elif action == 'delete':
+                settings_show(cb, 'Удалить правило?', [[('Да, удалить', f'ps_remove_{rid}'), ('Отмена', f'ps_rule_{rid}')]])
+            elif action == 'remove':
+                db.db_auto_delete(db_bot_id, rid); show_rules(cb)
+            else:
+                if action == 'flag':
+                    rule['offhours'] = not rule['offhours']
+                    db.db_auto_save(db_bot_id, rule['phrases'], rule['text'], rid, rule['offhours'])
+                show_rule(cb, rule)
+
+    @pbot.message_handler(func=lambda m: isinstance(pstate.get(m.from_user.id), dict)
+                         and pstate[m.from_user.id].get('step') == 'support_input'
+                         and (m.text or '').split(' ', 1)[0].split('@', 1)[0]
+                         not in ('/start', '/admin', '/status', '/templates'))
+    def support_settings_input(m):
+        if not settings_access(m): return
+        state = pstate[m.from_user.id]
+        action = state['action']
+        try:
+            if action == 'test':
+                rules = matching_rules(db_bot_id, m.text)
+                result = 'Сработало бы правило: ' + ', '.join(rules[0]['phrases']) if rules else 'Ни одно правило не подходит'
+            elif action in ('new_phrases', 'phrases'):
+                phrases = parse_phrases(m.text)
+                if action == 'new_phrases':
+                    _set_flow(m.from_user.id, dict(step='support_input', action='new_answer', phrases=phrases, back='ps_rules_0'))
+                    kb = InlineKeyboardMarkup(); kb.add(_pbtn('Отмена', callback_data='ps_rules_0'))
+                    pbot.send_message(m.chat.id, 'Введи текст ответа. Форматирование сохраняется.', reply_markup=kb)
+                    return
+                rule = next((r for r in db.db_auto_rules(db_bot_id) if r['id'] == state['rid']), None)
+                if not rule: raise ValueError('Правило больше недоступно')
+                db.db_auto_save(db_bot_id, phrases, rule['text'], rule['id'], rule['offhours'])
+                result = 'Фразы сохранены'
+            else:
+                text = m.html_text or ''
+                validate_support_html(text, 3600 if action == 'text' and state['key'] == 'txt_offhours' else 4000)
+                if action == 'text' and state['key'] == 'txt_offhours':
+                    validate_support_html(re.sub(r'\{(start|end|wait)\}',
+                        lambda m: '999 часов' if m[1] == 'wait' else '23:00', text))
+                pbot.send_message(m.chat.id, text, parse_mode='HTML')
+                if action == 'text': db_set_bot_setting(db_bot_id, state['key'], text)
+                elif action == 'new_answer': db.db_auto_save(db_bot_id, state['phrases'], text)
+                else:
+                    rule = next((r for r in db.db_auto_rules(db_bot_id) if r['id'] == state['rid']), None)
+                    if not rule: raise ValueError('Правило больше недоступно')
+                    db.db_auto_save(db_bot_id, rule['phrases'], text, rule['id'], rule['offhours'])
+                result = 'Текст сохранён'
+        except Exception as exc:
+            result = str(exc) if isinstance(exc, ValueError) else 'Текст не сохранён: проверь HTML и попробуй ещё раз'
+            kb = InlineKeyboardMarkup(); kb.add(_pbtn('Отмена', callback_data=state['back']))
+            pbot.send_message(m.chat.id, result, reply_markup=kb)
+            return
+        _reset_flow(m.from_user.id)
+        kb = InlineKeyboardMarkup(); kb.add(_pbtn('Назад', callback_data=state['back']))
+        pbot.send_message(m.chat.id, result, reply_markup=kb)
+
+    def after_delivery(messages, group, mappings):
+        uid = messages[0].from_user.id
+        if is_admin(uid) or db_is_blocked(db_bot_id, uid): return
+        eligible = [m for m in messages if not (m.text or '').startswith('/')]
+        if not eligible: return
+        now = time.time()
+        schedule = support_schedule(db_bot_id, now)
+        if schedule['enabled'] and not schedule['working']:
+            db.db_support_notify(db_bot_id, uid, 'offhours', offhours_text(db_bot_id, schedule), [], now, 21600)
+        batches = [eligible] if messages[0].media_group_id else [[m] for m in eligible]
+        for batch in batches:
+            text = ' '.join(m.text or m.caption or '' for m in batch)
+            for rule in matching_rules(db_bot_id, text, schedule):
+                preview = html.escape(' '.join(re.sub('<[^>]+>', '', rule['text']).split())[:80])
+                notice = sorted({(chat, thread, f'{TE_ROBOT} Автоответ: {preview}') for chat, mid, thread, src in mappings})
+                if db.db_support_notify(db_bot_id, uid, 'rule:' + str(rule['id']), rule['text'], notice, now, 43200,
+                                        album=messages[0].media_group_id):
+                    break
+
+    def pump_notifications():
+        import forum_support as fs
+        for row in db.db_support_notifications(db_bot_id, time.time()):
+            try:
+                if row[6] == 0:
+                    pbot.send_message(row[1], row[3], parse_mode='HTML')
+                    db.db_support_notification_sent(db_bot_id, row, time.time())
+                remaining = json.loads(row[4])
+                while remaining:
+                    chat, thread, text = remaining[0]
+                    if thread: fs._topic_notice(pbot, chat, thread, text, strict=True)
+                    else: pbot.send_message(chat, text, parse_mode='HTML')
+                    remaining.pop(0)
+                    db.db_support_notification_done(db_bot_id, row, remaining)
+            except Exception as exc:
+                params = (getattr(exc, 'result_json', None) or {}).get('parameters', {})
+                delay = max(0, float(params.get('retry_after', 1))) if getattr(exc, 'error_code', None) == 429 else min(300, 2 ** min(row[5], 9))
+                db.db_support_notification_retry(db_bot_id, row, time.time() + delay)
+                continue
+            db.db_support_notification_done(db_bot_id, row)
+
+    pbot._after_delivery = after_delivery
+    pbot._pump_notifications = pump_notifications
+
+    def faq_back(node, mode):
+        siblings = db.db_faq_nodes(db_bot_id, node['parent_id'])
+        index = next((i for i, n in enumerate(siblings) if n['id'] == node['id']), 0)
+        return f"fq_{mode}_{node['parent_id'] or 0}_{index // 8}"
+
+    def faq_show(cb, node_id=0, page=0, mode='u'):
+        from telegram_text import html_chunks
+        node = db.db_faq_get(db_bot_id, node_id) if node_id else None
+        if node_id and not node:
+            pbot.answer_callback_query(cb.id, 'Раздел больше недоступен', show_alert=True)
+            node_id, page = 0, 0
+        children = db.db_faq_nodes(db_bot_id, node_id or None)
+        pages = max(1, (len(children) + 7) // 8)
+        page = max(0, min(page, pages - 1))
+        text = f"<b>{html.escape(node['title'])}</b>" + ('\n\n' + node['text'] if node['text'] else '') if node else f'<b>{TE_NOTE} FAQ</b>\n\nВыбери вопрос'
+        # edit_html использует предел 3800: оставляем запас и сохраняем
+        # навигацию именно в одном сообщении, включая длинные ответы FAQ.
+        chunks = html_chunks(text, 3790)
+        text = chunks[0] + ('…' if len(chunks) > 1 else '')
+        if len(text.encode('utf-16-le')) // 2 > 4096:
+            text = html.escape(re.sub('<[^>]*>', '', text))
+            text = html_chunks(text, 3790)[0] + '…'
+        rows = [[(n['title'], f"fq_{mode}_{n['id']}_0")] for n in children[page*8:page*8+8]]
+        if pages > 1:
+            nav = []
+            if page: nav.append(('◀️', f'fq_{mode}_{node_id}_{page-1}'))
+            nav.append((f'{page+1}/{pages}', 'p_noop'))
+            if page+1 < pages: nav.append(('▶️', f'fq_{mode}_{node_id}_{page+1}'))
+            rows.append(nav)
+        if mode == 'e':
+            rows += [[('Добавить кнопку', f'fq_add_{node_id}')]]
+            if node:
+                rows += [[('Название', f'fq_name_{node_id}'), ('Текст', f'fq_text_{node_id}')],
+                         [('⬆️', f'fq_up_{node_id}'), ('⬇️', f'fq_down_{node_id}')],
+                         [('Удалить', f'fq_del_{node_id}')]]
+            rows += [[('Как видит пользователь', f'fq_v_{node_id}_{page}')],
+                     [('Назад', faq_back(node, mode) if node else 'p_back_admin')]]
+        else:
+            if not node: rows.append([('Не нашёл ответ — написать', 'p_send')])
+            rows += [[('Назад', faq_back(node, mode) if node else 'p_cancel')]]
+            if node: rows.append([('Главное меню', 'p_cancel')])
+            if mode == 'v': rows.append([('К редактору', f'fq_e_{node_id}_{page}')])
+        settings_show(cb, text, rows)
+
+    def faq_prompt(cb, action, node_id, **values):
+        prompts = {'add': 'Введи название кнопки (1–40 символов)',
+                   'name': 'Введи новое название (1–40 символов)',
+                   'text': 'Введи текст раздела. Форматирование сохраняется.',
+                   'new_text': 'Введи текст раздела или нажми «Пропустить». Форматирование сохраняется.'}
+        faq_input[cb.from_user.id] = dict(action=action, node_id=node_id, **values)
+        rows = [[('Отмена', f'fq_e_{node_id}_0')]]
+        if action == 'new_text': rows.insert(0, [('Пропустить', f'fq_skip_{node_id}')])
+        settings_show(cb, prompts[action], rows)
+
+    @pbot.callback_query_handler(func=lambda c: c.data.startswith('fq_'))
+    def faq_callback(cb):
+        parts = cb.data.split('_')
+        if len(parts) not in (3, 4): return
+        action = parts[1]
+        try:
+            node_id = int(parts[2]); page = int(parts[3]) if len(parts) == 4 else 0
+        except ValueError: return
+        if action != 'u' and not settings_access(cb): return
+        pending = faq_input.get(cb.from_user.id)
+        _reset_flow(cb.from_user.id)
+        if action in ('u', 'e', 'v'):
+            faq_show(cb, node_id, page, action)
+            return
+        node = db.db_faq_get(db_bot_id, node_id) if node_id else None
+        if node_id and not node:
+            pbot.answer_callback_query(cb.id, 'Раздел больше недоступен', show_alert=True)
+            faq_show(cb, mode='e')
+            return
+        try:
+            if action in ('add', 'name', 'text'):
+                if action != 'add' and not node: return
+                faq_prompt(cb, action, node_id)
+            elif action == 'skip':
+                if not pending or pending['action'] != 'new_text' or pending['node_id'] != node_id: return
+                new_id = db.db_faq_add(db_bot_id, node_id or None, pending['title'])
+                faq_show(cb, new_id, mode='e')
+            elif action in ('up', 'down') and node:
+                db.db_faq_move(db_bot_id, node_id, -1 if action == 'up' else 1)
+                faq_show(cb, node_id, mode='e')
+            elif action == 'del' and node:
+                count = db.db_faq_subtree(db_bot_id, node_id) - 1
+                kb = InlineKeyboardMarkup()
+                kb.row(_pbtn('Да, удалить', callback_data=f'fq_yes_{node_id}', style='danger'),
+                       _pbtn('Отмена', callback_data=f'fq_e_{node_id}_0'))
+                _edit(f"Удалить «{html.escape(node['title'])}» и всё, что внутри ({count})?", cb.message.chat.id, cb.message.message_id, kb)
+            elif action == 'yes' and node:
+                parent = node['parent_id'] or 0
+                db.db_faq_subtree(db_bot_id, node_id, delete=True)
+                faq_show(cb, parent, mode='e')
+        except ValueError as exc:
+            pbot.answer_callback_query(cb.id, str(exc), show_alert=True)
+            faq_show(cb, node_id, mode='e')
+
+    def faq_open_saved(m, node_id):
+        sent = pbot.send_message(m.chat.id, 'Раздел сохранён')
+        cb = SimpleNamespace(message=SimpleNamespace(chat=m.chat, message_id=sent.message_id))
+        faq_show(cb, node_id, mode='e')
+
+    @pbot.message_handler(func=lambda m: m.from_user.id in faq_input
+                         and pstate.get(m.from_user.id) is None and not m.reply_to_message
+                         and (m.text or '').split(' ', 1)[0].split('@', 1)[0]
+                         not in ('/start', '/admin', '/status', '/templates'))
+    def faq_save_input(m):
+        if not settings_access(m): return
+        state = faq_input.get(m.from_user.id)
+        action, node_id = state['action'], state['node_id']
+        try:
+            if action in ('add', 'name'):
+                title = (m.text or '').strip()
+                if not 1 <= len(title) <= 40: raise ValueError('Название должно содержать от 1 до 40 символов')
+                if action == 'add':
+                    sent = pbot.send_message(m.chat.id, 'Название принято')
+                    cb = SimpleNamespace(from_user=m.from_user, message=SimpleNamespace(chat=m.chat, message_id=sent.message_id))
+                    faq_prompt(cb, 'new_text', node_id, title=title)
+                    return
+                db.db_faq_edit(db_bot_id, node_id, 'title', title)
+            else:
+                text = m.html_text or ''
+                # Проверяем весь HTML, включая обрезаемую при показе часть.
+                validate_support_html(text, 100000)
+                from telegram_text import send_html
+                send_html(pbot, m.chat.id, text)
+                if action == 'new_text': node_id = db.db_faq_add(db_bot_id, node_id or None, state['title'], text)
+                else: db.db_faq_edit(db_bot_id, node_id, 'text', text)
+            faq_input.pop(m.from_user.id, None)
+            faq_open_saved(m, node_id)
+        except Exception as exc:
+            message = str(exc) if isinstance(exc, ValueError) else 'Текст не сохранён: проверь HTML и попробуй ещё раз'
+            kb = InlineKeyboardMarkup(); kb.add(_pbtn('Отмена', callback_data=f'fq_e_{state["node_id"]}_0'))
+            pbot.send_message(m.chat.id, message, reply_markup=kb)
 
     # ── Команды ────────────────────────────────────────
     @pbot.message_handler(commands=['start'])
@@ -301,7 +752,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         _reset_flow(m.from_user.id)
         pbot.send_message(m.chat.id,
             f"<b>{TE_KEYBOARD} Панель админа</b>\n\n{TE_HOURGLASS} Подписка до: <b>{_get_exp_str()}</b>",
-            parse_mode='HTML', reply_markup=pk_admin())
+            parse_mode='HTML', reply_markup=pk_admin(m.from_user.id))
 
     @pbot.message_handler(commands=['status'])
     def pstatus_cmd(m):
@@ -344,7 +795,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         _edit(
             f"<b>{TE_KEYBOARD} Панель админа</b>\n\n{TE_HOURGLASS} Подписка до: <b>{_get_exp_str()}</b>",
             cb.message.chat.id, cb.message.message_id,
-            parse_mode='HTML', reply_markup=pk_admin())
+            parse_mode='HTML', reply_markup=pk_admin(cb.from_user.id))
 
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_open_admin')
     def p_open_admin_cb(cb):
@@ -353,7 +804,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         _edit(
             f"<b>{TE_KEYBOARD} Панель админа</b>\n\n{TE_HOURGLASS} Подписка до: <b>{_get_exp_str()}</b>",
             cb.message.chat.id, cb.message.message_id,
-            parse_mode='HTML', reply_markup=pk_admin())
+            parse_mode='HTML', reply_markup=pk_admin(cb.from_user.id))
 
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_stats')
     def p_stats_cb(cb):
@@ -864,36 +1315,6 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             parse_mode='HTML', reply_markup=pk_close())
 
     # ── Изменить приветствие ───────────────────────────
-    @pbot.callback_query_handler(func=lambda c: c.data == 'p_edit_welcome')
-    def p_edit_welcome(cb):
-        if not is_admin(cb.from_user.id): return
-        _set_flow(cb.from_user.id, 'p_await_welcome')
-        _edit(
-            f"<b>{TE_PENCIL} Введи новый текст приветствия</b>\n\n"
-            "Поддерживается HTML:\n"
-            "<code>&lt;b&gt;жирный&lt;/b&gt;</code>, <code>&lt;i&gt;курсив&lt;/i&gt;</code>\n\n"
-            f"<b>Текущий текст:</b>\n{get_welcome()}",
-            cb.message.chat.id, cb.message.message_id,
-            parse_mode='HTML', reply_markup=pk_back_admin())
-
-    @pbot.message_handler(func=lambda m: pstate.get(m.from_user.id) == 'p_await_welcome')
-    def p_save_welcome(m):
-        if not is_admin(m.from_user.id): return
-        if _take_flow(m.from_user.id, 'p_await_welcome') is None: return
-        # валидация HTML ДО сохранения: кривой текст сделал бы /start
-        # молча падающим у ВСЕХ пользователей бота
-        try:
-            pbot.send_message(m.chat.id,
-                f"<b>{TE_CHECK}  Приветствие обновлено!</b>\n\n<b>Предпросмотр:</b>\n\n{m.text}",
-                parse_mode='HTML', reply_markup=pk_close())
-        except Exception:
-            pbot.send_message(m.chat.id,
-                f"<b>{TE_CROSS}  Приветствие НЕ сохранено: некорректный HTML "
-                f"(проверь закрытие тегов &lt;b&gt;, &lt;i&gt; и т.п.). Попробуй ещё раз.</b>",
-                parse_mode='HTML', reply_markup=pk_back_admin())
-            return
-        db_set_bot_setting(db_bot_id, 'welcome', m.text)
-
     # ── Удалить бота ───────────────────────────────────
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_delete_bot')
     def p_delete_bot(cb):
@@ -911,7 +1332,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if not is_primary_admin(cb.from_user.id): return
         _edit(f"<b>{TE_KEYBOARD} Панель админа</b>",
             cb.message.chat.id, cb.message.message_id,
-            parse_mode='HTML', reply_markup=pk_admin())
+            parse_mode='HTML', reply_markup=pk_admin(cb.from_user.id))
 
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_confirm_delete')
     def p_confirm_delete(cb):

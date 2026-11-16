@@ -437,6 +437,42 @@ def init_db():
             created_at REAL NOT NULL,
             PRIMARY KEY(bot_id, chat_id, group_msg_id, src_msg_id)
         );
+        CREATE TABLE IF NOT EXISTS faq_nodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id INTEGER NOT NULL,
+            parent_id INTEGER,
+            title TEXT NOT NULL,
+            text TEXT NOT NULL DEFAULT '',
+            position INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_faq_parent ON faq_nodes(bot_id, parent_id, position, id);
+        CREATE TABLE IF NOT EXISTS auto_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id INTEGER NOT NULL,
+            phrases TEXT NOT NULL,
+            text TEXT NOT NULL,
+            offhours INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_auto_rules_bot ON auto_rules(bot_id, id);
+        CREATE TABLE IF NOT EXISTS support_cooldowns (
+            bot_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL, shown_at REAL NOT NULL,
+            PRIMARY KEY(bot_id, user_id, kind)
+        );
+        CREATE TABLE IF NOT EXISTS support_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL, text TEXT NOT NULL,
+            notice TEXT NOT NULL DEFAULT '[]', next_at REAL NOT NULL DEFAULT 0,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            stage INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(bot_id, user_id, kind)
+        );
+        CREATE TABLE IF NOT EXISTS support_album_replies (
+            bot_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            album TEXT NOT NULL, reserved_at REAL NOT NULL,
+            PRIMARY KEY(bot_id,user_id,album)
+        );
         -- Еженедельные отчёты (защита от дублей по периоду)
         CREATE TABLE IF NOT EXISTS fs_weekly_reports (
             bot_id       INTEGER NOT NULL,
@@ -467,6 +503,7 @@ def init_db():
         'ALTER TABLE fs_groups ADD COLUMN mgmt_claim TEXT',
         'ALTER TABLE fs_groups ADD COLUMN mgmt_claim_at REAL',
         'ALTER TABLE fs_pending ADD COLUMN claim_session TEXT',
+        'ALTER TABLE support_notifications ADD COLUMN stage INTEGER NOT NULL DEFAULT 0',
         'ALTER TABLE payment_orders ADD COLUMN expected_ton REAL',
         "ALTER TABLE payment_orders ADD COLUMN receipt TEXT DEFAULT '{}'",
     ]:
@@ -659,6 +696,254 @@ def db_delivery_fallback(rows):
 
 
 # ── Bots ──────────────────────────────────────────────
+def db_token_in_use(token, exclude_bot_id):
+    c = _conn()
+    try:
+        return bool(c.execute('SELECT 1 FROM bots WHERE id<>? AND (token=? OR token LIKE ?)',
+                              (exclude_bot_id, token, token.split(':', 1)[0] + ':%')).fetchone())
+    finally:
+        c.close()
+
+
+def db_replace_bot_token(bot_id, expected, token, username, reset_group=False):
+    """Compare-and-swap токена и снимок привязки для отката неудачного запуска."""
+    c = _conn()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        previous = c.execute('SELECT token,username FROM bots WHERE id=?', (bot_id,)).fetchone()
+        if not previous or previous[0] != expected: raise ValueError('Токен уже изменён. Открой список ботов заново')
+        if c.execute('SELECT 1 FROM bots WHERE id<>? AND (token=? OR token LIKE ?)',
+                     (bot_id, token, token.split(':', 1)[0] + ':%')).fetchone():
+            raise ValueError('Этот бот уже подключён')
+        snapshot = dict(previous=previous, tables={})
+        if reset_group:
+            for table in ('fs_groups', 'fs_topics', 'fs_msgs', 'delivery_sources'):
+                cursor = c.execute(f'SELECT * FROM {table} WHERE bot_id=?', (bot_id,))
+                snapshot['tables'][table] = ([col[0] for col in cursor.description], cursor.fetchall())
+                c.execute(f'DELETE FROM {table} WHERE bot_id=?', (bot_id,))
+            snapshot['notices'] = c.execute('SELECT id,notice FROM support_notifications WHERE bot_id=?', (bot_id,)).fetchall()
+            c.execute("UPDATE support_notifications SET notice='[]' WHERE bot_id=?", (bot_id,))
+        c.execute('UPDATE bots SET token=?,username=? WHERE id=?', (token, username, bot_id))
+        c.commit()
+        return snapshot
+    finally:
+        c.close()
+
+
+def db_restore_bot_token(bot_id, expected, snapshot):
+    c = _conn()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        if not c.execute('UPDATE bots SET token=?,username=? WHERE id=? AND token=?',
+                         (*snapshot['previous'], bot_id, expected)).rowcount:
+            raise ValueError('Токен уже изменён')
+        for table, (columns, rows) in snapshot['tables'].items():
+            c.execute(f'DELETE FROM {table} WHERE bot_id=?', (bot_id,))
+            names, placeholders = ','.join(columns), ','.join('?' for _ in columns)
+            c.executemany(f'INSERT INTO {table} ({names}) VALUES ({placeholders})', rows)
+        for row_id, notice in snapshot.get('notices', []):
+            c.execute('UPDATE support_notifications SET notice=? WHERE bot_id=? AND id=?', (notice, bot_id, row_id))
+        c.commit()
+    finally:
+        c.close()
+
+
+def db_faq_nodes(bot_id, parent_id=None):
+    c = _conn()
+    try:
+        return [dict(zip(('id', 'parent_id', 'title', 'text', 'position'), r)) for r in c.execute(
+            'SELECT id,parent_id,title,text,position FROM faq_nodes WHERE bot_id=? AND parent_id IS ? ORDER BY position,id',
+            (bot_id, parent_id))]
+    finally:
+        c.close()
+
+
+def db_faq_get(bot_id, node_id):
+    c = _conn()
+    try:
+        row = c.execute('SELECT id,parent_id,title,text,position FROM faq_nodes WHERE bot_id=? AND id=?', (bot_id, node_id)).fetchone()
+        return dict(zip(('id', 'parent_id', 'title', 'text', 'position'), row)) if row else None
+    finally:
+        c.close()
+
+
+def db_faq_add(bot_id, parent_id, title, text=''):
+    if not 1 <= len(title.strip()) <= 40:
+        raise ValueError('Название должно содержать от 1 до 40 символов')
+    c = _conn()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        ancestor, depth = parent_id, 1
+        while ancestor is not None:
+            row = c.execute('SELECT parent_id FROM faq_nodes WHERE bot_id=? AND id=?', (bot_id, ancestor)).fetchone()
+            if not row: raise ValueError('Раздел больше недоступен')
+            ancestor = row[0]
+            depth += 1
+            if depth > 4: raise ValueError('Максимальная глубина FAQ — 4 уровня')
+        if c.execute('SELECT COUNT(*) FROM faq_nodes WHERE bot_id=?', (bot_id,)).fetchone()[0] >= 300:
+            raise ValueError('В FAQ может быть не больше 300 кнопок')
+        count, pos = c.execute('SELECT COUNT(*),COALESCE(MAX(position),-1)+1 FROM faq_nodes '
+                               'WHERE bot_id=? AND parent_id IS ?', (bot_id, parent_id)).fetchone()
+        if count >= 50: raise ValueError('В разделе может быть не больше 50 кнопок')
+        cur = c.execute('INSERT INTO faq_nodes(bot_id,parent_id,title,text,position) VALUES(?,?,?,?,?)',
+                        (bot_id, parent_id, title.strip(), text, pos))
+        c.commit()
+        return cur.lastrowid
+    finally:
+        c.close()
+
+
+def db_faq_edit(bot_id, node_id, field, value):
+    if field not in ('title', 'text'): raise ValueError('Неизвестное поле')
+    if field == 'title' and not 1 <= len(value.strip()) <= 40:
+        raise ValueError('Название должно содержать от 1 до 40 символов')
+    c = _conn()
+    try:
+        if not c.execute(f'UPDATE faq_nodes SET {field}=? WHERE bot_id=? AND id=?', (value, bot_id, node_id)).rowcount:
+            raise ValueError('Раздел больше недоступен')
+        c.commit()
+    finally:
+        c.close()
+
+
+def db_faq_subtree(bot_id, node_id, delete=False):
+    c = _conn()
+    try:
+        c.execute('BEGIN IMMEDIATE' if delete else 'BEGIN')
+        ids = [r[0] for r in c.execute('WITH RECURSIVE tree(id) AS '
+            '(SELECT id FROM faq_nodes WHERE bot_id=? AND id=? UNION ALL '
+            'SELECT n.id FROM faq_nodes n JOIN tree t ON n.parent_id=t.id WHERE n.bot_id=?) SELECT id FROM tree',
+            (bot_id, node_id, bot_id))]
+        if delete:
+            c.executemany('DELETE FROM faq_nodes WHERE bot_id=? AND id=?', [(bot_id, i) for i in ids])
+        c.commit()
+        return len(ids)
+    finally:
+        c.close()
+
+
+def db_faq_move(bot_id, node_id, direction):
+    c = _conn()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        node = c.execute('SELECT parent_id FROM faq_nodes WHERE bot_id=? AND id=?', (bot_id, node_id)).fetchone()
+        if not node: raise ValueError('Раздел больше недоступен')
+        siblings = c.execute('SELECT id,position FROM faq_nodes WHERE bot_id=? AND parent_id IS ? ORDER BY position,id', (bot_id, node[0])).fetchall()
+        index = next(i for i, r in enumerate(siblings) if r[0] == node_id)
+        other = index + direction
+        if 0 <= other < len(siblings):
+            a, b = siblings[index], siblings[other]
+            c.execute('UPDATE faq_nodes SET position=? WHERE bot_id=? AND id=?', (b[1], bot_id, a[0]))
+            c.execute('UPDATE faq_nodes SET position=? WHERE bot_id=? AND id=?', (a[1], bot_id, b[0]))
+        c.commit()
+    finally:
+        c.close()
+
+
+def db_auto_rules(bot_id):
+    c = _conn()
+    try:
+        return [dict(id=r[0], phrases=json.loads(r[1]), text=r[2], offhours=bool(r[3]))
+                for r in c.execute('SELECT id,phrases,text,offhours FROM auto_rules WHERE bot_id=? ORDER BY id', (bot_id,))]
+    finally:
+        c.close()
+
+
+def db_auto_save(bot_id, phrases, text, rule_id=None, offhours=False):
+    c = _conn()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        if rule_id is None:
+            if c.execute('SELECT COUNT(*) FROM auto_rules WHERE bot_id=?', (bot_id,)).fetchone()[0] >= 30:
+                raise ValueError('Можно добавить не больше 30 правил')
+            cur = c.execute('INSERT INTO auto_rules(bot_id,phrases,text,offhours) VALUES(?,?,?,?)',
+                            (bot_id, json.dumps(phrases, ensure_ascii=False), text, int(offhours)))
+            rule_id = cur.lastrowid
+        else:
+            if not c.execute('UPDATE auto_rules SET phrases=?,text=?,offhours=? WHERE bot_id=? AND id=?',
+                             (json.dumps(phrases, ensure_ascii=False), text, int(offhours), bot_id, rule_id)).rowcount:
+                raise ValueError('Правило больше недоступно')
+        c.commit()
+        return rule_id
+    finally:
+        c.close()
+
+
+def db_auto_delete(bot_id, rule_id):
+    c = _conn()
+    try:
+        c.execute('DELETE FROM auto_rules WHERE bot_id=? AND id=?', (bot_id, rule_id))
+        c.commit()
+    finally:
+        c.close()
+
+
+def db_support_notify(bot_id, uid, kind, text, notice, now, cooldown, album=None):
+    """Резервируем ответ до отправки; кулдаун отсчитывается от успешного показа."""
+    c = _conn()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        last = c.execute('SELECT shown_at FROM support_cooldowns WHERE bot_id=? AND user_id=? AND kind=?',
+                         (bot_id, uid, kind)).fetchone()
+        if last and now - last[0] < cooldown:
+            return False
+        if album:
+            c.execute('DELETE FROM support_album_replies WHERE reserved_at<?', (now - 7*86400,))
+            if c.execute('SELECT 1 FROM support_album_replies WHERE bot_id=? AND user_id=? AND album=?',
+                         (bot_id, uid, album)).fetchone(): return False
+        cur = c.execute('INSERT OR IGNORE INTO support_notifications(bot_id,user_id,kind,text,notice) VALUES(?,?,?,?,?)',
+                        (bot_id, uid, kind, text, json.dumps(notice, ensure_ascii=False)))
+        if cur.rowcount and album:
+            c.execute('INSERT INTO support_album_replies VALUES(?,?,?,?)', (bot_id, uid, album, now))
+        c.commit()
+        return bool(cur.rowcount)
+    finally:
+        c.close()
+
+
+def db_support_notifications(bot_id, now):
+    c = _conn()
+    try:
+        return c.execute('SELECT id,user_id,kind,text,notice,attempts,stage FROM support_notifications '
+                         'WHERE bot_id=? AND next_at<=? ORDER BY id', (bot_id, now)).fetchall()
+    finally:
+        c.close()
+
+
+def db_support_notification_sent(bot_id, row, now):
+    c = _conn()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        c.execute('INSERT OR REPLACE INTO support_cooldowns VALUES(?,?,?,?)', (bot_id, row[1], row[2], now))
+        c.execute('UPDATE support_notifications SET stage=1 WHERE id=? AND bot_id=?', (row[0], bot_id))
+        c.commit()
+    finally:
+        c.close()
+
+
+def db_support_notification_done(bot_id, row, remaining=None):
+    c = _conn()
+    try:
+        if remaining is None:
+            c.execute('DELETE FROM support_notifications WHERE id=? AND bot_id=?', (row[0], bot_id))
+        else:
+            c.execute('UPDATE support_notifications SET notice=? WHERE id=? AND bot_id=?',
+                      (json.dumps(remaining, ensure_ascii=False), row[0], bot_id))
+        c.commit()
+    finally:
+        c.close()
+
+
+def db_support_notification_retry(bot_id, row, next_at):
+    c = _conn()
+    try:
+        c.execute('UPDATE support_notifications SET next_at=?,attempts=attempts+1 WHERE id=? AND bot_id=?',
+                  (next_at, row[0], bot_id))
+        c.commit()
+    finally:
+        c.close()
+
+
 def db_add_bot(owner_id, token, admin_id, days: int = 30):
     expires = datetime.now() + timedelta(days=days)
     c = _conn()

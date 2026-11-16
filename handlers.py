@@ -6,6 +6,8 @@ import time
 import threading
 import logging
 import uuid
+import re
+import database as db
 from safe_logging import register_secret
 from telegram_text import send_html, send_long, edit_html, protect_text_lengths
 from purchase_store import (db_get_payment, db_register_paid_bot, db_activate_trial,
@@ -40,13 +42,51 @@ from database import (DB_PATH, init_db,
 from keyboards import (start_kb, back_to_start_kb, back_to_payment_kb, cancel_kb, close_kb, reply_kb, payment_kb, cryptobot_kb, broadcast_type_kb, super_admin_kb, _btn, start_text, buy_text, PE_FIRE, PE_DIAMOND, PE_STAR, PE_ROCKET, PE_GIFT, PE_CHECK, PE_MONEY, TE_ANNOUNCE, TE_BLOCK, TE_CALENDAR, TE_CARD, TE_CART, TE_CHAT, TE_CHECK, TE_CROSS, TE_DIAMOND, TE_DOLLAR, TE_EXCLAM, TE_FIRE, TE_FOLDER, TE_FREE, TE_GIFT, TE_GREEN, TE_HOURGLASS, TE_ID, TE_INBOX, TE_KEYBOARD, TE_LINK, TE_MONEY, TE_MOON, TE_NEW, TE_NOTE, TE_PARTY, TE_PICTURE, TE_RED, TE_REFRESH, TE_ROBOT, TE_ROCKET, TE_SEARCH, TE_SEND, TE_STAR, TE_STATS, TE_USER, TE_USERS)
 from payments import (cb_create_invoice, cb_check_invoice,
                       get_ton_amount, ton_payment_link, ton_check_transfer)
-from purchased_bot import launch_bot, stop_bot, running_bots, running_bot_ids
+from purchased_bot import launch_bot, stop_bot, running_bots, running_bot_ids, _lifecycle_lock
 from forum_support import html_safe_chunks
 
 log = logging.getLogger(__name__)
 
 _main_rate: dict = {}
 MAIN_RATE_SEC = 15
+_token_locks = {}
+_token_locks_guard = threading.Lock()
+
+
+def _replace_owned_token(owner_id, bot_id, expected, token, me, main_bot):
+    with _token_locks_guard:
+        lock = _token_locks.setdefault(bot_id, threading.Lock())
+    if not lock.acquire(blocking=False):
+        return 'Смена токена уже выполняется'
+    try:
+        # Тот же RLock используют launch/stop: параллельный автозапуск
+        # не вклинивается между остановкой, сменой в БД и новым запуском.
+        with _lifecycle_lock:
+            info = db_get_bot_info(bot_id)
+            if not info or info[2] != owner_id: return 'Этот бот тебе недоступен'
+            if info[0] != expected: return 'Токен уже изменён. Открой список ботов заново'
+            was_running = expected in running_bots
+            if not stop_bot(expected) and was_running:
+                return 'Не удалось остановить бота. Попробуй ещё раз'
+            snapshot = None
+            try:
+                snapshot = db.db_replace_bot_token(bot_id, expected, token, me.username or '',
+                                                    reset_group=str(me.id) != expected.split(':', 1)[0])
+                if launch_bot(bot_id, token, info[1], main_bot):
+                    return f'{TE_CHECK} Токен обновлён, бот @{me.username} запущен'
+            except Exception:
+                # Здесь не выводим ни исключение Telegram, ни аргументы вызова.
+                pass
+            try:
+                stop_bot(token)
+                if snapshot is not None:
+                    db.db_restore_bot_token(bot_id, token, snapshot)
+                launch_bot(bot_id, expected, info[1], main_bot)
+            except Exception:
+                log.error('Не удалось восстановить запуск бота #%s', bot_id)
+            return 'Не удалось запустить бота с новым токеном, оставлен прежний'
+    finally:
+        lock.release()
 
 
 def _is_super_admin(event):
@@ -173,7 +213,11 @@ def register(bot: telebot.TeleBot):
     bot.exception_handler = _EH()
 
     state = DBState(0)
+    token_candidates = {}
+    token_flow_lock = threading.RLock()
     def _reset_flow(uid, preserve_purchase=False):
+        with token_flow_lock:
+            token_candidates.pop(uid, None)
         current = state.pop(uid, None)
         current = current if isinstance(current, dict) else {}
         target, via = purchase_context(current)
@@ -215,6 +259,119 @@ def register(bot: telebot.TeleBot):
     def _safe_photo(uid, photo, caption):
         try: bot.send_photo(uid, photo, caption=caption, parse_mode='HTML'); return True
         except: return False
+
+    def token_cancel_kb():
+        kb = InlineKeyboardMarkup()
+        kb.add(_btn('Отмена', callback_data='token_cancel'))
+        return kb
+
+    @bot.callback_query_handler(func=lambda c: c.data == 'token_cancel')
+    def cancel_token_change(cb):
+        _reset_flow(cb.from_user.id)
+        _edit('Смена токена отменена', cb.message.chat.id, cb.message.message_id,
+              reply_markup=back_to_start_kb())
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith('change_token_'))
+    def start_token_change(cb):
+        try: bot_id = int(cb.data[len('change_token_'):])
+        except ValueError: return
+        info = db_get_bot_info(bot_id)
+        if not info or info[2] != cb.from_user.id:
+            bot.answer_callback_query(cb.id, 'Этот бот тебе недоступен', show_alert=True)
+            return
+        _reset_flow(cb.from_user.id)
+        state[cb.from_user.id] = dict(step='change_bot_token', bot_id=bot_id,
+                                      expires=time.time()+600, request_id=uuid.uuid4().hex[:16])
+        _edit('Отправь новый токен бота из @BotFather', cb.message.chat.id,
+              cb.message.message_id, reply_markup=token_cancel_kb())
+
+    @bot.message_handler(func=lambda m: isinstance(state.get(m.from_user.id), dict)
+                         and state[m.from_user.id].get('step') == 'change_bot_token'
+                         and not (m.text or '').startswith('/'))
+    def receive_new_token(m):
+        uid = m.from_user.id
+        # Удаляем даже некорректный или просроченный ввод, ничего не цитируем.
+        try: bot.delete_message(m.chat.id, m.message_id)
+        except Exception: pass
+        token = (m.text or '').strip()
+        register_secret(token)
+        with token_flow_lock:
+            session = state.get(uid)
+            if not isinstance(session, dict) or session.get('step') != 'change_bot_token': return
+            if session['expires'] <= time.time():
+                _reset_flow(uid)
+                bot.send_message(m.chat.id, 'Время ожидания истекло. Нажми «Сменить токен» ещё раз')
+                return
+            # Один вход забирает этот шаг. Второй одновременный ввод его не выполнит.
+            state[uid] = dict(session, step='checking_bot_token')
+        def retry(message):
+            with token_flow_lock:
+                current = state.get(uid)
+                if isinstance(current, dict) and current.get('request_id') == session['request_id']:
+                    state[uid] = session
+            bot.send_message(m.chat.id, message, reply_markup=token_cancel_kb())
+        info = db_get_bot_info(session['bot_id'])
+        if not info or info[2] != uid:
+            _reset_flow(uid); bot.send_message(m.chat.id, 'Этот бот тебе недоступен'); return
+        expected = info[0]
+        register_secret(expected)
+        if not re.fullmatch(r'\d+:[A-Za-z0-9_-]+', token) or len(token) < 30:
+            retry('Неверный формат токена. Попробуй ещё раз'); return
+        if token == expected:
+            retry('Этот токен уже используется этим ботом'); return
+        if db.db_token_in_use(token, session['bot_id']):
+            retry('Этот бот уже подключён'); return
+        probe = None
+        try:
+            probe = telebot.TeleBot(token, threaded=False)
+            me = probe.get_me()
+        except Exception:
+            retry('Токен недействителен. Проверь его в @BotFather'); return
+        finally:
+            if probe is not None:
+                try: probe.stop_bot()
+                except Exception: pass
+        with token_flow_lock:
+            current = state.get(uid)
+            if not isinstance(current, dict) or current.get('request_id') != session['request_id']: return
+            if session['expires'] <= time.time():
+                _reset_flow(uid)
+                bot.send_message(m.chat.id, 'Время ожидания истекло. Нажми «Сменить токен» ещё раз')
+                return
+            if str(me.id) != expected.split(':',1)[0]:
+                token_candidates[uid] = dict(session, token=token, expected=expected, me=me)
+                state[uid] = dict(session, step='confirm_bot_token')
+                old_name = next((r[2] for r in db_get_owner_bots(uid) if r[0] == session['bot_id']), '')
+                old_name = '@'+old_name if old_name else 'прежнего бота'
+                kb=InlineKeyboardMarkup()
+                kb.row(_btn('Сменить', callback_data=f"token_confirm_{session['bot_id']}_{session['request_id']}"),
+                       _btn('Отмена', callback_data='token_cancel'))
+                bot.send_message(m.chat.id, f'Это другой бот (@{me.username}). Пользователи {old_name} не перейдут в него, группу поддержки нужно будет подключить заново', reply_markup=kb)
+                return
+            _reset_flow(uid)
+        result = _replace_owned_token(uid, session['bot_id'], expected, token, me, bot)
+        bot.send_message(m.chat.id, result, parse_mode='HTML', reply_markup=back_to_start_kb())
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith('token_confirm_'))
+    def confirm_token_change(cb):
+        with token_flow_lock:
+            candidate = token_candidates.get(cb.from_user.id)
+            session = state.get(cb.from_user.id)
+            valid = (candidate and isinstance(session,dict) and session.get('step')=='confirm_bot_token'
+                     and candidate['request_id']==session.get('request_id')
+                     and cb.data==f"token_confirm_{candidate['bot_id']}_{candidate['request_id']}"
+                     and candidate['expires']>time.time())
+            if not valid:
+                if ((candidate and candidate['expires']<=time.time()) or
+                    (isinstance(session,dict) and session.get('step')=='confirm_bot_token'
+                     and (session.get('expires',0)<=time.time() or not candidate))):
+                    _reset_flow(cb.from_user.id)
+                bot.answer_callback_query(cb.id, 'Подтверждение устарело. Нажми «Сменить токен» ещё раз', show_alert=True)
+                return
+            _reset_flow(cb.from_user.id)
+        result = _replace_owned_token(cb.from_user.id, candidate['bot_id'], candidate['expected'],
+                                      candidate['token'], candidate['me'], bot)
+        _edit(result, cb.message.chat.id, cb.message.message_id, reply_markup=back_to_start_kb())
 
     @staticmethod
     def _cap_lines(header, rows, limit=30):
@@ -575,6 +732,7 @@ def register(bot: telebot.TeleBot):
                     exp_str = "—"
                 lines.append(f"{status} {name} — {exp_str}")
                 kb.add(_btn(f"Продлить {name} (+30д.)", style='success', callback_data=f'renew_bot_{bot_id}'))
+                kb.add(_btn('Сменить токен', callback_data=f'change_token_{bot_id}'))
             kb.add(_btn('Купить новый бот', style='primary', callback_data='buy_new_bot'))
             kb.add(_btn('Назад', icon='🔙', callback_data='back_to_start'))
             _edit("\n".join(lines),
