@@ -7,15 +7,60 @@ from html.parser import HTMLParser
 
 
 def message_html(raw, caption=False):
-    """Entities Telegram используют смещения UTF-16, включая скрытые ссылки"""
-    from telebot.types import Message
+    """Один проход по UTF-16: пересекающиеся entities не повторяют текст.
+
+    На границах пересечений закрываем и переоткрываем теги, чтобы HTML
+    оставался вложенным, а каждый исходный символ выводился ровно один раз.
+    """
     raw = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    text = raw.get('caption' if caption else 'text') or ''
+    encoded = text.encode('utf-16-le')
+    size = len(encoded) // 2
     field = 'caption_entities' if caption else 'entities'
-    raw[field] = [dict(entity, **({'url': html.escape(entity['url'], quote=True)}
-                                if entity.get('url') else {}))
-                  for entity in raw.get(field) or []]
-    message = Message.de_json(raw)
-    return (message.html_caption if caption else message.html_text) or ''
+    simple = dict(bold='b', italic='i', underline='u', strikethrough='s',
+                  spoiler='tg-spoiler', code='code', blockquote='blockquote')
+    spans = []
+    for entity in raw.get(field) or []:
+        kind = entity['type']
+        if kind in simple:
+            tag = simple[kind]
+            opening, closing = f'<{tag}>', f'</{tag}>'
+        elif kind == 'expandable_blockquote':
+            opening, closing = '<blockquote expandable>', '</blockquote>'
+        elif kind == 'pre':
+            language = html.escape(entity.get('language') or '', quote=True)
+            opening = f'<pre><code class="language-{language}">' if language else '<pre>'
+            closing = '</code></pre>' if language else '</pre>'
+        elif kind in ('text_link', 'text_mention'):
+            url = entity['url'] if kind == 'text_link' else f'tg://user?id={entity["user"]["id"]}'
+            opening, closing = f'<a href="{html.escape(url, quote=True)}">', '</a>'
+        elif kind == 'custom_emoji':
+            opening = f'<tg-emoji emoji-id="{html.escape(str(entity["custom_emoji_id"]), quote=True)}">'
+            closing = '</tg-emoji>'
+        elif kind == 'date_time':
+            opening = (f'<tg-time unix="{html.escape(str(entity["unix_time"]), quote=True)}" '
+                       f'format="{html.escape(entity["date_time_format"], quote=True)}">')
+            closing = '</tg-time>'
+        else:
+            continue  # URL, mention, hashtag и т. п. остаются исходным текстом.
+        start = max(0, entity['offset'])
+        end = min(size, entity['offset'] + entity['length'])
+        if start < end:
+            spans.append((start, end, opening, closing))
+    spans.sort(key=lambda span: (span[0], -span[1]))
+    boundaries = sorted({0, size} | {pos for span in spans for pos in span[:2]})
+    result, previous = [], []
+    for start, end in zip(boundaries, boundaries[1:]):
+        active = [i for i, span in enumerate(spans) if span[0] <= start < span[1]]
+        common = 0
+        while common < min(len(previous), len(active)) and previous[common] == active[common]:
+            common += 1
+        result.extend(spans[i][3] for i in reversed(previous[common:]))
+        result.extend(spans[i][2] for i in active[common:])
+        result.append(html.escape(encoded[start*2:end*2].decode('utf-16-le'), quote=False))
+        previous = active
+    result.extend(spans[i][3] for i in reversed(previous))
+    return ''.join(result)
 
 
 def ordered_album(items, key=lambda message: message.message_id):

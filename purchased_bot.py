@@ -13,7 +13,7 @@ from html.parser import HTMLParser
 from datetime import timedelta, timezone
 import database as db
 from safe_logging import register_secret
-from telegram_text import edit_html, protect_text_lengths
+from telegram_text import edit_html, protect_text_lengths, message_html, html_chunks
 from datetime import datetime
 from functools import wraps
 from types import SimpleNamespace
@@ -654,7 +654,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                         db_bot_id, phrases, rule['text'], rule['id'], rule['offhours']), revision): return
                 result = 'Фразы сохранены'
             else:
-                text = m.html_text or ''
+                text = message_html(m.json)
                 validate_support_html(text, 3600 if action == 'text' and state['key'] == 'txt_offhours' else 4000)
                 if action == 'text' and state['key'] == 'txt_offhours':
                     validate_support_html(re.sub(r'\{(start|end|wait)\}',
@@ -691,8 +691,13 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         for batch in batches:
             text = ' '.join(m.text or m.caption or '' for m in batch)
             for rule in matching_rules(db_bot_id, text, schedule):
-                preview = html.escape(' '.join(re.sub('<[^>]+>', '', rule['text']).split())[:80])
-                notice = sorted({(chat, thread, f'{TE_ROBOT} Автоответ: {preview}') for chat, mid, thread, src in mappings})
+                normalized = ' ' + normalize_phrase(text) + ' '
+                phrase = next(s for s in rule['phrases'] if ' ' + normalize_phrase(s) + ' ' in normalized)
+                notice_text = (f'{TE_ROBOT} <b>Автоответ на «{html.escape(phrase)}»</b>\n'
+                               f'<blockquote>{rule["text"]}</blockquote>')
+                notice = [(chat, thread, part)
+                          for chat, thread in sorted({(chat, thread) for chat, mid, thread, src in mappings})
+                          for part in html_chunks(notice_text, 4096)]
                 if db.db_support_notify(db_bot_id, uid, 'rule:' + str(rule['id']), rule['text'], notice, now, 43200,
                                         album=messages[0].media_group_id):
                     break
@@ -848,7 +853,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                 if not _commit_input(m.from_user.id, state,
                         lambda: db.db_faq_edit(db_bot_id, node_id, 'title', title)): return
             else:
-                text = m.html_text or ''
+                text = message_html(m.json)
                 db.validate_faq_text(text)
                 validate_support_html(text, db.FAQ_TEXT_LIMIT)
                 from telegram_text import send_html

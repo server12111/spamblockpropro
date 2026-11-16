@@ -52,7 +52,7 @@ def run():
     click(f'fq_v_{nid}_0')
     check('предпросмотр показывает текст и возврат к редактору','<i>Завтра</i>' in last_edit()[1][0] and 'К редактору' in [b.text for b in buttons()])
     click(f'fq_text_{nid}'); bad=q.message(777,10,'сломано')
-    with patch.object(type(bad),'html_text',new=property(lambda self:'<b>сломано')): q.dispatch(bot,bad)
+    with patch.object(pb,'message_html',return_value='<b>сломано'): q.dispatch(bot,bad)
     check('битый HTML не сохраняется',db.db_faq_get(bid,nid)['text']=='<i>Завтра</i>')
     click(f'fq_e_{nid}_0'); q.dispatch(bot,q.message(777,11,'Не менять'))
     check('Отмена сбрасывает отдельный ввод',db.db_faq_get(bid,nid)['text']=='<i>Завтра</i>' and db.DBState(bid).get(777) is None)

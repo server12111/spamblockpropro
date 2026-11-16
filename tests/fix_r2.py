@@ -419,7 +419,7 @@ def welcome_retry():
     bid, bot, _ = q.fresh(False)
     q.click(bot, 777, 'p_edit_welcome')
     m = q.message(777, 3, 'Плохой')
-    with patch.object(type(m), 'html_text', property(lambda self: '<b>Плохой')):
+    with patch.object(pb, 'message_html', return_value='<b>Плохой'):
         q.dispatch(bot, m)
     q.dispatch(bot, q.message(777, 4, 'Исправлено'))
     assert db.db_get_bot_setting(bid, 'welcome') == 'Исправлено'

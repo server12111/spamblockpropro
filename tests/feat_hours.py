@@ -45,7 +45,7 @@ def run():
 
     q.click(bot, 777, 'ps_edit_welcome')
     q.dispatch(bot, q.message(777, 1, 'Привет', entities=[dict(type='bold', offset=0, length=6)]))
-    check('форматирование m.html_text сохраняется', db.db_get_bot_setting(bid, 'welcome') == '<b>Привет</b>')
+    check('форматирование entities сохраняется', db.db_get_bot_setting(bid, 'welcome') == '<b>Привет</b>')
     q.dispatch(bot, q.message(uid, 1, '/start'))
     check('новое приветствие реально отправлено', q.SENT[-1][1][1] == '<b>Привет</b>')
     q.click(bot, 777, 'ps_reset_welcome')
@@ -62,7 +62,7 @@ def run():
     check('сброс txt_offhours', db.db_get_bot_setting(bid, 'txt_offhours') == pb.DEFAULT_OFFHOURS)
     q.click(bot, 777, 'ps_edit_welcome')
     bad = q.message(777, 4, 'сломано')
-    with patch.object(type(bad), 'html_text', new=property(lambda self: '<b>сломано')):
+    with patch.object(pb, 'message_html', return_value='<b>сломано'):
         q.dispatch(bot, bad)
     check('битый HTML не сохраняется', db.db_get_bot_setting(bid, 'welcome') == pb.DEFAULT_WELCOME)
     q.click(bot, 777, 'ps_texts')
@@ -95,7 +95,8 @@ def run():
     delivered_index = next(i for i,s in enumerate(sent) if s[0]=='copy_message')
     response_index = next(i for i,s in enumerate(sent) if s[0]=='send_message' and s[1][1]=='<i>Наш ответ</i>')
     check('автоответ и нерабочее время после доставки', response_index > delivered_index and any('65 часов' in s[1][1] for s in sent if s[0]=='send_message'))
-    notice = next(s for s in sent if s[0]=='send_message' and 'Автоответ:' in s[1][1])
+    notice = next(s for s in sent if s[0]=='send_message' and 'Автоответ на «цена»' in s[1][1])
+    check('заметка: фраза и полный форматированный ответ', notice[1][1] == f'{pb.TE_ROBOT} <b>Автоответ на «цена»</b>\n<blockquote><i>Наш ответ</i></blockquote>')
     c=db._conn(); mapped=c.execute('SELECT 1 FROM fs_msgs WHERE bot_id=? AND group_msg_id=?',(bid,notice[3])).fetchone(); c.close()
     check('заметка в теме не стала ответом и не вошла в соответствия', mapped is None and notice[2].get('message_thread_id'))
     start=len(q.SENT); q.NOW[0]+=100
@@ -145,11 +146,11 @@ def run():
     q.FAULT=None; q.NOW[0]+=60; q.drain(bot2,bid)
     check('отложенный автоответ отправлен после рестарта без дубля обращения', sum(s[0]=='copy_message' for s in q.SENT[start:])==1 and any(s[0]=='send_message' and s[1][0]==uid+9 and s[1][1]=='<i>Наш ответ</i>' for s in q.SENT[start:]))
     def notice_fault(name,a,k):
-        if name=='send_message' and a[0]==gid and 'Автоответ:' in a[1]: raise q.error(429,'retry',30)
+        if name=='send_message' and a[0]==gid and 'Автоответ на «цена»' in a[1]: raise q.error(429,'retry',30)
     q.FAULT=notice_fault;start=len(q.SENT)
     q.dispatch(bot,q.message(uid+10,70,'цена'));q.drain(bot,bid)
     q.FAULT=None;q.NOW[0]+=30;q.drain(bot2,bid)
-    check('429 заметки повторяет только заметку после рестарта',sum(s[0]=='send_message' and s[1][0]==uid+10 and s[1][1]=='<i>Наш ответ</i>' for s in q.SENT[start:])==1 and any(s[0]=='send_message' and s[1][0]==gid and 'Автоответ:' in s[1][1] for s in q.SENT[start:]))
+    check('429 заметки повторяет только заметку после рестарта',sum(s[0]=='send_message' and s[1][0]==uid+10 and s[1][1]=='<i>Наш ответ</i>' for s in q.SENT[start:])==1 and any(s[0]=='send_message' and s[1][0]==gid and 'Автоответ на «цена»' in s[1][1] for s in q.SENT[start:]))
     db.db_auto_save(bid,['цена'],'Ответ второго правила')
     start=len(q.SENT)
     for mid in (80,81):
@@ -160,7 +161,7 @@ def run():
     db.db_auto_save(private_id,['цена'],'Личный автоответ')
     start=len(q.SENT);q.dispatch(private_bot,q.message(uid+12,90,'цена'));q.drain(private_bot,private_id)
     private_sent=q.SENT[start:]
-    check('личный режим: короткая заметка после обращения админам',any(s[0]=='send_message' and s[1][0]==777 and 'Автоответ:' in s[1][1] for s in private_sent) and any(s[0]=='send_message' and s[1][0]==uid+12 and s[1][1]=='Личный автоответ' for s in private_sent))
+    check('личный режим: полная заметка после обращения админам',any(s[0]=='send_message' and s[1][0]==777 and s[1][1]==f'{pb.TE_ROBOT} <b>Автоответ на «цена»</b>\n<blockquote>Личный автоответ</blockquote>' for s in private_sent) and any(s[0]=='send_message' and s[1][0]==uid+12 and s[1][1]=='Личный автоответ' for s in private_sent))
     def rejected(value):
         try:pb.parse_phrases(value)
         except ValueError:return True
