@@ -207,12 +207,12 @@ def broadcast_type_kb(scope):
 def super_admin_kb():
     kb = InlineKeyboardMarkup()
     kb.row(
-        _btn('Рассылка (главный бот)',  style='primary', callback_data='broadcast'),
-        _btn('Рассылка по всем ботам', style='primary', callback_data='broadcast_all'),
+        _btn('Рассылка (главный бот)', icon='📣',  style='primary', callback_data='broadcast'),
+        _btn('Рассылка по всем ботам', icon='📣', style='primary', callback_data='broadcast_all'),
     )
     kb.row(
         _btn('Управление ботами', style='primary', callback_data='manage_bots'),
-        _btn('Статистика',        style='primary', callback_data='stats'),
+        _btn('Статистика', icon='📊',        style='primary', callback_data='stats'),
     )
     kb.row(
         _btn('Установить цену', style='success', callback_data='set_price'),

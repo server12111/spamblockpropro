@@ -253,7 +253,7 @@ def _mgmt_list(bot_id):
     for tid, body in templates[:MGMT_TEMPLATE_LIMIT]:
         preview = body[:35] + '…' if len(body) > 35 else body
         kb.add(_fbtn(preview, callback_data=f'fs_mgmt_view_{tid}'))
-    kb.add(_fbtn('Добавить шаблон', callback_data='fs_mgmt_add'))
+    kb.add(_fbtn('Добавить шаблон', icon='➕', callback_data='fs_mgmt_add'))
     return text, kb, 'HTML'
 
 
@@ -350,15 +350,15 @@ def fs_management_callback(pbot, bot_id, cb):
                 db_del_template(tid, bot_id)
             else:
                 kb = InlineKeyboardMarkup()
-                kb.add(_fbtn('Удалить', style='danger', callback_data=f'fs_mgmt_delete_{tid}'))
-                kb.add(_fbtn('Назад', callback_data='fs_mgmt_back'))
+                kb.add(_fbtn('Удалить', icon='❌', style='danger', callback_data=f'fs_mgmt_delete_{tid}'))
+                kb.add(_fbtn('Назад', icon='🔙', callback_data='fs_mgmt_back'))
                 screen = (_mgmt_preview(body), kb, None)  # шаблон — обычный текст
         elif data == 'fs_mgmt_add':
             if len(db_get_templates(bot_id)) >= MGMT_TEMPLATE_LIMIT:
                 pbot.answer_callback_query(cb.id, 'Можно сохранить не больше 50 шаблонов', show_alert=True)
                 return
             kb = InlineKeyboardMarkup()
-            kb.add(_fbtn('Отмена', callback_data='fs_mgmt_cancel'))
+            kb.add(_fbtn('Отмена', icon='❌', callback_data='fs_mgmt_cancel'))
             screen = (f'<b>{TE_NOTE} Отправь текст шаблона сюда</b>', kb, 'HTML')
         elif data not in ('fs_mgmt_back', 'fs_mgmt_cancel'):
             pbot.answer_callback_query(cb.id, 'Доступно только главному админу', show_alert=True)
@@ -773,7 +773,7 @@ def fs_pin_markup(bot_id: int, user_id: int):
     kb = InlineKeyboardMarkup()
     blocked = db_is_blocked(bot_id, user_id)
     kb.row(
-        _fbtn('Шаблоны', style='primary', callback_data=f'fs_pin_tpl_{user_id}'),
+        _fbtn('Шаблоны', icon='📝', style='primary', callback_data=f'fs_pin_tpl_{user_id}'),
         _fbtn('Разблокировать' if blocked else 'Заблокировать',
               icon='✔️' if blocked else '🚫', style='success' if blocked else 'danger',
               callback_data=f'fs_pin_unblock_{user_id}' if blocked else f'fs_pin_block_{user_id}'),
@@ -1494,7 +1494,7 @@ def fs_pin_callback(pbot, bot_id: int, cb):
         for template_id, text in templates:
             preview = text[:35] + '…' if len(text) > 35 else text
             kb.add(_fbtn(preview, callback_data=f'fs_pin_send_{uid}_{template_id}'))
-        kb.add(_fbtn('Закрыть', callback_data=f'fs_pin_close_{uid}'))
+        kb.add(_fbtn('Закрыть', icon='❌', callback_data=f'fs_pin_close_{uid}'))
         _api(pbot.send_message, group[1], f'{TE_NOTE} Выбери шаблон',
              parse_mode='HTML', message_thread_id=topic[0], reply_markup=kb)
         pbot.answer_callback_query(cb.id)

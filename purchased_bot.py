@@ -303,10 +303,10 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
     def pk_start(show_admin: bool = False):
         kb = InlineKeyboardMarkup()
         if db.db_faq_nodes(db_bot_id):
-            kb.add(_pbtn('FAQ', callback_data='fq_u_0_0'))
+            kb.add(_pbtn('FAQ', icon='❓', callback_data='fq_u_0_0'))
         kb.add(_pbtn('Отправить сообщение', icon='📤', style='primary', callback_data='p_send'))
         if show_admin:
-            kb.add(_pbtn('Панель админа', style='primary', callback_data='p_open_admin'))
+            kb.add(_pbtn('Панель админа', icon='⌨️', style='primary', callback_data='p_open_admin'))
         if db_is_marketplace_enabled(db_bot_id) and BOT_USERNAME:
             kb.add(_pbtn('Купить такого бота', icon='💎', style='success',
                          url=f'https://t.me/{BOT_USERNAME}?start=via_{db_bot_id}'))
@@ -321,7 +321,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         kb = InlineKeyboardMarkup()
         kb.row(
             _pbtn('Назад',    icon='🔙',                callback_data=f'p_back_reply_{target_id}'),
-            _pbtn('Шаблоны', style='primary',           callback_data=f'p_templates_{target_id}'),
+            _pbtn('Шаблоны', icon='📝', style='primary',           callback_data=f'p_templates_{target_id}'),
         )
         return kb
 
@@ -331,9 +331,9 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         for tid, text in templates:
             preview = text[:35] + '…' if len(text) > 35 else text
             kb.add(_pbtn(preview, icon='💬', style='primary', callback_data=f'p_use_tpl_{target_id}_{tid}'))
-        kb.add(_pbtn('Добавить шаблон', style='success', callback_data=f'p_add_tpl_{target_id}'))
+        kb.add(_pbtn('Добавить шаблон', icon='➕', style='success', callback_data=f'p_add_tpl_{target_id}'))
         if templates:
-            kb.add(_pbtn('Удалить',  style='danger',  callback_data=f'p_del_tpl_menu_{target_id}'))
+            kb.add(_pbtn('Удалить', icon='❌',  style='danger',  callback_data=f'p_del_tpl_menu_{target_id}'))
         kb.add(_pbtn('Назад', icon='🔙', callback_data=f'p_back_reply_{target_id}'))
         return kb
 
@@ -358,22 +358,22 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
     def pk_admin(uid=None):
         kb = InlineKeyboardMarkup()
         kb.row(
-            _pbtn('Статистика',  style='primary', callback_data='p_stats'),
-            _pbtn('Мой баланс',  style='success', callback_data='p_balance'),
+            _pbtn('Статистика', icon='📊',  style='primary', callback_data='p_stats'),
+            _pbtn('Мой баланс', icon='💰',  style='success', callback_data='p_balance'),
         )
-        kb.add(_pbtn('Рассылка', style='primary', callback_data='p_broadcast'))
+        kb.add(_pbtn('Рассылка', icon='📣', style='primary', callback_data='p_broadcast'))
         if is_primary_admin(uid):
-            kb.row(_pbtn('Тексты', callback_data='ps_texts'),
-                   _pbtn('Рабочее время', callback_data='ps_hours'))
-            kb.row(_pbtn('Автоответы', callback_data='ps_rules_0'),
-                   _pbtn('Шаблоны', callback_data='p_admin_templates'))
-            kb.add(_pbtn('FAQ', callback_data='fq_e_0_0'))
+            kb.row(_pbtn('Тексты', icon='✏️', callback_data='ps_texts'),
+                   _pbtn('Рабочее время', icon='⏰', callback_data='ps_hours'))
+            kb.row(_pbtn('Автоответы', icon='🤖', callback_data='ps_rules_0'),
+                   _pbtn('Шаблоны', icon='📝', callback_data='p_admin_templates'))
+            kb.add(_pbtn('FAQ', icon='❓', callback_data='fq_e_0_0'))
         else:
-            kb.add(_pbtn('Шаблоны', callback_data='p_admin_templates'))
+            kb.add(_pbtn('Шаблоны', icon='📝', callback_data='p_admin_templates'))
         kb.add(_pbtn('Группа техподдержки', icon='💬', style='primary', callback_data='fs_group_menu'))
-        kb.add(_pbtn('Заблокированные',     style='primary', callback_data='p_blocked_list'))
-        kb.add(_pbtn('Управление админами', style='primary', callback_data='p_admins'))
-        kb.add(_pbtn('Удалить бота',        style='danger',  callback_data='p_delete_bot'))
+        kb.add(_pbtn('Заблокированные', icon='🚫',     style='primary', callback_data='p_blocked_list'))
+        kb.add(_pbtn('Управление админами', icon='👥', style='primary', callback_data='p_admins'))
+        kb.add(_pbtn('Удалить бота', icon='❌',        style='danger',  callback_data='p_delete_bot'))
         return kb
 
     def pk_confirm_delete():
@@ -394,10 +394,26 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             pbot.send_message(event.chat.id, 'Доступно только главному админу')
         return False
 
+    # Иконки служебных кнопок экранов настроек и FAQ: по точной подписи или по действию (callback),
+    # чтобы подписи, введённые админом (правила, разделы FAQ), иконку не получали
+    _SETTINGS_ICONS = {
+        'Изменить': '✏️', 'Сбросить': '🔄', 'Назад': '🔙', 'Отмена': '❌', 'Добавить': '➕',
+        'Проверить фразу': '🔍', 'Изменить фразы': '✏️', 'Изменить текст': '📝', 'Удалить': '❌',
+        'Да, удалить': '❌', 'Добавить кнопку': '➕', 'Название': '✏️', 'Текст': '📝',
+        'Как видит пользователь': '👤', 'Не нашёл ответ — написать': '📤', 'Главное меню': '🔙',
+        'К редактору': '🔙', 'Приветствие': '💬', 'Сообщение отправлено': '✔️', 'Нерабочее время': '⏰',
+        'Включено': '✔️', 'Выключено': '❌',
+    }
+
+    def _settings_icon(label, data):
+        if data in ('ps_grid_start', 'ps_grid_end', 'ps_grid_tz') or data.startswith('ps_flag_'):
+            return '⏰'
+        return _SETTINGS_ICONS.get(label)
+
     def settings_show(cb, text, rows):
         kb = InlineKeyboardMarkup()
         for row in rows:
-            kb.row(*[_pbtn(label, callback_data=data) for label, data in row])
+            kb.row(*[_pbtn(label, icon=_settings_icon(label, data), callback_data=data) for label, data in row])
         _edit(text, cb.message.chat.id, cb.message.message_id, kb)
 
     def settings_input(cb, step, prompt, back, **values):
@@ -530,7 +546,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                 phrases = parse_phrases(m.text)
                 if action == 'new_phrases':
                     _set_flow(m.from_user.id, dict(step='support_input', action='new_answer', phrases=phrases, back='ps_rules_0'))
-                    kb = InlineKeyboardMarkup(); kb.add(_pbtn('Отмена', callback_data='ps_rules_0'))
+                    kb = InlineKeyboardMarkup(); kb.add(_pbtn('Отмена', icon='❌', callback_data='ps_rules_0'))
                     pbot.send_message(m.chat.id, 'Введи текст ответа. Форматирование сохраняется', reply_markup=kb)
                     return
                 rule = next((r for r in db.db_auto_rules(db_bot_id) if r['id'] == state['rid']), None)
@@ -553,11 +569,11 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                 result = 'Текст сохранён'
         except Exception as exc:
             result = str(exc) if isinstance(exc, ValueError) else 'Текст не сохранён: проверь HTML и попробуй ещё раз'
-            kb = InlineKeyboardMarkup(); kb.add(_pbtn('Отмена', callback_data=state['back']))
+            kb = InlineKeyboardMarkup(); kb.add(_pbtn('Отмена', icon='❌', callback_data=state['back']))
             pbot.send_message(m.chat.id, result, reply_markup=kb)
             return
         pstate.finish(m.from_user.id, revision)
-        kb = InlineKeyboardMarkup(); kb.add(_pbtn('Назад', callback_data=state['back']))
+        kb = InlineKeyboardMarkup(); kb.add(_pbtn('Назад', icon='🔙', callback_data=state['back']))
         pbot.send_message(m.chat.id, result, reply_markup=kb)
 
     def after_delivery(messages, group, mappings):
@@ -683,8 +699,8 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             elif action == 'del' and node:
                 count = db.db_faq_subtree(db_bot_id, node_id) - 1
                 kb = InlineKeyboardMarkup()
-                kb.row(_pbtn('Да, удалить', callback_data=f'fq_yes_{node_id}', style='danger'),
-                       _pbtn('Отмена', callback_data=f'fq_e_{node_id}_0'))
+                kb.row(_pbtn('Да, удалить', icon='❌', callback_data=f'fq_yes_{node_id}', style='danger'),
+                       _pbtn('Отмена', icon='❌', callback_data=f'fq_e_{node_id}_0'))
                 _edit(f"Удалить «{html.escape(node['title'])}» и всё, что внутри ({count})?", cb.message.chat.id, cb.message.message_id, kb)
             elif action == 'yes' and node:
                 parent = node['parent_id'] or 0
@@ -731,7 +747,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             faq_open_saved(m, node_id)
         except Exception as exc:
             message = str(exc) if isinstance(exc, ValueError) else 'Текст не сохранён: проверь HTML и попробуй ещё раз'
-            kb = InlineKeyboardMarkup(); kb.add(_pbtn('Отмена', callback_data=f'fq_e_{state["node_id"]}_0'))
+            kb = InlineKeyboardMarkup(); kb.add(_pbtn('Отмена', icon='❌', callback_data=f'fq_e_{state["node_id"]}_0'))
             pbot.send_message(m.chat.id, message, reply_markup=kb)
 
     # ── Команды ────────────────────────────────────────
@@ -832,7 +848,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                 _pbtn(preview, icon='💬', style='primary', callback_data='p_noop'),
                 _pbtn('Удалить', icon='❌', style='danger', callback_data=f'p_mgdel_tpl_{tid}'),
             )
-        kb.add(_pbtn('Добавить шаблон', style='success', callback_data='p_mgadd_tpl'))
+        kb.add(_pbtn('Добавить шаблон', icon='➕', style='success', callback_data='p_mgadd_tpl'))
         kb.add(_pbtn('Назад', icon='🔙', callback_data='p_back_admin'))
         return kb, templates
 
@@ -1297,9 +1313,9 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             lines.append(label)
             if aid != primary_id:
                 kb.add(_pbtn(f"Удалить {aid}", icon='❌', style='danger', callback_data=f'p_rm_admin_{aid}'))
-        kb.add(_pbtn('Добавить админа', style='success', callback_data='p_add_admin'))
+        kb.add(_pbtn('Добавить админа', icon='➕', style='success', callback_data='p_add_admin'))
         if primary_id and primary_id != cb_from_user_id_placeholder:
-            kb.add(_pbtn('Сменить главного', style='primary', callback_data='p_change_primary'))
+            kb.add(_pbtn('Сменить главного', icon='👑', style='primary', callback_data='p_change_primary'))
         kb.add(_pbtn('Назад', icon='🔙', callback_data='p_back_admin'))
         _edit("\n".join(lines), chat_id, message_id,
             parse_mode='HTML', reply_markup=kb)
@@ -1408,7 +1424,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         if balance > 0:
             kb.row(
                 _pbtn('Вывести TON',   icon='💲', style='primary',  callback_data='p_withdraw'),
-                _pbtn('Продлить бота', style='success', callback_data='p_renew_balance'),
+                _pbtn('Продлить бота', icon='🔄', style='success', callback_data='p_renew_balance'),
             )
         kb.add(_pbtn('Назад', icon='🔙', callback_data='p_back_admin'))
         ton_text = f"\n{TE_DIAMOND} Эквивалент: ~<b>{ton_equiv} TON</b>" if ton_equiv else ""
@@ -1494,8 +1510,8 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             try:
                 kb_admin = InlineKeyboardMarkup()
                 kb_admin.row(
-                    _pbtn(f'Подтвердить #{wr_id}', style='success', callback_data=f'wr_confirm_{wr_id}'),
-                    _pbtn(f'Отклонить #{wr_id}',   style='danger',  callback_data=f'wr_reject_{wr_id}'),
+                    _pbtn(f'Подтвердить #{wr_id}', icon='✔️', style='success', callback_data=f'wr_confirm_{wr_id}'),
+                    _pbtn(f'Отклонить #{wr_id}', icon='❌',   style='danger',  callback_data=f'wr_reject_{wr_id}'),
                 )
                 from database import get_price as _get_price
                 ton_rate = get_ton_amount()
