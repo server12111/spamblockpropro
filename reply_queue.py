@@ -1,11 +1,12 @@
 """Ответы администратора: сохранение до API, квитанции частей и отложенные повторы"""
 import json
+import hashlib
 import threading
 import time
 from telebot.types import Message
 import database as db
 import delivery_queue as dq
-from telegram_text import html_chunks
+from telegram_text import html_chunks, message_html
 from keyboards import TE_INBOX, TE_CHECK, TE_EXCLAM
 
 _guard = threading.RLock()
@@ -13,6 +14,76 @@ _guard = threading.RLock()
 
 class PartialReply(Exception):
     pass
+
+
+def _sender(bot, bot_id):
+    with _guard:
+        sender = getattr(bot, '_reply_sender', None)
+        if sender is None:
+            sender = bot._reply_sender = ReplySender(bot, bot_id)
+        return sender
+
+
+def _album_prefix(mode, chat, media_group):
+    return 'album:' + hashlib.sha256(json.dumps([mode, chat, media_group]).encode()).hexdigest() + ':'
+
+
+def album_target(bot_id, chat, media_group):
+    """Маршрут следующих частей личного альбома переживает потерю pstate"""
+    c = db._conn()
+    try:
+        row = c.execute('SELECT payload FROM reply_queue WHERE bot_id=? AND source_key LIKE ? '
+                        'ORDER BY id DESC LIMIT 1',
+                        (bot_id, _album_prefix('album', chat, media_group) + '%')).fetchone()
+        return json.loads(row[0])['target'] if row else None
+    finally: c.close()
+
+
+def enqueue_album(bot, bot_id, message, payload, delay=.8):
+    """Каждая часть сначала сохраняется; таймер только ускоряет отправку"""
+    prefix = _album_prefix(payload['mode'], message.chat.id, message.media_group_id)
+    sender = _sender(bot, bot_id)
+    with sender.lock:
+        c = db._conn()
+        try:
+            c.execute('BEGIN IMMEDIATE')
+            rows = c.execute('SELECT source_key,payload,progress,status,next_at,attempts FROM reply_queue '
+                             'WHERE bot_id=? AND source_key LIKE ? ORDER BY id DESC',
+                             (bot_id, prefix + '%')).fetchall()
+            for key, raw, _, _, _, _ in rows:
+                if message.message_id in json.loads(raw)['ids']:
+                    return key
+            key = prefix + str(message.message_id)
+            data = dict(payload, ids=[], authors={})
+            retry_at = 0
+            if rows:
+                old_key, raw, progress, status, next_at, attempts = rows[0]
+                # После успешной части API состав пачки неизменен
+                if status == 'pending' and not json.loads(progress).get('ops'):
+                    key, data = old_key, json.loads(raw)
+                    retry_at = next_at if attempts else 0
+            data['ids'] = sorted(data['ids'] + [message.message_id])
+            data['authors'][str(message.message_id)] = message.from_user.id
+            ready = max(retry_at, time.time() + (delay if len(data['ids']) < 10 else 0))
+            c.execute('INSERT INTO reply_queue(bot_id,source_key,payload,next_at) VALUES(?,?,?,?) '
+                      'ON CONFLICT(bot_id,source_key) DO UPDATE SET payload=excluded.payload,next_at=excluded.next_at',
+                      (bot_id, key, json.dumps(data, ensure_ascii=False), ready))
+            c.commit()
+            return key
+        finally: c.close()
+
+
+def flush_album(bot, bot_id, key):
+    sender = _sender(bot, bot_id)
+    with sender.lock:
+        c = db._conn()
+        try:
+            # Таймер сбора не обходит retry_after после попытки API
+            c.execute("UPDATE reply_queue SET next_at=0 WHERE bot_id=? AND source_key=? "
+                      "AND status='pending' AND attempts=0", (bot_id, key))
+            c.commit()
+        finally: c.close()
+    pump(bot, bot_id)
 
 
 def pending(bot_id):
@@ -56,7 +127,8 @@ class ReplySender(dq.DeliverySender):
         if mode == 'text':
             import html
             result = None
-            for part in html_chunks(f'<b>{TE_INBOX} Сообщение от администратора</b>\n\n' + html.escape(payload['text']),4096):
+            body = message_html(payload['message']) if payload.get('message') else html.escape(payload['text'])
+            for part in html_chunks(f'<b>{TE_INBOX} Сообщение от администратора</b>\n\n' + body,4096):
                 result = self.api(self.bot.send_message,target,part,parse_mode='HTML').message_id
             return result
         if mode in ('album', 'forum_album'):
@@ -64,8 +136,17 @@ class ReplySender(dq.DeliverySender):
                 group = fs.fs_get_group(self.bot_id)
                 if not group or group[1] != payload['chat']:
                     raise ValueError('Группа изменилась')
-            result = self.api(self.bot.copy_messages,target,payload['chat'],payload['ids'])
-            if len(result) != len(payload['ids']):
+            ids = payload['ids']
+            if payload.get('authors'):
+                # Состав разрешённых частей фиксируем перед первым API
+                if not self.progress.get('ops'):
+                    self.progress['album_ids'] = [mid for mid in ids
+                        if fs.fs_is_admin(self.bot_id, payload['authors'][str(mid)])]
+                    self._save()
+                ids = self.progress['album_ids']
+                if not ids: raise ValueError('Доступ отозван')
+            result = self.api(self.bot.copy_messages,target,payload['chat'],ids)
+            if len(result) != len(ids):
                 raise PartialReply()
             if mode == 'forum_album': fs.fs_log_admin_msg(self.bot_id,target)
             return result[0].message_id if result else None
@@ -73,26 +154,25 @@ class ReplySender(dq.DeliverySender):
         if mode == 'forum':
             return fs._deliver_admin_reply(self.bot,self.bot_id,m,target,payload['thread'],payload.get('reply'))
         if m.content_type == 'photo':
-            import html
             header=f'<b>{TE_INBOX} Сообщение от администратора</b>'
-            caption=header+('\n\n'+html.escape(m.caption) if m.caption else '')
+            body=message_html(m.json, caption=True)
+            caption=header+('\n\n'+body if body else '')
             overflow=len(caption.encode('utf-16-le'))//2>1024
             result=self.api(self.bot.send_photo,target,m.photo[-1].file_id,
                             caption=header if overflow else caption,parse_mode='HTML').message_id
             if overflow:
-                for part in html_chunks(html.escape(m.caption),4096):
+                for part in html_chunks(body,4096):
                     self.api(self.bot.send_message,target,part,parse_mode='HTML')
             return result
         return fs._relay_single(self.bot,target,m.chat.id,m.message_id,src_msg=m)
 
 
 def pump(bot, bot_id):
-    with _guard:
-        sender = getattr(bot,'_reply_sender',None)
-        if sender is None:
-            sender = bot._reply_sender = ReplySender(bot,bot_id)
+    import forum_support as fs
+    sender = _sender(bot, bot_id)
     # Один поток доставки на экземпляр, общая блокировка защищает его квитанции
-    with sender.lock:
+    # Порядок блокировок общий с приёмом и таймером форумного альбома
+    with fs._mgmt_lock(bot_id), sender.lock:
         c=db._conn()
         try:
             rows=c.execute("SELECT id,payload,progress,attempts,next_at FROM reply_queue "

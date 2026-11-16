@@ -7,6 +7,7 @@ import math
 import re
 import json
 import uuid
+from input_validation import bounded_number
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 from html.parser import HTMLParser
 from datetime import timedelta, timezone
@@ -1162,7 +1163,8 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         target_id = int(state.split('_')[-1])
         from reply_queue import enqueue
         status, _ = enqueue(pbot, db_bot_id, f'private:{m.chat.id}:{m.message_id}',
-                            dict(mode='text', target=target_id, text=m.text or '', notify=m.chat.id))
+                            dict(mode='text', target=target_id, text=m.text or '',
+                                 message=m.json, notify=m.chat.id))
         if status == 'pending':
             pbot.send_message(m.chat.id, 'Ответ сохранён, отправлю позже', reply_markup=pk_close())
 
@@ -1176,6 +1178,10 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             batches = [reply_albums.pop(k) for k in keys if k in reply_albums]
         for batch in batches:
             batch['timer'].cancel()
+            if batch.get('queue_key'):
+                from reply_queue import flush_album
+                flush_album(pbot, db_bot_id, batch['queue_key'])
+                continue
             if not is_admin(batch['admin']):
                 continue
             from telegram_text import ordered_album
@@ -1186,11 +1192,17 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
 
     pbot._flush_reply_albums = flush_reply_albums
 
+    def persisted_album_target(m):
+        if not m.media_group_id: return None
+        from reply_queue import album_target
+        return album_target(db_bot_id, m.chat.id, m.media_group_id)
+
     @pbot.message_handler(
         content_types=['photo', 'video', 'document', 'audio', 'animation', 'voice', 'video_note', 'sticker', 'contact', 'location', 'venue', 'poll'],
         func=lambda m: isinstance(pstate.get(m.from_user.id), str)
                        and pstate[m.from_user.id].startswith('await_reply_')
                        or (m.from_user.id, m.media_group_id) in reply_album_routes
+                       or persisted_album_target(m) is not None
     )
     def p_admin_photo_reply(m):
         if not is_admin(m.from_user.id):
@@ -1199,13 +1211,25 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             return
         if m.media_group_id:
             key = (m.from_user.id, m.media_group_id)
-            with reply_album_lock:
-                state = _take_flow(m.from_user.id, 'await_reply_') if key not in reply_album_routes else None
-                if state:
+            with reply_album_lock, flow_lock:
+                state = pstate.get(m.from_user.id) if key not in reply_album_routes else None
+                if isinstance(state, str) and state.startswith('await_reply_'):
                     reply_album_routes[key] = (int(state.split('_')[-1]), time.time())
+                else:
+                    state = None
                 route = reply_album_routes.get(key)
+                if not route:
+                    target = persisted_album_target(m)
+                    if target is not None:
+                        route = reply_album_routes[key] = (target, time.time())
                 if not route: return
+                from reply_queue import enqueue_album
+                queue_key = enqueue_album(pbot, db_bot_id, m,
+                    dict(mode='album', target=route[0], chat=m.chat.id, notify=m.chat.id), delay=1)
+                if state:
+                    _take_flow(m.from_user.id, 'await_reply_')
                 batch = reply_albums.setdefault(key, dict(admin=m.from_user.id, target=route[0], ids=[]))
+                batch['queue_key'] = queue_key
                 if 'timer' in batch: batch['timer'].cancel()
                 batch['ids'].append(m.message_id)
                 batch['timer'] = threading.Timer(1, flush_reply_albums, args=(key,))
@@ -1329,9 +1353,9 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
     def p_save_new_admin(m):
         if not is_primary_admin(m.from_user.id): return
         try:
-            new_admin = int(m.text.strip())
+            new_admin = bounded_number(m.text)
         except ValueError:
-            pbot.send_message(m.chat.id, f"<b>{TE_CROSS}  ID должен быть числом</b>", parse_mode='HTML')
+            pbot.send_message(m.chat.id, 'Неверный ID')
             return
         if _take_flow(m.from_user.id, 'p_await_new_admin') is None: return
         db_add_bot_admin(db_bot_id, new_admin)
@@ -1354,9 +1378,9 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
     def p_save_primary(m):
         if not is_primary_admin(m.from_user.id): return
         try:
-            new_primary = int(m.text.strip())
+            new_primary = bounded_number(m.text)
         except ValueError:
-            pbot.send_message(m.chat.id, f"<b>{TE_CROSS}  ID должен быть числом</b>", parse_mode='HTML')
+            pbot.send_message(m.chat.id, 'Неверный ID')
             return
         if _take_flow(m.from_user.id, 'p_await_primary') is None: return
         db_set_primary_admin(db_bot_id, new_primary)
@@ -1469,8 +1493,8 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             amount = balance
         else:
             try:
-                amount = float(text.replace(',', '.'))
-                if not math.isfinite(amount) or amount <= 0 or amount > balance:
+                amount = bounded_number(text.replace(',', '.'), integer=False, minimum=0)
+                if amount <= 0 or amount > balance:
                     raise ValueError
             except ValueError:
                 pbot.send_message(m.chat.id,
@@ -1637,7 +1661,8 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         if _take_flow(m.from_user.id, 'p_bcast_photo') is None: return
         users   = db_get_bot_users(db_bot_id)
         photo   = m.photo[-1].file_id
-        caption = html.escape(m.caption or '')
+        from telegram_text import message_html
+        caption = message_html(m.json, caption=True)
         sent    = sum(1 for uid in users if _safe_photo(pbot, uid, photo, caption))
         pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Рассылка завершена: {sent}/{len(users)}</b>",
             parse_mode='HTML', reply_markup=pk_close())
@@ -1671,6 +1696,8 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
     # direct_route: случайные сообщения юзеров доставляются СРАЗУ (без очереди)
     register_forum_support(pbot, db_bot_id, pstate, is_admin,
                                       confirm_kb=pk_close, direct_route=_deliver_direct)
+    from input_validation import guard_numeric_callbacks
+    guard_numeric_callbacks(pbot)
 
     return pbot
 

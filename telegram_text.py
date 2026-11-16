@@ -1,8 +1,21 @@
 """Отправка длинного HTML с сохранением тегов, сущностей и кнопок"""
 import html
+import json
 import time
 from functools import wraps
 from html.parser import HTMLParser
+
+
+def message_html(raw, caption=False):
+    """Entities Telegram используют смещения UTF-16, включая скрытые ссылки"""
+    from telebot.types import Message
+    raw = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    field = 'caption_entities' if caption else 'entities'
+    raw[field] = [dict(entity, **({'url': html.escape(entity['url'], quote=True)}
+                                if entity.get('url') else {}))
+                  for entity in raw.get(field) or []]
+    message = Message.de_json(raw)
+    return (message.html_caption if caption else message.html_text) or ''
 
 
 def ordered_album(items, key=lambda message: message.message_id):

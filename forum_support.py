@@ -45,6 +45,7 @@ from database import (_utc_now_str, db_get_topic_copies_by_src,
                       db_fs_count_range, db_fs_tickets_total,
                       db_fs_new_users_range, db_fs_users_total)
 from config import STATS_TZ_OFFSET, RATE_LIMIT_SEC
+from input_validation import bounded_number, SQLITE_MIN
 from keyboards import (_ICON, TE_BLOCK, TE_CALENDAR, TE_CHAT, TE_CHECK, TE_CLIP, TE_CLOCK, TE_CROSS, TE_EXCLAM, TE_ID, TE_LINK, TE_NOTE, TE_SEND, TE_STATS, TE_USER)
 
 log = logging.getLogger(__name__)
@@ -344,8 +345,10 @@ def fs_management_callback(pbot, bot_id, cb):
         screen = None
         if action in ('view', 'delete'):
             number = parts[3] if len(parts) == 4 else ''
-            tid = (int(number) if number.isascii() and number.isdecimal()
-                   and len(number) <= 19 and 0 < int(number) < 2**63 else None)
+            try:
+                tid = bounded_number(number) if number.isascii() and number.isdecimal() else None
+            except ValueError:
+                tid = None
             body = db_get_template(tid, bot_id) if tid else None
             if body is None:
                 pbot.answer_callback_query(cb.id, 'Шаблон не найден', show_alert=True)
@@ -1020,11 +1023,11 @@ def _rebuild_media_group(msgs):
     """Пересборка альбома из file_id (только фото/видео)."""
     media = []
     for i, m in enumerate(msgs):
-        cap = m.caption if i == 0 else None
+        options = dict(caption=m.caption, caption_entities=m.caption_entities, parse_mode=None)
         if m.content_type == 'photo':
-            media.append(InputMediaPhoto(m.photo[-1].file_id, caption=cap))
+            media.append(InputMediaPhoto(m.photo[-1].file_id, **options))
         elif m.content_type == 'video':
-            media.append(InputMediaVideo(m.video.file_id, caption=cap))
+            media.append(InputMediaVideo(m.video.file_id, **options))
         else:
             return None
     return media if len(media) > 1 else None
@@ -1403,6 +1406,10 @@ _admin_album_lock = threading.Lock()
 
 def _buffer_admin_album(pbot, bot_id: int, gid: int, target_uid: int,
                         thread: int, m):
+    from reply_queue import enqueue_album
+    queue_key = enqueue_album(pbot, bot_id, m,
+        dict(mode='forum_album', target=target_uid, chat=gid, notify=gid, notice_thread=thread),
+        delay=ALBUM_FLUSH_SEC)
     key = (bot_id, target_uid, m.media_group_id)
     with _admin_album_lock:
         buf = _admin_album_buffers.get(key)
@@ -1412,6 +1419,8 @@ def _buffer_admin_album(pbot, bot_id: int, gid: int, target_uid: int,
             _admin_album_buffers[key] = buf
         buf['ids'].append(m.message_id)
         buf['msgs'].append(m)
+        buf['queue_key'] = queue_key
+        if buf.get('timer'): buf['timer'].cancel()
         if buf['reply_ctx'] is None and m.reply_to_message:
             mp = fs_get_mapping(m.chat.id, m.reply_to_message.message_id)
             if mp and mp[0] == bot_id:
@@ -1433,6 +1442,10 @@ def _flush_admin_album(pbot, bot_id: int, key):
     with _admin_album_lock:
         buf = _admin_album_buffers.pop(key, None)
     if not buf:
+        return
+    if buf.get('queue_key'):
+        from reply_queue import flush_album
+        flush_album(pbot, bot_id, buf['queue_key'])
         return
     if buf.get('msgs'):
         buf['ids'] = [m.message_id for m in buf['msgs'] if fs_is_admin(bot_id, m.from_user.id)]
@@ -1480,10 +1493,13 @@ def fs_pin_callback(pbot, bot_id: int, cb):
     if (action in ('tpl', 'send', 'close', 'block', 'unblock')
             and len(parts) == expected and len(cb.data.encode('utf-8')) <= 64):
         numbers = parts[3:]
-        if all(n.isascii() and n.isdecimal() and len(n) <= 19
-               and 0 < int(n) < 2**63 for n in numbers):
-            uid = int(parts[3])
-            tid = int(parts[4]) if action == 'send' else None
+        if all(n.isascii() and n.isdecimal() for n in numbers):
+            try:
+                values = [bounded_number(n) for n in numbers]
+                uid = values[0]
+                tid = values[1] if action == 'send' else None
+            except ValueError:
+                pass
     m = cb.message
     group = fs_get_group(bot_id)
     topic = fs_get_topic(bot_id, uid) if uid else None
@@ -1589,20 +1605,56 @@ def queue_random_message(pbot, bot_id: int, m) -> None:
             except Exception:
                 pass
             return
-        text = f'<b>{TE_CHAT}  Отправить сообщение администратору?</b>'
-        if cnt > 1:
-            text += f'\n\n{TE_NOTE} В очереди: <b>{cnt}</b> сообщений'
+        _send_pending_prompt(pbot, bot_id, uid, cnt, prompt_id)
+
+
+def _send_pending_prompt(pbot, bot_id, uid, count, previous=None):
+    if db_is_blocked(bot_id, uid): return
+    c = _conn()
+    try:
+        row = c.execute('SELECT prompt_next_at,prompt_attempts FROM fs_pending '
+                        'WHERE bot_id=? AND user_id=?', (bot_id, uid)).fetchone()
+    finally: c.close()
+    if not row or row[0] > time.time(): return
+    text = f'<b>{TE_CHAT}  Отправить сообщение администратору?</b>'
+    if count > 1:
+        text += f'\n\n{TE_NOTE} В очереди: <b>{count}</b> сообщений'
+    try:
+        msg = pbot.send_message(uid, text, parse_mode='HTML', reply_markup=_confirm_kb())
+    except Exception as exc:
+        params = (getattr(exc, 'result_json', None) or {}).get('parameters', {})
+        delay = max(1, float(params.get('retry_after', 1))) if getattr(exc, 'error_code', None) == 429 else min(300, 2**min(row[1], 9))
+        c = _conn()
         try:
-            msg = pbot.send_message(m.chat.id, text, parse_mode='HTML', reply_markup=_confirm_kb())
-            fs_set_prompt(bot_id, uid, msg.message_id)
-        except Exception as e:
-            log.warning(f'queue prompt bot#{bot_id} uid={uid}: {e}')
-            return
-        if prompt_id:
-            try:
-                pbot.delete_message(m.chat.id, prompt_id)
-            except Exception:
-                pass
+            c.execute('UPDATE fs_pending SET prompt_next_at=?,prompt_attempts=prompt_attempts+1 '
+                      'WHERE bot_id=? AND user_id=?', (time.time()+delay, bot_id, uid))
+            c.commit()
+        finally: c.close()
+        log.warning('Не удалось показать подтверждение бота #%s пользователю %s', bot_id, uid)
+        return
+    c = _conn()
+    try:
+        c.execute('UPDATE fs_pending SET prompt_msg_id=?,prompt_next_at=0,prompt_attempts=0 '
+                  'WHERE bot_id=? AND user_id=?', (msg.message_id, bot_id, uid))
+        c.commit()
+    finally: c.close()
+    if previous:
+        try: pbot.delete_message(uid, previous)
+        except Exception: pass
+
+
+def recover_pending_prompts(pbot, bot_id):
+    c = _conn()
+    try:
+        users = c.execute("SELECT user_id FROM fs_pending WHERE bot_id=? AND status='pending' "
+                          'AND prompt_msg_id IS NULL AND prompt_next_at<=?', (bot_id, time.time())).fetchall()
+    finally: c.close()
+    for (uid,) in users:
+        lock = _queue_prompt_locks[hash((bot_id, uid)) % len(_queue_prompt_locks)]
+        with lock:
+            pending = fs_get_pending(bot_id, uid)
+            if pending and pending[1] == 'pending' and not pending[2]:
+                _send_pending_prompt(pbot, bot_id, uid, len(json_loads(pending[0])))
 
 
 
@@ -1869,7 +1921,10 @@ def _connect_reply_kb(request_id, select=True):
 def _parse_group_id(text):
     text = text.strip()
     if re.fullmatch(r'-?100[0-9]+', text):
-        return -abs(int(text))
+        try:
+            return -bounded_number(text.lstrip('-'), maximum=-SQLITE_MIN)
+        except ValueError:
+            return None
     if re.fullmatch(r'@[A-Za-z][A-Za-z0-9_]{3,31}', text):
         return text
     return None

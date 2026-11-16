@@ -9,6 +9,7 @@ import math
 import uuid
 from datetime import datetime, timedelta
 from config import PRICE_USDT
+from input_validation import bounded_number, validate_bindings
 
 log = logging.getLogger(__name__)
 
@@ -108,6 +109,33 @@ class _ConnLease:
 
     def __getattr__(self, name):
         return getattr(self._cached, name)
+
+    def _call(self, method, *args, **kwargs):
+        if self._closed:
+            raise sqlite3.ProgrammingError('Соединение освобождено')
+        try:
+            return method(*args, **kwargs)
+        except BaseException:
+            # Traceback может жить долго: освобождаем гейт сразу при ошибке,
+            # не полагаясь на __del__ локальной переменной вызывающего кода
+            self.close()
+            raise
+
+    def execute(self, sql, parameters=()):
+        def run():
+            return self._cached.execute(sql, validate_bindings(parameters))
+        return self._call(run)
+
+    def executemany(self, sql, parameters):
+        return self._call(self._cached.executemany, sql,
+                          (validate_bindings(row) for row in parameters))
+
+    def commit(self):
+        return self._call(self._cached.commit)
+
+    def rollback(self):
+        if not self._closed:
+            return self._call(self._cached.rollback)
 
     def close(self):
         if not self._closed:
@@ -545,6 +573,8 @@ def _init_db_connection(conn, *, schema=False):
         'ALTER TABLE fs_groups ADD COLUMN mgmt_claim TEXT',
         'ALTER TABLE fs_groups ADD COLUMN mgmt_claim_at REAL',
         'ALTER TABLE fs_pending ADD COLUMN claim_session TEXT',
+        'ALTER TABLE fs_pending ADD COLUMN prompt_next_at REAL NOT NULL DEFAULT 0',
+        'ALTER TABLE fs_pending ADD COLUMN prompt_attempts INTEGER NOT NULL DEFAULT 0',
         'ALTER TABLE support_notifications ADD COLUMN stage INTEGER NOT NULL DEFAULT 0',
         'ALTER TABLE payment_orders ADD COLUMN expected_ton REAL',
         'ALTER TABLE payment_orders ADD COLUMN next_check REAL NOT NULL DEFAULT 0',
@@ -1284,6 +1314,8 @@ def get_price() -> float:
     return float(row[0]) if row else PRICE_USDT
 
 def set_price(price: float):
+    price = bounded_number(price, integer=False, minimum=0)
+    if price <= 0: raise ValueError('Неверная сумма')
     c = _conn()
     c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('price', ?)", (str(price),))
     c.commit(); c.close()

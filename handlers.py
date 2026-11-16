@@ -6,6 +6,7 @@ import time
 import threading
 import logging
 import uuid
+from input_validation import bounded_number
 import re
 import database as db
 from safe_logging import register_secret
@@ -433,7 +434,7 @@ def register(bot: telebot.TeleBot):
 
         if payload.startswith('ref_'):
             try:
-                referrer_id = int(payload[4:])
+                referrer_id = bounded_number(payload[4:])
                 if referrer_id != uid:
                     db_set_referral(referrer_id, uid)
             except (ValueError, Exception):
@@ -441,7 +442,7 @@ def register(bot: telebot.TeleBot):
 
         elif payload.startswith('via_'):
             try:
-                via_bot_id = int(payload[4:])
+                via_bot_id = bounded_number(payload[4:])
                 cur = state.get(uid)
                 if isinstance(cur, dict):
                     cur['via_bot_id'] = via_bot_id
@@ -1011,10 +1012,9 @@ def register(bot: telebot.TeleBot):
         s, revision = state.snapshot(m.from_user.id)
         if not isinstance(s, dict) or s.get('step') != 'await_admin_id': return
         try:
-            admin_id_val = int(m.text.strip())
+            admin_id_val = bounded_number(m.text)
         except ValueError:
-            bot.send_message(m.chat.id, f"<b>{TE_CROSS}  ID должен быть числом. Попробуй ещё раз:</b>",
-                parse_mode='HTML')
+            bot.send_message(m.chat.id, 'Неверный ID')
             return
         token_val = s['token']
         uname     = s.get('username', '')
@@ -1301,7 +1301,7 @@ def register(bot: telebot.TeleBot):
     def handle_new_price(m):
         if not _is_super_admin(m): return
         try:
-            new_price = float(m.text.strip().replace(',', '.'))
+            new_price = bounded_number(m.text.strip().replace(',', '.'), integer=False, minimum=0)
             if new_price <= 0: raise ValueError
         except ValueError:
             bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Неверный формат. Введи число, например: 10</b>",
@@ -1407,8 +1407,12 @@ def register(bot: telebot.TeleBot):
                 parse_mode='HTML')
             return
         try:
-            target_uid = int(parts[0])
-            days       = int(parts[1])
+            target_uid = bounded_number(parts[0])
+        except ValueError:
+            bot.send_message(m.chat.id, 'Неверный ID')
+            return
+        try:
+            days = bounded_number(parts[1], maximum=(datetime.max - datetime.now()).days)
             if days <= 0: raise ValueError
         except ValueError:
             bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Неверные данные. user_id и дни должны быть числами > 0</b>",
@@ -1447,8 +1451,12 @@ def register(bot: telebot.TeleBot):
                 parse_mode='HTML')
             return
         try:
-            target_bot_id = int(parts[0])
-            days          = int(parts[1])
+            target_bot_id = bounded_number(parts[0])
+        except ValueError:
+            bot.send_message(m.chat.id, 'Неверный ID')
+            return
+        try:
+            days = bounded_number(parts[1], maximum=(datetime.max - datetime.now()).days)
             if days <= 0: raise ValueError
         except ValueError:
             bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Неверные данные</b>", parse_mode='HTML')
@@ -1576,3 +1584,6 @@ def register(bot: telebot.TeleBot):
     @bot.message_handler(func=lambda m: True)
     def catch_all(m):
         log.info(f'Catch-all msg: uid={m.from_user.id} type={m.content_type} text={repr(m.text or "")}')
+
+    from input_validation import guard_numeric_callbacks
+    guard_numeric_callbacks(bot)

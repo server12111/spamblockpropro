@@ -19,7 +19,7 @@ from database import (db_delivery_rows, db_delivery_enqueue, db_delivery_update,
                       db_delivery_fallback,
                       db_get_bot_admins, db_get_bot_setting)
 from keyboards import TE_CHECK, TE_CHAT, TE_INBOX, TE_USER, TE_LINK, TE_ID, _ICON
-from telegram_text import html_chunks
+from telegram_text import html_chunks, message_html
 
 log = logging.getLogger(__name__)
 _context = threading.local()
@@ -104,7 +104,6 @@ class DeliverySender:
         self.progress, self.rows = {}, []
         self.last_cleanup = 0
         self.payload_phase = False
-        self.fallback_recovered = False
         self.operation_counts = {}
         # При аварии подтверждение пользователю могло не завершиться.
         abandoned = [r['id'] for r in db_delivery_rows(bot_id) if r['status'] == 'accepting']
@@ -252,7 +251,7 @@ class DeliverySender:
 
     def _body(self, rows):
         if len(rows) == 1:
-            return f'{TE_CHAT} ' + html.escape(json.loads(rows[0]['payload']).get('text') or '')
+            return f'{TE_CHAT} ' + message_html(json.loads(rows[0]['payload']))
         try:
             offset = int(db_get_bot_setting(self.bot_id, 'hours_tz', '3'))
             tz = timezone(timedelta(hours=offset))
@@ -262,7 +261,7 @@ class DeliverySender:
         for row in rows:
             raw = json.loads(row['payload'])
             stamp = datetime.fromtimestamp(raw.get('date') or row['created_at'], tz).strftime('%H:%M')
-            parts.append(f'<i>{stamp}</i>\n' + html.escape(raw.get('text') or ''))
+            parts.append(f'<i>{stamp}</i>\n' + message_html(raw))
         return '\n\n'.join(parts)
 
     def _batch(self, first, all_rows):
@@ -398,13 +397,14 @@ class DeliverySender:
         elif m.content_type in ('photo', 'video', 'document', 'audio', 'animation', 'voice'):
             obj = getattr(m, m.content_type)
             file_id = obj[-1].file_id if m.content_type == 'photo' else obj.file_id
-            cap = header + ('\n\n' + TE_CHAT + ' ' + html.escape(m.caption) if m.caption else '')
+            caption = message_html(m.json, caption=True)
+            cap = header + ('\n\n' + TE_CHAT + ' ' + caption if caption else '')
             overflow = _units(cap) > 1024
             mid = self.api(getattr(self.bot, 'send_' + m.content_type), aid, file_id,
                 caption=header if overflow else cap, parse_mode='HTML', reply_markup=kb).message_id
             mids.append(mid)
             if overflow:
-                for chunk in html_chunks(html.escape(m.caption), 4096):
+                for chunk in html_chunks(caption, 4096):
                     self.api(self.bot.send_message, aid, chunk, parse_mode='HTML')
         else:
             self.api(self.bot.send_message, aid, header, parse_mode='HTML', reply_markup=kb)
@@ -423,17 +423,9 @@ class DeliverySender:
         with self.lock:
             from reply_queue import pump as pump_replies
             pump_replies(self.bot, self.bot_id)
-            if not self.fallback_recovered:
-                # Авария могла случиться между commit страховки и показом окна.
-                recovered = set()
-                for row in db_delivery_rows(self.bot_id):
-                    if row['status'] != 'fallback' or row['user_id'] in recovered:
-                        continue
-                    recovered.add(row['user_id'])
-                    pending = fs.fs_get_pending(self.bot_id, row['user_id'])
-                    if not pending or not pending[2]:
-                        fs.queue_random_message(self.bot, self.bot_id, Message.de_json(row['payload']))
-                self.fallback_recovered = True
+            # Указатель страховки сохраняется атомарно с fallback
+            # Повтор окна и его срок хранятся в БД, в том числе после перезапуска
+            fs.recover_pending_prompts(self.bot, self.bot_id)
             previous = current_sender()
             _context.sender = self
             processed = 0
