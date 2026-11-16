@@ -268,9 +268,9 @@ def run():
     db.db_del_template(template, bid)
     API.clear()
     dispatch(bot, cb('fs_pin_tpl_800', thread=thread, mid=pinned))
-    check('нет шаблонов: alert с путём в раздел личной панели', len(API) == 1
-          and 'Шаблонов пока нет' in calls('answer_callback_query')[0][1][1]
-          and '«Шаблоны» → «Добавить шаблон»' in calls('answer_callback_query')[0][1][1]
+    check('нет шаблонов: alert с темой Управление', len(API) == 1
+          and calls('answer_callback_query')[0][1][1] ==
+          'Шаблонов пока нет. Добавь их в теме «Управление»'
           and calls('answer_callback_query')[0][2].get('show_alert') is True)
 
     fs.fs_set_topic_pinned(bid, 800, pinned, 'старый хеш')

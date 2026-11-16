@@ -415,7 +415,7 @@ check('при неоплате привязка восстановлена (кн
 check('юзеру показано «Оплата не найдена»',
       any('Оплата не найдена' in a for a in ALERT_LOG), str(ALERT_LOG))
 # оплаченный: claim → начисление → грант 30 дней
-_H.cb_check_invoice = lambda iid: {'status': 'paid'}
+_H.cb_check_invoice = lambda iid: {'invoice_id': iid, 'status': 'paid', 'amount': '0.1', 'asset': 'USDT'}
 SEND_LOG.clear()
 dcb(main_bot, ucb('check_payment_4242', uid=_test_uid))
 check('при оплате начислен грант 30 дней', db_peek_grant_days(_test_uid) == 30,
@@ -426,7 +426,7 @@ check('второй клик по тому же инвойсу → отказ', 
 ALERT_LOG.clear()
 dcb(main_bot, ucb('check_payment_4242', uid=_test_uid))
 check('повторная обработка невозможна (грант не задвоился)',
-      db_peek_grant_days(_test_uid) == 30 and any('Инвойс не найден' in a for a in ALERT_LOG),
+      db_peek_grant_days(_test_uid) == 30 and any('Оплата уже зачтена' in a for a in ALERT_LOG),
       (db_peek_grant_days(_test_uid), ALERT_LOG))
 telebot.TeleBot.answer_callback_query = _orig_acq
 

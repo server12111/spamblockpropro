@@ -5,28 +5,33 @@ import telebot
 import time
 import threading
 import logging
+import uuid
+from safe_logging import register_secret
+from telegram_text import send_html, send_long, edit_html, protect_text_lengths
+from purchase_store import (db_get_payment, db_register_paid_bot, db_activate_trial,
+                            db_use_purchase_discount, purchase_context)
 from datetime import datetime
+from database import subscription_days_left
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import SUPER_ADMIN, TON_WALLET, WITHDRAWAL_CHANNEL, BOT_USERNAME
 from database import (DB_PATH, init_db,
-                       db_add_user, db_get_owner_bots, db_add_bot,
+                       db_add_user, db_get_owner_bots,
                        db_get_all_users, db_get_bot_users, db_get_stats,
                        db_get_active_bots_list, db_get_bot_info,
                        db_get_all_bots_for_checker,
                        db_get_bot_setting, db_set_bot_setting,
                        db_renew_bot,
                        get_price, set_price,
-                       db_set_pending, db_del_pending, db_get_pending,
+                       db_set_pending,
                        db_claim_pending_payment,
-                       db_take_grant_days, db_peek_grant_days,
-                       db_mark_paid, db_is_paid, db_clear_paid,
-                       db_has_used_trial, db_mark_trial_used,
-                       db_set_referral, db_get_referrer, db_mark_referral_paid,
-                       db_get_discount_count, db_use_discount_atomic,
+                       db_mark_paid, db_is_paid,
+                       db_has_used_trial,
+                       db_set_referral,
+                       db_get_discount_count,
                        db_set_marketplace, db_is_marketplace_enabled,
                        db_get_marketplace_bots,
-                       db_add_bot_earnings, db_get_bot_earnings,
-                       db_create_withdrawal, db_get_pending_withdrawals,
+                       db_get_bot_earnings,
+                       db_get_pending_withdrawals,
                        db_get_withdrawal, db_update_withdrawal_status,
                        db_return_bot_earnings,
                        db_set_free_coupon, db_get_free_coupon, db_mark_coupon_used,
@@ -42,6 +47,10 @@ log = logging.getLogger(__name__)
 
 _main_rate: dict = {}
 MAIN_RATE_SEC = 15
+
+
+def _is_super_admin(event):
+    return event.from_user.id == SUPER_ADMIN
 
 def _is_main_rate_limited(user_id: int) -> bool:
     now = time.time()
@@ -70,7 +79,7 @@ def start_subscription_checker(main_bot):
                         exp = datetime.fromisoformat(str(expires_at))
                     except Exception:
                         continue
-                    days_left = (exp - now).days
+                    days_left = subscription_days_left(exp, now)
 
                     if days_left <= -30:
                         if token in running_bots:
@@ -126,6 +135,7 @@ def start_subscription_checker(main_bot):
 
 
 def register(bot: telebot.TeleBot):
+    protect_text_lengths(bot)
     class _EH:
         def __init__(self):
             self._last_401_alert = 0
@@ -163,24 +173,30 @@ def register(bot: telebot.TeleBot):
     bot.exception_handler = _EH()
 
     state = DBState(0)
+    def _reset_flow(uid, preserve_purchase=False):
+        current = state.pop(uid, None)
+        current = current if isinstance(current, dict) else {}
+        target, via = purchase_context(current)
+        clean = {}
+        if via:
+            clean['via_bot_id'] = via
+        if preserve_purchase and target:
+            clean.update(step='renewing', bot_id=target)
+        if clean:
+            state[uid] = clean
+
+    def _resume_bot(bot_id):
+        info = db_get_bot_info(bot_id)
+        if info and info[0] not in running_bots:
+            return launch_bot(bot_id, info[0], info[1], bot)
+        return bool(info)
+
     def _edit(text, chat_id, message_id, reply_markup=None, parse_mode='HTML'):
-        """edit_message_text с фолбэком: Telegram не даёт править сообщения
-        старше 48 часов (InaccessibleMessage) — шлём новое с тем же содержимым."""
         try:
-            return bot.edit_message_text(text, chat_id, message_id,
-                                         parse_mode=parse_mode,
-                                         reply_markup=reply_markup)
-        except Exception as e:
-            s = str(e).lower()
-            if 'not modified' in s:
-                return True
-            try:
-                return bot.send_message(chat_id, text,
-                                        parse_mode=parse_mode,
-                                        reply_markup=reply_markup)
-            except Exception as e2:
-                log.warning(f'_edit fallback failed: {e2}')
-                return None
+            return edit_html(bot, chat_id, message_id, text, reply_markup, parse_mode)
+        except Exception as exc:
+            log.warning('_edit failed: %s', exc)
+            return None
 
     _bot_username_cache = [None]
 
@@ -210,90 +226,48 @@ def register(bot: telebot.TeleBot):
         text = header + '\n' + '\n'.join(shown)
         if len(rows) > limit:
             text += f"\n<i>… показаны первые {limit} из {len(rows)}</i>"
-        return text[:4000]
+        return text
 
     def _broadcast_users(scope):
         if scope == 'all': return db_get_all_users()
         return db_get_bot_users(0)
 
     def _after_payment_confirmed(uid, chat_id, message_id, renew_days=30,
-                                 is_real_payment=True):
-        """Вызывается после успешной оплаты/продления.
-        is_real_payment=False для БЕСПЛАТНЫХ действий (использование скидки):
-        партнёрская комиссия и реферальный бонус начисляются ТОЛЬКО за деньги —
-        раньше бесплатное продление по скидке могло дать 50% «за оплату»."""
-        # Начисление комиссии владельцу бота через маркетплейс (50%)
-        s_cur = state.get(uid)
-        via_bot_id = None
-        if isinstance(s_cur, dict):
-            via_bot_id = s_cur.get('via_bot_id')
-
-        if is_real_payment:
-            # Реферальный бонус при первой оплате
-            referrer = db_get_referrer(uid)
-            if referrer:
-                db_mark_referral_paid(uid)
-                try:
-                    disc = db_get_discount_count(referrer)
-                    bot.send_message(referrer,
-                        f"{TE_PARTY} <b>Твой реферал оплатил подписку!</b>\n\n"
-                        f"{TE_DIAMOND} Накоплено скидок: <b>{disc}</b>\n"
-                        f"Каждая скидка = 1 бесплатное продление на 10 дней.\n"
-                        f"Используй при следующей оплате через кнопку «{TE_CART} Купить бота».",
-                        parse_mode='HTML')
-                except Exception:
-                    pass
-
-            # 50% комиссия владельцу бота-реферера
-            if via_bot_id:
-                commission = round(get_price() * 0.5, 4)
-                db_add_bot_earnings(via_bot_id, commission)
-                info = db_get_bot_info(via_bot_id)
-                if info:
-                    owner_id_ref = info[2]
-                    try:
-                        bot.send_message(owner_id_ref,
-                            f"{TE_MONEY} <b>Новая комиссия!</b>\n\n"
-                            f"Пользователь купил бота через твой бот.\n"
-                            f"Начислено: <b>{commission} USDT</b> (50%)\n\n"
-                            f"Баланс: смотри в /admin своего бота → {TE_MONEY} Мой баланс",
-                            parse_mode='HTML')
-                    except Exception:
-                        pass
-
-        s = state.get(uid)
-        if isinstance(s, dict) and s.get('step') == 'renewing':
-            bot_id = s['bot_id']
-            state.pop(uid, None)
-            # продление чужого бота невозможно: владелец/админ проверяется
-            _binfo = db_get_bot_info(bot_id)
-            if not _binfo or uid not in (_binfo[2], _binfo[1]):
-                bot.send_message(chat_id,
-                    f"{TE_CROSS}  У тебя нет прав на этот бот.", parse_mode='HTML')
-                return
-            new_exp = db_renew_bot(bot_id, renew_days)
-            info = db_get_bot_info(bot_id)
-            if info:
-                token, admin_id_val, _, _ = info
-                if token not in running_bots:
-                    launch_bot(bot_id, token, admin_id_val, bot)
-            exp_str = str(new_exp)[:10] if new_exp else '—'
-            _edit(
-                f"{TE_CHECK} <b>Подписка успешно продлена на {renew_days} дней!</b>\n\n"
-                f"Действует до: <b>{exp_str}</b>",
-                chat_id, message_id, parse_mode='HTML', reply_markup=close_kb())
+                                 context=None):
+        # Начисления уже сохранены транзакцией; здесь только запуск и ответ
+        receipt = context.get('receipt', {}) if isinstance(context, dict) else {}
+        referrer = receipt.get('referrer')
+        if referrer:
+            _safe_send(referrer,
+                f"{TE_PARTY} <b>Твой реферал оплатил подписку</b>\n\n"
+                f"Накоплено скидок: <b>{db_get_discount_count(referrer)}</b>\n"
+                "Каждая скидка даёт 10 дней — используй её через «Купить бота»")
+        if receipt.get('commission_owner'):
+            _safe_send(receipt['commission_owner'],
+                f"{TE_MONEY} <b>Новая комиссия</b>\n\n"
+                f"Начислено: <b>{receipt['commission']} USDT</b> (50%)\n"
+                "Баланс — в /admin своего бота → Мой баланс")
+        target, _ = purchase_context(context if context is not None else state.get(uid))
+        if target:
+            _reset_flow(uid)
+            started = _resume_bot(target)
+            from database import db_get_bot_expires
+            expires = db_get_bot_expires(target)
+            text = (f"{TE_CHECK} <b>Подписка продлена на {renew_days} дней</b>\n\n"
+                    f"Действует до: <b>{str(expires)[:10]}</b>")
+            if not started:
+                text += "\n\nНе удалось запустить бота — попробуй позже или напиши в поддержку"
+            _edit(text, chat_id, message_id, reply_markup=close_kb())
         else:
-            db_mark_paid(uid, days=30)
             state[uid] = 'await_bot_token'
-            _edit(
-                f"{TE_CHECK} <b>Оплата получена!\n\n"
-                f"{TE_ROBOT} Введи токен своего бота (получи в @BotFather):</b>",
-                chat_id, message_id, parse_mode='HTML', reply_markup=cancel_kb())
+            _edit(f"{TE_CHECK} <b>Оплата получена</b>\n\n"
+                  "Введи токен бота из @BotFather", chat_id, message_id,
+                  reply_markup=cancel_kb())
 
-    # ── /start ───────────────────────────────────────────
     @bot.message_handler(commands=['start'])
     def cmd_start(m):
         uid = m.from_user.id
+        _reset_flow(uid)
         log.info(f'/start from uid={uid}')
         db_add_user(0, uid)
         payload = m.text.strip().split(' ', 1)[1] if ' ' in m.text else ''
@@ -324,14 +298,14 @@ def register(bot: telebot.TeleBot):
     # ── /admin ───────────────────────────────────────────
     @bot.message_handler(commands=['admin'])
     def cmd_admin(m):
-        if m.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(m): return
         bot.send_message(m.chat.id, f"<b>{TE_KEYBOARD} Панель супер-админа</b>",
             parse_mode='HTML', reply_markup=super_admin_kb())
 
     # ── /backup ──────────────────────────────────────────
     @bot.message_handler(commands=['backup'])
     def cmd_backup(m):
-        if m.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(m): return
         try:
             with open(DB_PATH, 'rb') as f:
                 bot.send_document(m.chat.id, f,
@@ -343,7 +317,7 @@ def register(bot: telebot.TeleBot):
 
     @bot.message_handler(commands=['restore_db'])
     def cmd_restore_db(m):
-        if m.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(m): return
         state[m.from_user.id] = 'await_db_file'
         bot.send_message(m.chat.id,
             f"<b>{TE_FOLDER} Восстановление базы данных</b>\n\n"
@@ -354,7 +328,7 @@ def register(bot: telebot.TeleBot):
     @bot.message_handler(content_types=['document'],
                          func=lambda m: state.get(m.from_user.id) == 'await_db_file')
     def handle_db_restore(m):
-        if m.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(m): return
         state.pop(m.from_user.id, None)
         doc = m.document
         # file_name у документа опционален (Telegram) — None сломал бы .endswith
@@ -403,7 +377,7 @@ def register(bot: telebot.TeleBot):
     # ── Backup / Restore через кнопки ────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'backup_db')
     def backup_db_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         try:
             with open(DB_PATH, 'rb') as f:
                 bot.send_document(cb.message.chat.id, f,
@@ -416,7 +390,7 @@ def register(bot: telebot.TeleBot):
 
     @bot.callback_query_handler(func=lambda c: c.data == 'restore_db_btn')
     def restore_db_btn_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         state[cb.from_user.id] = 'await_db_file'
         bot.answer_callback_query(cb.id)
         bot.send_message(cb.message.chat.id,
@@ -428,8 +402,7 @@ def register(bot: telebot.TeleBot):
     # ── Навигация ────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'back_to_start')
     def back_to_start_cb(cb):
-        state.pop(cb.from_user.id, None)
-        db_del_pending(cb.from_user.id)
+        _reset_flow(cb.from_user.id)
         _edit(start_text(),
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=start_kb())
@@ -437,8 +410,7 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data == 'back_to_payment')
     def back_to_payment_cb(cb):
         uid = cb.from_user.id
-        state.pop(uid, None)
-        db_del_pending(uid)
+        _reset_flow(uid, preserve_purchase=True)
         disc = db_get_discount_count(uid)
         show_trial = not db_has_used_trial(uid)
         _edit(buy_text(),
@@ -455,6 +427,8 @@ def register(bot: telebot.TeleBot):
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith('admin_reply_'))
     def admin_reply(cb):
+        if not _is_super_admin(cb):
+            return
         target = int(cb.data.split('_')[-1])
         _edit(f"<b>{TE_CHAT}  Введи ответ:</b>",
             cb.message.chat.id, cb.message.message_id,
@@ -465,8 +439,7 @@ def register(bot: telebot.TeleBot):
     def cancel_cb(cb):
         # состояние сбрасываем ДО удаления: сообщение может быть старше 48 ч
         # (удаление упадёт) — юзер не должен застревать в состоянии
-        state.pop(cb.from_user.id, None)
-        db_del_pending(cb.from_user.id)
+        _reset_flow(cb.from_user.id)
         try:
             bot.delete_message(cb.message.chat.id, cb.message.message_id)
         except Exception:
@@ -527,10 +500,12 @@ def register(bot: telebot.TeleBot):
     @bot.message_handler(func=lambda m: isinstance(state.get(m.from_user.id), str)
                                         and state[m.from_user.id].startswith('await_admin_msg_'))
     def admin_text(m):
+        if not _is_super_admin(m):
+            _reset_flow(m.from_user.id)
+            return
         target_id = int(state[m.from_user.id].split('_')[-1])
         try:
-            bot.send_message(target_id, f"<b>{TE_INBOX} Сообщение от администратора\n\n{TE_CHAT} {html.escape(m.text or '')}</b>",
-                parse_mode='HTML')
+            send_long(bot, target_id, f"<b>{TE_INBOX} Сообщение от администратора</b>", m.text)
         except Exception as e:
             # адресат недоступен (заблокировал бота / удалил аккаунт): не молчим —
             # сообщаем и снимаем состояние, иначе админ застрянет в режиме ответа
@@ -549,6 +524,7 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data == 'buy_bot')
     def buy_bot_cb(cb):
         uid = cb.from_user.id
+        _reset_flow(uid)
 
         # Проверяем бесплатный купон от суперадмина
         coupon_days = db_get_free_coupon(uid)
@@ -579,14 +555,20 @@ def register(bot: telebot.TeleBot):
             lines = ["<b>У тебя уже есть бот(ы):</b>\n"]
             kb    = InlineKeyboardMarkup()
             for bot_id, token, username, created_at, expires_at in existing:
+                if token not in running_bots and expires_at:
+                    try:
+                        if datetime.fromisoformat(str(expires_at)) > datetime.now():
+                            _resume_bot(bot_id)
+                    except (ValueError, TypeError):
+                        pass
                 is_running = token in running_bots
                 status     = f'{TE_GREEN}' if is_running else f'{TE_RED}'
                 name       = f"@{username}" if username else f"Bot #{bot_id}"
                 if expires_at:
                     try:
                         exp       = datetime.fromisoformat(str(expires_at))
-                        days_left = (exp - datetime.now()).days
-                        exp_str   = f"истекает через {days_left}д." if days_left > 0 else f"{TE_CROSS} истёк"
+                        days_left = subscription_days_left(exp)
+                        exp_str = f"осталось {days_left} дн" if days_left > 0 else f"{TE_CROSS} истёк"
                     except Exception:
                         exp_str = "—"
                 else:
@@ -610,6 +592,7 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data == 'buy_new_bot')
     def buy_new_bot_cb(cb):
         uid = cb.from_user.id
+        _reset_flow(uid)
         disc = db_get_discount_count(uid)
         show_trial = not db_has_used_trial(uid)
         _edit(buy_text(),
@@ -658,12 +641,13 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data == 'try_free')
     def try_free_cb(cb):
         uid = cb.from_user.id
-        if db_has_used_trial(uid):
-            bot.answer_callback_query(cb.id,
-                "❌ Ты уже использовал бесплатный пробный период.", show_alert=True)
+        if db_is_paid(uid):
+            bot.answer_callback_query(cb.id, "Сначала заверши настройку оплаченного бота", show_alert=True)
             return
-        db_mark_trial_used(uid)
-        db_mark_paid(uid, days=3)
+        if not db_activate_trial(uid):
+            bot.answer_callback_query(cb.id,
+                "Пробный период уже использован", show_alert=True)
+            return
         state[uid] = 'await_bot_token_trial'
         _edit(
             f"{TE_GIFT} <b>Бесплатный пробный период (3 дня) активирован!\n\n"
@@ -675,29 +659,24 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data == 'use_discount')
     def use_discount_cb(cb):
         uid = cb.from_user.id
-        # АТОМАРНОЕ списание: два одновременных нажатия при одной скидке —
-        # только одно проходит (проверка и списание раньше были раздельными)
-        if not db_use_discount_atomic(uid):
-            bot.answer_callback_query(cb.id, "❌ У тебя нет скидок.", show_alert=True)
+        context = state.get(uid)
+        if not db_use_purchase_discount(uid, context):
+            bot.answer_callback_query(cb.id, "Нет доступной скидки или настройка уже оплачена", show_alert=True)
             return
-        s = state.get(uid)
-        if not (isinstance(s, dict) and s.get('step') == 'renewing'):
-            db_mark_paid(uid)
-        # скидка — НЕ денежный платёж: без партнёрской комиссии и реф-бонуса
         _after_payment_confirmed(uid, cb.message.chat.id, cb.message.message_id,
-                                 renew_days=10, is_real_payment=False)
+                                 renew_days=10, context=context)
 
-    # ── CryptoBot ────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'pay_cryptobot')
     def pay_cryptobot_cb(cb):
         invoice = cb_create_invoice(cb.from_user.id)
         if not invoice:
-            bot.answer_callback_query(cb.id, "❌ Ошибка создания инвойса. Попробуй ещё раз.", show_alert=True)
+            bot.answer_callback_query(cb.id, "Не удалось создать счёт — попробуй ещё раз", show_alert=True)
             return
-        db_set_pending(cb.from_user.id, invoice['invoice_id'])
+        db_set_pending(cb.from_user.id, invoice['invoice_id'], context=state.get(cb.from_user.id),
+                       amount=invoice.get('amount'), expires_at=time.time() + 3600)
         _edit(
             f"<b>{TE_CARD} Оплата через CryptoBot</b>\n\n"
-            f"Сумма: <b>{get_price()} USDT</b>\n\n"
+            f"Сумма: <b>{invoice.get('amount', get_price())} USDT</b>\n\n"
             f"Нажми кнопку ниже, оплати и вернись сюда — нажми «Проверить оплату».",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=cryptobot_kb(invoice['pay_url'], invoice['invoice_id']))
@@ -705,21 +684,28 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data.startswith('check_payment_'))
     def check_payment_cb(cb):
         invoice_id = int(cb.data.split('_')[-1])
-        # АТОМАРНЫЙ захват права обработать оплату: два одновременных клика —
-        # один True. Раньше проверка и удаление были раздельными: оба потока
-        # доходили до начислений (двойное продление / лишний грант)
-        if not db_claim_pending_payment(cb.from_user.id, invoice_id):
-            bot.answer_callback_query(cb.id, "❌ Инвойс не найден. Создай оплату заново.", show_alert=True)
+        uid = cb.from_user.id
+        order = db_get_payment(uid, invoice_id)
+        if not order:
+            bot.answer_callback_query(cb.id, "Счёт не найден", show_alert=True)
+            return
+        if order['settled']:
+            bot.answer_callback_query(cb.id, "Оплата уже зачтена", show_alert=True)
             return
         invoice = cb_check_invoice(invoice_id)
         if invoice and invoice.get('status') == 'paid':
-            _after_payment_confirmed(cb.from_user.id, cb.message.chat.id, cb.message.message_id)
+            amount = invoice.get('amount') or order['amount']
+            if amount is None:
+                bot.answer_callback_query(cb.id, "Не удалось проверить сумму оплаты — попробуй позже", show_alert=True)
+                return
+            if db_claim_pending_payment(uid, invoice_id, paid_amount=amount):
+                context = dict(db_get_payment(uid, invoice_id), step='renewing' if order['bot_id'] else 'new')
+                _after_payment_confirmed(uid, cb.message.chat.id, cb.message.message_id, context=context)
+            else:
+                bot.answer_callback_query(cb.id, "Оплата уже зачтена", show_alert=True)
         else:
-            # не оплачен — возвращаем привязку: кнопка «Проверить» работает дальше
-            db_set_pending(cb.from_user.id, invoice_id)
-            bot.answer_callback_query(cb.id, "❌ Оплата не найдена. Попробуй ещё раз.", show_alert=True)
+            bot.answer_callback_query(cb.id, "Оплата не найдена — попробуй ещё раз", show_alert=True)
 
-    # ── TON ──────────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'pay_ton')
     def pay_ton_cb(cb):
         bot.answer_callback_query(cb.id, "⏳ Получаю курс TON...")
@@ -727,20 +713,21 @@ def register(bot: telebot.TeleBot):
         if ton_amount <= 0:
             bot.answer_callback_query(cb.id, "❌ Не удалось получить курс TON.", show_alert=True)
             return
-        payment_code = f"SPB{cb.from_user.id}"
+        payment_code = f"SPB{cb.from_user.id}_{uuid.uuid4().hex[:16]}"
         link = ton_payment_link(ton_amount, payment_code)
         cur = state.get(cb.from_user.id)
+        db_set_pending(cb.from_user.id, payment_code, context=cur, amount=get_price(),
+                       expires_at=time.time() + 7200, provider='ton', expected_ton=ton_amount)
         new_state = {'step': 'ton_pending', 'ton': ton_amount, 'code': payment_code}
-        if isinstance(cur, dict):
-            if cur.get('step') == 'renewing':
-                new_state['bot_id'] = cur['bot_id']
-                new_state['renewing'] = True
-            if 'via_bot_id' in cur:
-                new_state['via_bot_id'] = cur['via_bot_id']
+        target, via = purchase_context(cur)
+        if target:
+            new_state.update(bot_id=target, renewing=True)
+        if via:
+            new_state['via_bot_id'] = via
         state[cb.from_user.id] = new_state
         kb = InlineKeyboardMarkup()
         kb.add(_btn('Открыть TON Keeper и оплатить', icon='💎', style='primary', url=link))
-        kb.add(_btn('Я оплатил — проверить', icon='✔️', style='success', callback_data='ton_check_auto'))
+        kb.add(_btn('Я оплатил — проверить', icon='✔️', style='success', callback_data=f'ton_check_{payment_code}'))
         kb.add(_btn('Назад', icon='🔙', callback_data='back_to_payment'))
         _edit(
             f"<b>{TE_DIAMOND} Оплата через TON Keeper</b>\n\n"
@@ -755,36 +742,46 @@ def register(bot: telebot.TeleBot):
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=kb)
 
-    @bot.callback_query_handler(func=lambda c: c.data == 'ton_check_auto')
+    @bot.callback_query_handler(func=lambda c: c.data.startswith('ton_check_'))
     def ton_check_auto_cb(cb):
         uid = cb.from_user.id
-        s   = state.get(uid)
-        if not isinstance(s, dict) or 'ton' not in s:
-            bot.answer_callback_query(cb.id, "❌ Сессия истекла. Начни заново.", show_alert=True)
+        current = state.get(uid)
+        if cb.data == 'ton_check_auto':
+            payment_code = current.get('code', '') if isinstance(current, dict) else ''
+        else:
+            payment_code = cb.data[len('ton_check_'):]
+        order = db_get_payment(uid, payment_code, provider='ton')
+        # Совместимость с кнопками TON, созданными до миграции
+        if not order and isinstance(current, dict) and current.get('code') == payment_code and 'ton' in current:
+            db_set_pending(uid, payment_code, context=current, amount=get_price(),
+                           provider='ton', expected_ton=current['ton'])
+            order = db_get_payment(uid, payment_code, provider='ton')
+        if not order:
+            bot.answer_callback_query(cb.id, "Платёж не найден", show_alert=True)
             return
-        ton_amount   = s['ton']
-        payment_code = s.get('code', f"SPB{uid}")
-        bot.answer_callback_query(cb.id, "🔍 Проверяю блокчейн...")
-        _edit(f"<b>{TE_SEARCH} Проверяю блокчейн TON...</b>",
-            cb.message.chat.id, cb.message.message_id, parse_mode='HTML')
-        found = ton_check_transfer(uid, ton_amount, payment_code)
+        if order['settled']:
+            bot.answer_callback_query(cb.id, "Оплата уже зачтена", show_alert=True)
+            return
+        ton_amount = order['ton']
+        bot.answer_callback_query(cb.id, "Проверяю оплату")
+        found = ton_check_transfer(uid, ton_amount, payment_code, return_tx=True)
         if found:
-            if s.get('renewing'):
-                new_s = {'step': 'renewing', 'bot_id': s['bot_id']}
-                if 'via_bot_id' in s:
-                    new_s['via_bot_id'] = s['via_bot_id']
-                state[uid] = new_s
+            tx_hash = found['tx_hash'] if isinstance(found, dict) else found
+            paid_amount = order['amount']
+            if isinstance(found, dict) and paid_amount is not None:
+                paid_amount *= found['ton_amount'] / ton_amount
+            if db_claim_pending_payment(uid, payment_code, provider='ton', tx_hash=tx_hash,
+                                        paid_amount=paid_amount):
+                context = dict(db_get_payment(uid, payment_code, provider='ton'),
+                               step='renewing' if order['bot_id'] else 'new')
+                _after_payment_confirmed(uid, cb.message.chat.id, cb.message.message_id, context=context)
             else:
-                if 'via_bot_id' in s:
-                    state[uid] = {'via_bot_id': s['via_bot_id']}
-                else:
-                    state.pop(uid, None)
-            _after_payment_confirmed(uid, cb.message.chat.id, cb.message.message_id)
+                bot.answer_callback_query(cb.id, "Оплата уже зачтена", show_alert=True)
         else:
             link = ton_payment_link(ton_amount, payment_code)
             kb   = InlineKeyboardMarkup()
             kb.add(_btn('Открыть TON Keeper', icon='💎', style='primary', url=link))
-            kb.add(_btn('Проверить снова', style='primary', callback_data='ton_check_auto'))
+            kb.add(_btn('Проверить снова', style='primary', callback_data=f'ton_check_{payment_code}'))
             kb.add(_btn('Назад', icon='🔙', callback_data='back_to_payment'))
             _edit(
                 f"<b>{TE_CROSS}  Оплата не найдена</b>\n\n"
@@ -802,6 +799,10 @@ def register(bot: telebot.TeleBot):
                                         or (isinstance(state.get(m.from_user.id), dict)
                                             and state[m.from_user.id].get('step') == 'await_bot_token_free'))
     def get_bot_token(m):
+        if not db_is_paid(m.from_user.id):
+            _reset_flow(m.from_user.id)
+            bot.send_message(m.chat.id, "Сначала оплати настройку бота")
+            return
         s = state.get(m.from_user.id)
         is_trial = (s == 'await_bot_token_trial')
         is_free_coupon = isinstance(s, dict) and s.get('step') == 'await_bot_token_free'
@@ -812,6 +813,7 @@ def register(bot: telebot.TeleBot):
             bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Неверный формат токена. Попробуй ещё раз:</b>",
                 parse_mode='HTML')
             return
+        register_secret(token_val)
         try:
             me = telebot.TeleBot(token_val).get_me()
         except Exception:
@@ -840,20 +842,11 @@ def register(bot: telebot.TeleBot):
         s         = state.pop(m.from_user.id)
         token_val = s['token']
         uname     = s.get('username', '')
-        # дни берём из гранта (однократно) — пробный/купон не превращаются в 30.
-        # СНАЧАЛА читаем (peek): расход гранта — только после успешного db_add_bot,
-        # иначе дубль токена съедал бы грант (триал-юзер получал бы 30 дней на повторе)
-        grant_days = db_peek_grant_days(m.from_user.id)
-        if grant_days is not None:
-            days = grant_days
-        elif s.get('free_days'):
-            days = s['free_days']
-        elif s.get('trial'):
-            days = 3
-        else:
-            days = 30
+        if not db_is_paid(m.from_user.id):
+            bot.send_message(m.chat.id, "Сначала оплати настройку бота")
+            return
         try:
-            bot_db_id = db_add_bot(m.from_user.id, token_val, admin_id_val, days=days)
+            bot_db_id = db_register_paid_bot(m.from_user.id, token_val, admin_id_val)
         except sqlite3.IntegrityError:
             # именно занятый токен (UNIQUE): возвращаем юзера к вводу, грант не тронут
             if s.get('free_days'):
@@ -874,12 +867,10 @@ def register(bot: telebot.TeleBot):
                 'username': uname, 'trial': s.get('trial', False),
                 'free_days': s.get('free_days')}
             bot.send_message(m.chat.id,
-                f"<b>{TE_CROSS}  Ошибка базы данных. Попробуй через минуту — просто отправь ID снова:</b>",
+                f"<b>{TE_CROSS} Не удалось подключить бота — отправь ID ещё раз через минуту</b>",
                 parse_mode='HTML')
             return
-        db_take_grant_days(m.from_user.id)  # расходуем грант (успешная регистрация)
         if launch_bot(bot_db_id, token_val, admin_id_val, bot):
-            db_clear_paid(m.from_user.id)
             kb = InlineKeyboardMarkup()
             if uname:
                 kb.add(_btn(f'Перейти к @{uname}', style='success', url=f'https://t.me/{uname}'))
@@ -895,26 +886,27 @@ def register(bot: telebot.TeleBot):
                 parse_mode='HTML')
         else:
             bot.send_message(m.chat.id,
-                f"<b>{TE_CROSS}  Ошибка запуска. Попробуй позже или напиши сюда — админ увидит.</b>", parse_mode='HTML')
+                f"<b>{TE_CROSS} Не удалось запустить бота — открой «Купить бота» для повтора или напиши в поддержку</b>",
+                parse_mode='HTML')
 
     # ── Рассылка ─────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'broadcast')
     def broadcast_start(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         _edit(f"<b>{TE_ANNOUNCE} Выбери тип рассылки:</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=broadcast_type_kb('mine'))
 
     @bot.callback_query_handler(func=lambda c: c.data == 'broadcast_all')
     def broadcast_all_start(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         _edit(f"<b>{TE_ANNOUNCE} Рассылка по всем ботам. Выбери тип:</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=broadcast_type_kb('all'))
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith('bcast_') and not c.data.endswith('_p'))
     def broadcast_type(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         parts = cb.data.split('_')
         btype, scope = parts[1], parts[2]
         if btype == 'text':
@@ -958,7 +950,7 @@ def register(bot: telebot.TeleBot):
     # ── Статистика ────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'stats')
     def stats_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         bots_count, main_users, total_users, breakdown = db_get_stats()
         revenue = round(bots_count * get_price(), 2)
         lines = []
@@ -985,7 +977,7 @@ def register(bot: telebot.TeleBot):
     # ── Управление ботами ────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'manage_bots')
     def manage_bots_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         _show_bots_list(cb.message.chat.id, cb.message.message_id)
 
     def _show_bots_list(chat_id, message_id=None):
@@ -1030,7 +1022,7 @@ def register(bot: telebot.TeleBot):
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith('bot_stop_'))
     def bot_stop_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         bot_id = int(cb.data.split('_')[-1])
         token  = running_bot_ids.get(bot_id)
         if token and stop_bot(token):
@@ -1041,7 +1033,7 @@ def register(bot: telebot.TeleBot):
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith('bot_restart_'))
     def bot_restart_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         bot_id = int(cb.data.split('_')[-1])
         info   = db_get_bot_info(bot_id)
         if not info:
@@ -1059,7 +1051,7 @@ def register(bot: telebot.TeleBot):
     # ── Удаление бота (супер-админ) ───────────────────────
     @bot.callback_query_handler(func=lambda c: c.data.startswith('bot_delete_yes_'))
     def bot_delete_yes_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         bot_id = int(cb.data.split('_')[-1])
         info = db_get_bot_info(bot_id)
         if not info:
@@ -1083,12 +1075,12 @@ def register(bot: telebot.TeleBot):
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith('bot_delete_no_'))
     def bot_delete_no_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         _show_bots_list(cb.message.chat.id, cb.message.message_id)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith('bot_delete_'))
     def bot_delete_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         bot_id = int(cb.data.split('_')[-1])
         info = db_get_bot_info(bot_id)
         if not info:
@@ -1112,7 +1104,7 @@ def register(bot: telebot.TeleBot):
     # ── Установить цену ───────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'set_price')
     def set_price_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         _edit(
             f"<b>{TE_MONEY} Текущая цена: {get_price()} USDT</b>\n\n"
             f"Введи новую цену (например: 5 или 9.99):",
@@ -1122,7 +1114,7 @@ def register(bot: telebot.TeleBot):
 
     @bot.message_handler(func=lambda m: state.get(m.from_user.id) == 'await_new_price')
     def handle_new_price(m):
-        if m.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(m): return
         try:
             new_price = float(m.text.strip().replace(',', '.'))
             if new_price <= 0: raise ValueError
@@ -1138,7 +1130,7 @@ def register(bot: telebot.TeleBot):
     # ── Маркетплейс ───────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'marketplace')
     def marketplace_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         _show_marketplace(cb.message.chat.id, cb.message.message_id)
 
     def _show_marketplace(chat_id, message_id=None):
@@ -1177,7 +1169,7 @@ def register(bot: telebot.TeleBot):
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith('mp_toggle_'))
     def mp_toggle_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         bot_id = int(cb.data.split('_')[-1])
         enabled = db_is_marketplace_enabled(bot_id)
         db_set_marketplace(bot_id, not enabled)
@@ -1187,7 +1179,7 @@ def register(bot: telebot.TeleBot):
 
     @bot.callback_query_handler(func=lambda c: c.data == 'back_admin_panel')
     def back_admin_panel_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         _edit(f"<b>{TE_KEYBOARD} Панель супер-админа</b>",
             cb.message.chat.id, cb.message.message_id,
             parse_mode='HTML', reply_markup=super_admin_kb())
@@ -1199,7 +1191,7 @@ def register(bot: telebot.TeleBot):
     # ── Бесплатная выдача ─────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'free_give')
     def free_give_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         kb = InlineKeyboardMarkup()
         kb.add(_btn('Купон для нового бота',     icon='🎁', style='success', callback_data='free_coupon'))
         kb.add(_btn('Продлить существующий бот', style='primary', callback_data='free_renew'))
@@ -1212,7 +1204,7 @@ def register(bot: telebot.TeleBot):
 
     @bot.callback_query_handler(func=lambda c: c.data == 'free_coupon')
     def free_coupon_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         _edit(
             f"<b>{TE_NEW} Купон для нового бота</b>\n\n"
             "Введи в формате:\n<code>user_id дни</code>\n\n"
@@ -1223,7 +1215,7 @@ def register(bot: telebot.TeleBot):
 
     @bot.message_handler(func=lambda m: state.get(m.from_user.id) == 'await_coupon_input')
     def handle_coupon_input(m):
-        if m.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(m): return
         parts = m.text.strip().split()
         if len(parts) != 2:
             bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Неверный формат. Пример: 123456789 30</b>",
@@ -1252,7 +1244,7 @@ def register(bot: telebot.TeleBot):
 
     @bot.callback_query_handler(func=lambda c: c.data == 'free_renew')
     def free_renew_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         _edit(
             f"<b>{TE_REFRESH} Бесплатное продление бота</b>\n\n"
             "Введи в формате:\n<code>bot_id дни</code>\n\n"
@@ -1263,7 +1255,7 @@ def register(bot: telebot.TeleBot):
 
     @bot.message_handler(func=lambda m: state.get(m.from_user.id) == 'await_free_renew_input')
     def handle_free_renew_input(m):
-        if m.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(m): return
         parts = m.text.strip().split()
         if len(parts) != 2:
             bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Неверный формат. Пример: 5 30</b>",
@@ -1283,6 +1275,9 @@ def register(bot: telebot.TeleBot):
             return
         state.pop(m.from_user.id, None)
         new_exp = db_renew_bot(target_bot_id, days)
+        started = _resume_bot(target_bot_id)
+        if not started:
+            bot.send_message(m.chat.id, "Подписка продлена, но бот не запустился — попробуй позже")
         owner_id = info[2]
         exp_str  = str(new_exp)[:10] if new_exp else '—'
         try:
@@ -1299,7 +1294,7 @@ def register(bot: telebot.TeleBot):
     # ── Запросы на вывод (super admin) ───────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'withdrawal_list')
     def withdrawal_list_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         _show_withdrawal_list(cb.message.chat.id, cb.message.message_id)
 
     def _show_withdrawal_list(chat_id, message_id=None):
@@ -1338,7 +1333,7 @@ def register(bot: telebot.TeleBot):
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith('wr_confirm_'))
     def wr_confirm_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         wr_id = int(cb.data.split('_')[-1])
         row   = db_get_withdrawal(wr_id)
         if not row:
@@ -1353,7 +1348,7 @@ def register(bot: telebot.TeleBot):
             bot.answer_callback_query(cb.id, f"⚠️ Заявка #{wr_id} уже обработана", show_alert=True)
             return
         try:
-            bot.send_message(owner_id,
+            send_html(bot, owner_id,
                 f"{TE_CHECK} <b>Запрос на вывод #{wr_id} подтверждён!</b>\n\n"
                 f"Сумма: <b>{usdt_amount} USDT</b>\n"
                 f"Адрес: <code>{html.escape(str(ton_address))}</code>\n\n"
@@ -1366,7 +1361,7 @@ def register(bot: telebot.TeleBot):
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith('wr_reject_'))
     def wr_reject_cb(cb):
-        if cb.from_user.id != SUPER_ADMIN: return
+        if not _is_super_admin(cb): return
         wr_id = int(cb.data.split('_')[-1])
         row   = db_get_withdrawal(wr_id)
         if not row:
@@ -1382,7 +1377,7 @@ def register(bot: telebot.TeleBot):
             return
         db_return_bot_earnings(bot_id, usdt_amount)
         try:
-            bot.send_message(owner_id,
+            send_html(bot, owner_id,
                 f"{TE_CROSS} <b>Запрос на вывод #{wr_id} отклонён.</b>\n\n"
                 f"Сумма <b>{usdt_amount} USDT</b> возвращена на твой баланс.\n"
                 f"Адрес: <code>{html.escape(str(ton_address))}</code>\n"

@@ -5,6 +5,7 @@ import os
 import threading
 import time
 import weakref
+import math
 from datetime import datetime, timedelta
 from config import PRICE_USDT
 
@@ -41,7 +42,7 @@ class _CachedConn:
             self._c.close()
         except Exception:
             pass
-        self._c = sqlite3.connect(self._path, timeout=15)
+        self._c = sqlite3.connect(self._path, timeout=15, check_same_thread=False)
         try:
             self._c.execute('PRAGMA busy_timeout=15000')
         except Exception:
@@ -49,8 +50,17 @@ class _CachedConn:
         self._file_sig = _file_signature(self._path)
     def execute(self, *args, **kwargs):
         try:
+            transaction_open = self._c.in_transaction
+        except sqlite3.ProgrammingError:
+            transaction_open = False
+        try:
             return self._c.execute(*args, **kwargs)
         except sqlite3.OperationalError as e:
+            # Нельзя повторять один запрос из середины транзакции на новом
+            # соединении: предыдущие начисления откатятся, а отметка зачёта
+            # может сохраниться отдельно от них
+            if transaction_open or self._c.in_transaction:
+                raise
             low = str(e).lower()
             if 'disk i/o' in low:
                 # файл/хранилище моргнуло: пересоздаём соединение и повторяем раз
@@ -80,6 +90,35 @@ class _CachedConn:
     def __getattr__(self, name):
         return getattr(self._c, name)
 
+    def __del__(self):
+        # Завершившийся поток удаляет TLS; дескриптор закрываем сразу,
+        # не дожидаясь сборки внутренних циклов sqlite3.Connection
+        try:
+            self._c.close()
+        except Exception:
+            pass
+
+
+class _ConnLease:
+    """Держит гейт до окончания работы вызывающего кода, включая fetch/commit"""
+    def __init__(self, cached):
+        self._cached = cached
+        self._closed = False
+
+    def __getattr__(self, name):
+        return getattr(self._cached, name)
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            try:
+                self._cached.close()
+            finally:
+                _restore_gate.release()
+
+    def __del__(self):
+        self.close()
+
 # Реестр всех соединений: db_close_all() закрывает их перед подменой файла БД
 # (restore_db), иначе на Windows файл не удалить под открытым дескриптором.
 _conns_registry = weakref.WeakSet()
@@ -87,12 +126,9 @@ _conns_registry = weakref.WeakSet()
 def db_close_all():
     """Закрывает ВСЕ кэшированные соединения любых потоков. После вызова
     кэшированные обёртки переоткрываются автоматически при следующем запросе."""
-    for c in list(_conns_registry):
-        try:
+    with _restore_gate:
+        for c in list(_conns_registry):
             c._c.close()
-        except Exception:
-            pass
-    _conns_registry.clear()
 
 def _file_signature(path):
     # только идентификация файла (inode/dev): mtime/size меняются при КАЖДОЙ
@@ -112,8 +148,12 @@ def db_restore_section():
 
 def _conn():
     # во время restore ждём завершения замены файла (см. db_restore_section)
-    with _restore_gate:
-        return _conn_locked()
+    _restore_gate.acquire()
+    try:
+        return _ConnLease(_conn_locked())
+    except BaseException:
+        _restore_gate.release()
+        raise
 
 def _conn_locked():
     path = DB_PATH
@@ -131,7 +171,7 @@ def _conn_locked():
                 pass
             c = None
     if c is None:
-        raw = sqlite3.connect(path, timeout=15)
+        raw = sqlite3.connect(path, timeout=15, check_same_thread=False)
         try:
             raw.execute('PRAGMA busy_timeout=15000')
             raw.execute('PRAGMA synchronous=NORMAL')
@@ -146,6 +186,12 @@ def _conn_locked():
 def _utc_now_str() -> str:
     """Единый формат UTC-времени для всех новых таблиц (CURRENT_TIMESTAMP тоже UTC)."""
     return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def subscription_days_left(expires_at, now=None):
+    """Положительный остаток, даже меньше суток, означает действующую подписку"""
+    expires = datetime.fromisoformat(str(expires_at))
+    return math.ceil((expires - (now or datetime.now())).total_seconds() / 86400)
 
 def init_db():
     conn = sqlite3.connect(DB_PATH, timeout=15)
@@ -196,6 +242,22 @@ def init_db():
         CREATE TABLE IF NOT EXISTS pending_payments (
             user_id    INTEGER PRIMARY KEY,
             invoice_id INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS payment_orders (
+            provider TEXT NOT NULL,
+            invoice_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            amount REAL,
+            target_bot_id INTEGER,
+            via_bot_id INTEGER,
+            expires_at REAL,
+            settled INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (provider, invoice_id)
+        );
+        CREATE TABLE IF NOT EXISTS setup_grants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            days INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS blocked_users (
             bot_id  INTEGER NOT NULL,
@@ -364,11 +426,37 @@ def init_db():
         'ALTER TABLE bot_users ADD COLUMN first_contact_at TIMESTAMP',
         'ALTER TABLE bot_users ADD COLUMN contact_count INTEGER DEFAULT 0',
         'ALTER TABLE states ADD COLUMN updated_at TIMESTAMP',
+        'ALTER TABLE fs_groups ADD COLUMN thread_mgmt INTEGER',
+        'ALTER TABLE fs_groups ADD COLUMN mgmt_msg_id INTEGER',
+        'ALTER TABLE fs_groups ADD COLUMN mgmt_wait_admin INTEGER',
+        'ALTER TABLE fs_groups ADD COLUMN mgmt_claim TEXT',
+        'ALTER TABLE fs_groups ADD COLUMN mgmt_claim_at REAL',
+        'ALTER TABLE fs_pending ADD COLUMN claim_session TEXT',
+        'ALTER TABLE payment_orders ADD COLUMN expected_ton REAL',
+        "ALTER TABLE payment_orders ADD COLUMN receipt TEXT DEFAULT '{}'",
     ]:
         try:
             conn.execute(stmt); conn.commit()
         except Exception:
             pass
+    # Только добавление: прежние таблицы остаются совместимыми
+    for user_id, invoice_id, state_json in conn.execute(
+            'SELECT p.user_id, p.invoice_id, s.state FROM pending_payments p '
+            'LEFT JOIN states s ON s.bot_id=0 AND s.user_id=p.user_id').fetchall():
+        try:
+            context = json.loads(state_json) if state_json else None
+        except (ValueError, TypeError):
+            context = None
+        from purchase_store import purchase_context
+        target, via = purchase_context(context)
+        conn.execute('INSERT OR IGNORE INTO payment_orders '
+                     '(provider, invoice_id, user_id, target_bot_id, via_bot_id) VALUES (?,?,?,?,?)',
+                     ('crypto', str(invoice_id), user_id, target, via))
+    conn.execute('INSERT INTO setup_grants (user_id, days) '
+                 'SELECT p.user_id, COALESCE(g.days, 30) FROM paid_setups p '
+                 'LEFT JOIN bot_grants g ON g.user_id=p.user_id '
+                 'WHERE NOT EXISTS (SELECT 1 FROM setup_grants s WHERE s.user_id=p.user_id)')
+    conn.commit()
     conn.close()
 
 # ── Bots ──────────────────────────────────────────────
@@ -450,15 +538,7 @@ def db_renew_bot(bot_id: int, days: int = 30):
     c = _conn()
     try:
         c.execute('BEGIN IMMEDIATE')
-        row = c.execute('SELECT expires_at FROM bots WHERE id=?', (bot_id,)).fetchone()
-        try:
-            current = datetime.fromisoformat(str(row[0])) if row and row[0] else datetime.now()
-            base    = max(current, datetime.now())
-        except Exception:
-            base = datetime.now()
-        new_expires = base + timedelta(days=days)
-        c.execute('UPDATE bots SET expires_at=?, active=1 WHERE id=?',
-                  (new_expires.isoformat(), bot_id))
+        new_expires = renew_in_transaction(c, bot_id, days)
         c.commit()
         return new_expires
     except Exception:
@@ -684,94 +764,14 @@ class DBState:
         return db_get_state(self.bot_id, user_id) is not None
 
 # ── Pending Payments ──────────────────────────────────
-def db_set_pending(user_id: int, invoice_id: int):
-    c = _conn()
-    c.execute('INSERT OR REPLACE INTO pending_payments (user_id, invoice_id) VALUES (?,?)',
-              (user_id, invoice_id))
-    c.commit(); c.close()
+from purchase_store import (db_set_pending, db_del_pending, db_get_pending,
+                            db_get_payment, db_claim_pending_payment,
+                            db_mark_paid, db_peek_grant_days, db_take_grant_days,
+                            db_is_paid, db_clear_paid, db_register_paid_bot,
+                            db_activate_trial, db_use_purchase_discount,
+                            renew_in_transaction)
 
-def db_del_pending(user_id: int):
-    c = _conn()
-    c.execute('DELETE FROM pending_payments WHERE user_id=?', (user_id,))
-    c.commit(); c.close()
 
-def db_get_pending(user_id: int):
-    """ID инвойса, привязанного к юзеру (защита от чужих/повторных инвойсов)."""
-    c = _conn()
-    row = c.execute('SELECT invoice_id FROM pending_payments WHERE user_id=?', (user_id,)).fetchone()
-    c.close()
-    return row[0] if row else None
-
-def db_claim_pending_payment(user_id: int, invoice_id: int) -> bool:
-    """Атомарный захват права обработать оплату: BEGIN IMMEDIATE → проверка
-    привязки → удаление. Два одновременных «Проверить оплату» дают ровно
-    один True — второй не проходит (запись уже удалена). Начисления
-    (_after_payment_confirmed) вызываются только у победителя."""
-    c = _conn()
-    try:
-        c.execute('BEGIN IMMEDIATE')
-        row = c.execute('SELECT invoice_id FROM pending_payments WHERE user_id=?',
-                        (user_id,)).fetchone()
-        if row and row[0] == invoice_id:
-            c.execute('DELETE FROM pending_payments WHERE user_id=?', (user_id,))
-            c.commit()
-            return True
-        c.execute('ROLLBACK')
-        return False
-    except Exception:
-        try:
-            c.execute('ROLLBACK')
-        except Exception:
-            pass
-        c.close(); raise
-    finally:
-        c.close()
-
-# ── Paid Setups ───────────────────────────────────────
-def db_mark_paid(user_id: int, days: int = 30):
-    """Отмечает оплату И записывает, на сколько дней права выдаются.
-    Пробный период (3) и купоны (N) не превращаются в 30-дневную подписку."""
-    c = _conn()
-    c.execute('INSERT OR IGNORE INTO paid_setups (user_id) VALUES (?)', (user_id,))
-    c.execute('INSERT OR REPLACE INTO bot_grants (user_id, days) VALUES (?,?)',
-              (user_id, max(int(days), 3)))
-    c.commit(); c.close()
-
-def db_peek_grant_days(user_id: int):
-    """Дни из гранта БЕЗ удаления (для расчёта до успешного создания бота).
-    None — нет записи (фолбэк 30). Расход делает db_take_grant_days."""
-    c = _conn()
-    row = c.execute('SELECT days FROM bot_grants WHERE user_id=?', (user_id,)).fetchone()
-    c.close()
-    return row[0] if row else None
-
-def db_take_grant_days(user_id: int):
-    """Забирает записанные дни права (однократно). None — нет записи (30 по умолчанию)."""
-    c = _conn()
-    try:
-        c.execute('BEGIN IMMEDIATE')
-        row = c.execute('SELECT days FROM bot_grants WHERE user_id=?', (user_id,)).fetchone()
-        c.execute('DELETE FROM bot_grants WHERE user_id=?', (user_id,))
-        c.commit()
-        return row[0] if row else None
-    except Exception:
-        try:
-            c.execute('ROLLBACK')
-        except Exception:
-            pass
-        c.close(); raise
-
-def db_is_paid(user_id: int) -> bool:
-    c = _conn()
-    row = c.execute('SELECT 1 FROM paid_setups WHERE user_id=?', (user_id,)).fetchone()
-    c.close(); return row is not None
-
-def db_clear_paid(user_id: int):
-    c = _conn()
-    c.execute('DELETE FROM paid_setups WHERE user_id=?', (user_id,))
-    c.commit(); c.close()
-
-# ── Bot Templates ─────────────────────────────────────
 def db_get_templates(bot_id: int) -> list:
     c = _conn()
     rows = c.execute(
@@ -889,7 +889,9 @@ def db_use_discount_atomic(user_id: int) -> bool:
         c.commit()
         return cur.rowcount > 0
     except Exception:
-        c.rollback(); c.close(); raise
+        c.rollback(); raise
+    finally:
+        c.close()
 
 # ── Bot Message Stats ─────────────────────────────────
 def db_log_message(bot_id: int, user_id: int, text: str = ''):
@@ -991,7 +993,9 @@ def db_deduct_bot_earnings_atomic(bot_id: int, usdt: float) -> bool:
         c.commit()
         return cur.rowcount > 0
     except Exception:
-        c.rollback(); c.close(); raise
+        c.rollback(); raise
+    finally:
+        c.close()
 
 def db_return_bot_earnings(bot_id: int, usdt: float):
     """Return earnings (e.g. after rejected withdrawal)."""
@@ -1045,7 +1049,9 @@ def db_claim_withdrawal(wr_id: int, status: str) -> bool:
         c.commit()
         return cur.rowcount > 0
     except Exception:
-        c.rollback(); c.close(); raise
+        c.rollback(); raise
+    finally:
+        c.close()
 
 # ── Free Coupons ──────────────────────────────────────
 def db_set_free_coupon(user_id: int, days: int):

@@ -1,5 +1,6 @@
 import logging
 import logging.handlers
+from safe_logging import install_secret_filter
 import os
 import signal
 import sys
@@ -26,12 +27,13 @@ logging.basicConfig(
         logging.StreamHandler(),
     ]
 )
+install_secret_filter()
 log = logging.getLogger(__name__)
 
 bot = telebot.TeleBot(TOKEN)
 
 if __name__ == '__main__':
-    log.info(f'Config: TOKEN={TOKEN[:10]}... SUPER_ADMIN={SUPER_ADMIN} DATA_DIR={_data_dir}')
+    log.info('Config: SUPER_ADMIN=%s DATA_DIR=%s', SUPER_ADMIN, _data_dir)
     init_db()
     register(bot)
 
@@ -40,7 +42,7 @@ if __name__ == '__main__':
     try:
         bot.get_me()
         if not WEBHOOK_URL:
-            bot.delete_webhook(drop_pending_updates=True, timeout=10)
+            bot.delete_webhook(drop_pending_updates=False, timeout=10)
             log.info('Webhook cleared.')
     except Exception as e:
         log.warning(f'Pre-warm (get_me/delete_webhook) failed: {e}')
@@ -177,6 +179,7 @@ if __name__ == '__main__':
                 # секретом — проверяется в _telegram_webhook через compare_digest
                 bot.set_webhook(url=f'{base}/{secret}',
                                 allowed_updates=['message', 'callback_query', 'message_reaction'],
+                                drop_pending_updates=False,
                                 secret_token=wh_secret)
                 webhook_ok = True
                 # секрет (производный от токена) в лог не пишем
@@ -194,7 +197,7 @@ if __name__ == '__main__':
                 # примет апдейты: снимаем его и уходим в polling, бот живёт
                 log.error(f'Порт {WEBHOOK_PORT} недоступен ({e}) — fallback в polling')
                 try:
-                    bot.delete_webhook()
+                    bot.delete_webhook(drop_pending_updates=False)
                 except Exception:
                     pass
                 _run_polling()

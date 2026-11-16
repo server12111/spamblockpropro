@@ -352,6 +352,8 @@ print('\n── 4. Подключение группы: проверка пра�
 fb = FakeBot()
 GID = -1001234567890
 UID_OWNER = 777
+# Реальный владелец нужен для общей проверки полномочий при подключении
+assert db.db_add_bot(UID_OWNER, 'forum-fixture', UID_OWNER) == 1
 # 1) группа не супергруппа
 fb.chat_info[GID] = {'id': GID, 'type': 'group', 'title': 'G'}
 ok, err = fs.fs_verify_group(fb, GID, UID_OWNER, fb.me_id)
@@ -634,9 +636,9 @@ forum_support._rate_cache.pop((1, 600), None)
 fs.confirm_send(fb6, 1, cb6)
 row = fs.fs_get_pending(1, 600)
 check('после подтверждения очередь удалена', row is None)
-copied = [c for c in fb6.calls if c[0] == 'copy_messages' and c[1][0] == GID]
+copied = [c for c in fb6.calls if c[0] == 'copy_message' and c[1][0] == GID]
 check('оба сообщения доставлены в тему',
-      len(copied) == 1 and len(copied[0][1][2]) == 2, str(len(copied)))
+      [c[1][2] for c in copied] == [301, 302], str(len(copied)))
 mapped = fs.fs_get_mapping(GID, fb6._mid)
 check('соответствия очереди записаны', mapped is not None)
 check('rate limit зафиксирован после доставки',
@@ -690,8 +692,8 @@ check('при сбое отправки старое окно не удаляе�
 fb_prompt.fail_prompt = False
 fs.confirm_send(fb_prompt, 1, make_cb('fs_confirm_send', from_id=603, msg_mid=old_prompt))
 check('старое окно после сбоя отправки доставляет обе записи',
-      fs.fs_get_pending(1, 603) is None and any(
-          c[0] == 'copy_messages' and c[1][2] == (310, 311) for c in fb_prompt.calls))
+      fs.fs_get_pending(1, 603) is None and
+      [c[1][2] for c in fb_prompt.calls if c[0] == 'copy_message'] == [310, 311])
 
 # Неудалённое устаревшее окно продолжает управлять всей очередью.
 fb_prompt = QueuePromptBot()
@@ -712,8 +714,8 @@ check('текст и кнопки нового окна сохранены',
 stale_cb = make_cb('fs_confirm_send', from_id=604, msg_mid=old_prompt)
 fs.confirm_send(fb_prompt, 1, stale_cb)
 check('устаревшее окно доставляет обе записи после сбоя удаления',
-      fs.fs_get_pending(1, 604) is None and any(
-          c[0] == 'copy_messages' and c[1][2] == (312, 313) for c in fb_prompt.calls))
+      fs.fs_get_pending(1, 604) is None and
+      [c[1][2] for c in fb_prompt.calls if c[0] == 'copy_message'] == [312, 313])
 fs.confirm_send(fb_prompt, 1, stale_cb)
 check('повторное нажатие устаревшего окна сообщает о пустой очереди',
       fb_prompt.calls[-1][0] == 'answer_callback_query'

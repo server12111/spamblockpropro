@@ -5,8 +5,8 @@ forum_support.py — режим техподдержки через Telegram For
 Ключевые идеи:
 - Один дочерний бот = одна привязанная группа (fs_groups). Отключение группы
   возвращает стандартный режим (личные сообщения админам).
-- Один пользователь = одна тема (fs_topics). Тема создаётся конкурентно-безопасно
-  через claim-запись в БД (INSERT OR IGNORE + ожидание/захват залипшей заявки).
+- Один пользователь = одна тема (fs_topics). Создание сериализуется на всё время
+  запроса Telegram, незавершённая заявка восстанавливается после перезапуска.
 - Все сообщения пользователя копируются в его тему (copy → forward → resend),
   соответствие (chat_id, group_msg_id) → исходное сообщение хранится в fs_msgs.
 - Админ отвечает стандартным «Ответить» на сообщение пользователя в теме —
@@ -23,6 +23,7 @@ import random
 import sqlite3
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from telebot.apihelper import ApiTelegramException
@@ -33,7 +34,7 @@ from database import (_utc_now_str, db_get_topic_copies_by_src,
                       db_add_user, db_get_user_info, db_bump_user_contact,
                       db_add_username_history,
                       db_is_blocked, db_block_user, db_unblock_user, db_get_bot_admins,
-                      db_get_templates, db_get_template,
+                      db_get_templates, db_get_template, db_add_template, db_del_template,
                       db_get_bot_setting, db_set_bot_setting,
                       db_get_bot_info, db_log_message,
                       db_fs_count_range, db_fs_tickets_total,
@@ -134,6 +135,247 @@ def fs_unbind_group(bot_id: int):
     return row[0] if row else None
 
 
+# ── Служебная тема управления ──────────────────────────────────
+MGMT_TEMPLATE_LIMIT = 50
+MGMT_TEXT_LIMIT = 4096  # единицы UTF-16, включая символы вне BMP
+_mgmt_locks = tuple(threading.RLock() for _ in range(64))
+
+
+def _mgmt_lock(bot_id):
+    return _mgmt_locks[bot_id % len(_mgmt_locks)]
+
+
+def _mgmt_row(bot_id):
+    c = _conn()
+    try:
+        return c.execute('SELECT chat_id, thread_mgmt, mgmt_msg_id, mgmt_wait_admin '
+                         'FROM fs_groups WHERE bot_id=?', (bot_id,)).fetchone()
+    finally:
+        c.close()
+
+
+def _mgmt_update(bot_id, gid, assignments, values=()):
+    c = _conn()
+    try:
+        c.execute(f'UPDATE fs_groups SET {assignments} WHERE bot_id=? AND chat_id=?',
+                  (*values, bot_id, gid))
+        c.commit()
+    finally:
+        c.close()
+
+
+def _mgmt_is_primary(bot_id, uid):
+    info = db_get_bot_info(bot_id)
+    return bool(info and uid == info[1])
+
+
+def _mgmt_ensure_thread(pbot, bot_id):
+    """Заявка в БД: один создатель, ожидание остальных, lease для умершего потока.
+
+    Сетевые вызовы выполняются после commit, без удержания транзакции.
+    Уникальная заявка не позволяет старому создателю стереть новую заявку.
+    """
+    claim = uuid.uuid4().hex
+    for _ in range(100):
+        row = _mgmt_row(bot_id)
+        if not row or row[1]:
+            return row
+        gid = row[0]
+        c = _conn()
+        try:
+            cur = c.execute('UPDATE fs_groups SET mgmt_claim=?, mgmt_claim_at=? '
+                            'WHERE bot_id=? AND chat_id=? AND thread_mgmt IS NULL '
+                            'AND (mgmt_claim IS NULL OR mgmt_claim_at<?)',
+                            (claim, time.time(), bot_id, gid, time.time() - 300))
+            c.commit()
+            claimed = cur.rowcount > 0
+        finally:
+            c.close()
+        if not claimed:
+            time.sleep(0.1)
+            continue
+        try:
+            topic = _api(pbot.create_forum_topic, gid, 'Управление')
+            c = _conn()
+            try:
+                c.execute('UPDATE fs_groups SET thread_mgmt=?, mgmt_msg_id=NULL, '
+                          'mgmt_wait_admin=NULL, mgmt_claim=NULL, mgmt_claim_at=NULL '
+                          'WHERE bot_id=? AND chat_id=? AND mgmt_claim=?',
+                          (topic.message_thread_id, bot_id, gid, claim))
+                c.commit()
+            finally:
+                c.close()
+            return _mgmt_row(bot_id)
+        except Exception:
+            c = _conn()
+            try:
+                c.execute('UPDATE fs_groups SET mgmt_claim=NULL, mgmt_claim_at=NULL '
+                          'WHERE bot_id=? AND chat_id=? AND mgmt_claim=?',
+                          (bot_id, gid, claim))
+                c.commit()
+            finally:
+                c.close()
+            raise
+    raise RuntimeError('management topic creation in progress')
+
+
+def _mgmt_list(bot_id):
+    templates = db_get_templates(bot_id)
+    text = (f'<b>{TE_NOTE} Шаблоны ответов ({len(templates)})</b>' if templates
+            else f'<b>{TE_NOTE} Шаблонов пока нет</b>')
+    kb = InlineKeyboardMarkup()
+    for tid, body in templates[:MGMT_TEMPLATE_LIMIT]:
+        preview = body[:35] + '…' if len(body) > 35 else body
+        kb.add(_fbtn(preview, callback_data=f'fs_mgmt_view_{tid}'))
+    kb.add(_fbtn('Добавить шаблон', callback_data='fs_mgmt_add'))
+    return text, kb, 'HTML'
+
+
+def _mgmt_render(pbot, bot_id, screen=None):
+    """Правка меню; новое сообщение при удалении, новая тема при её удалении.
+
+    Вызывается под _mgmt_lock, чтобы добавление, отмена и обновление из лички
+    были последовательны и не создавали несколько закрепов в одном процессе.
+    """
+    for _ in range(3):
+        row = _mgmt_ensure_thread(pbot, bot_id)
+        if not row:
+            return
+        gid, thread, mid, _wait = row
+        text, kb, mode = screen or _mgmt_list(bot_id)
+        if mid:
+            try:
+                _api(pbot.edit_message_text, text, gid, mid, parse_mode=mode,
+                     reply_markup=kb)
+                return
+            except ApiTelegramException as e:
+                if 'message is not modified' in _err_low(e):
+                    return
+                # Старый/удалённый закреп: попробуем отправить новый в ту же тему.
+        try:
+            sent = _api(pbot.send_message, gid, text, parse_mode=mode,
+                        message_thread_id=thread, reply_markup=kb)
+        except ApiTelegramException as e:
+            if not _is_topic_gone(e):
+                raise
+            c = _conn()
+            try:
+                c.execute('UPDATE fs_groups SET thread_mgmt=NULL, mgmt_msg_id=NULL, '
+                          'mgmt_wait_admin=NULL WHERE bot_id=? AND chat_id=? '
+                          'AND thread_mgmt=?', (bot_id, gid, thread))
+                c.commit()
+            finally:
+                c.close()
+            screen = None  # после пересоздания темы ожидание ввода отменено
+            continue
+        _mgmt_update(bot_id, gid, 'mgmt_msg_id=?', (sent.message_id,))
+        try:
+            _api(pbot.pin_chat_message, gid, sent.message_id, disable_notification=True)
+        except Exception as e:
+            log.warning(f'fs management pin bot#{bot_id}: {e}')
+        return
+
+
+def fs_refresh_management(pbot, bot_id):
+    """Обновление из личной панели/при подключении/запуске — best effort."""
+    try:
+        with _mgmt_lock(bot_id):
+            row = _mgmt_row(bot_id)
+            if row:
+                _mgmt_update(bot_id, row[0], 'mgmt_wait_admin=NULL')
+                _mgmt_render(pbot, bot_id)
+    except Exception as e:
+        log.warning(f'fs management refresh bot#{bot_id}: {e}')
+
+
+def _mgmt_text_units(text):
+    return len(text.encode('utf-16-le')) // 2
+
+
+def _mgmt_preview(text):
+    if _mgmt_text_units(text) <= MGMT_TEXT_LIMIT:
+        return text
+    return text.encode('utf-16-le')[:(MGMT_TEXT_LIMIT - 1) * 2].decode(
+        'utf-16-le', errors='ignore') + '…'
+
+
+def fs_management_callback(pbot, bot_id, cb):
+    with _mgmt_lock(bot_id):
+        row = _mgmt_row(bot_id)
+        m = cb.message
+        if not (m and m.chat.type in ('group', 'supergroup') and row and row[1]
+                and m.chat.id == row[0] and m.message_thread_id == row[1]
+                and m.message_id == row[2] and _mgmt_is_primary(bot_id, cb.from_user.id)):
+            pbot.answer_callback_query(cb.id, 'Доступно только главному админу', show_alert=True)
+            return
+        data = cb.data or ''
+        parts = data.split('_')
+        action = parts[2] if len(parts) >= 3 else ''
+        screen = None
+        if action in ('view', 'delete'):
+            number = parts[3] if len(parts) == 4 else ''
+            tid = (int(number) if number.isascii() and number.isdecimal()
+                   and len(number) <= 19 and 0 < int(number) < 2**63 else None)
+            body = db_get_template(tid, bot_id) if tid else None
+            if body is None:
+                pbot.answer_callback_query(cb.id, 'Шаблон не найден', show_alert=True)
+                return
+            if action == 'delete':
+                db_del_template(tid, bot_id)
+            else:
+                kb = InlineKeyboardMarkup()
+                kb.add(_fbtn('Удалить', style='danger', callback_data=f'fs_mgmt_delete_{tid}'))
+                kb.add(_fbtn('Назад', callback_data='fs_mgmt_back'))
+                screen = (_mgmt_preview(body), kb, None)  # шаблон — обычный текст
+        elif data == 'fs_mgmt_add':
+            if len(db_get_templates(bot_id)) >= MGMT_TEMPLATE_LIMIT:
+                pbot.answer_callback_query(cb.id, 'Можно сохранить не больше 50 шаблонов', show_alert=True)
+                return
+            kb = InlineKeyboardMarkup()
+            kb.add(_fbtn('Отмена', callback_data='fs_mgmt_cancel'))
+            screen = (f'<b>{TE_NOTE} Отправь текст шаблона сюда</b>', kb, 'HTML')
+        elif data not in ('fs_mgmt_back', 'fs_mgmt_cancel'):
+            pbot.answer_callback_query(cb.id, 'Доступно только главному админу', show_alert=True)
+            return
+        # Отмена фиксируется ДО обращения к Telegram, даже если правка меню упадёт.
+        _mgmt_update(bot_id, row[0], 'mgmt_wait_admin=?',
+                     (cb.from_user.id if data == 'fs_mgmt_add' else None,))
+        _mgmt_render(pbot, bot_id, screen)
+        pbot.answer_callback_query(cb.id)
+
+
+def _mgmt_is_message(pbot, bot_id, m):
+    if m.chat.type not in ('group', 'supergroup'):
+        return False
+    row = _mgmt_row(bot_id)
+    if not row or m.chat.id != row[0]:
+        return False
+    if not row[1]:
+        fs_refresh_management(pbot, bot_id)  # ленивая миграция старой привязки
+        row = _mgmt_row(bot_id)
+    return bool(row and row[1] and getattr(m, 'message_thread_id', None) == row[1])
+
+
+def _mgmt_handle_message(pbot, bot_id, m):
+    with _mgmt_lock(bot_id):
+        row = _mgmt_row(bot_id)
+        if not (row and m.chat.id == row[0] and m.message_thread_id == row[1]
+                and m.from_user and row[3] == m.from_user.id
+                and _mgmt_is_primary(bot_id, m.from_user.id)
+                and m.content_type == 'text' and m.text):
+            return
+        if _mgmt_text_units(m.text) > MGMT_TEXT_LIMIT:
+            _topic_notice(pbot, row[0], row[1], 'Текст шаблона должен быть не длиннее 4096 символов')
+            return
+        if len(db_get_templates(bot_id)) >= MGMT_TEMPLATE_LIMIT:
+            _topic_notice(pbot, row[0], row[1], 'Можно сохранить не больше 50 шаблонов')
+            return
+        db_add_template(bot_id, m.text)
+        _mgmt_update(bot_id, row[0], 'mgmt_wait_admin=NULL')
+        fs_refresh_management(pbot, bot_id)
+        _topic_notice(pbot, row[0], row[1], 'Шаблон сохранён')
+
+
 # ── Темы ──────────────────────────────────────────────────────
 def fs_get_topic(bot_id: int, user_id: int):
     """(thread_id, title, pinned_msg_id, info_hash) или None."""
@@ -209,6 +451,28 @@ def fs_get_mapping(chat_id: int, group_msg_id: int):
 
 
 # ── Очередь подтверждения ─────────────────────────────────────
+_pending_session = uuid.uuid4().hex
+_pending_activity_lock = threading.Lock()
+_pending_active = set()
+
+
+def _recover_pending_runtime(bot_id):
+    """Регистрация обработчиков освобождает прерванные, но не живые отправки."""
+    with _pending_activity_lock:
+        c = _conn()
+        try:
+            c.execute('BEGIN IMMEDIATE')
+            rows = c.execute("SELECT user_id FROM fs_pending WHERE bot_id=? AND status='sending'",
+                             (bot_id,)).fetchall()
+            for (uid,) in rows:
+                if (bot_id, uid) not in _pending_active:
+                    c.execute("UPDATE fs_pending SET status='pending', claim_session=NULL "
+                              'WHERE bot_id=? AND user_id=?', (bot_id, uid))
+            c.commit()
+        finally:
+            c.close()
+
+
 def fs_get_pending(bot_id: int, user_id: int):
     """(payload_json, status, prompt_msg_id) или None."""
     c = _conn()
@@ -267,15 +531,17 @@ def fs_claim_pending(bot_id: int, user_id: int):
     """Атомарно забирает очередь в работу (защита от повторного нажатия кнопки).
     Возвращает список элементов или None, если очередь уже обрабатывается."""
     c = _conn()
-    cur = c.execute("UPDATE fs_pending SET status='sending', updated_at=? "
-                    "WHERE bot_id=? AND user_id=? AND status='pending'",
-                    (_utc_now_str(), bot_id, user_id))
-    c.commit()
-    row = None
-    if cur.rowcount > 0:
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        cur = c.execute("UPDATE fs_pending SET status='sending', updated_at=?, claim_session=? "
+                        "WHERE bot_id=? AND user_id=? AND (status='pending' OR "
+                        "(status='sending' AND COALESCE(claim_session, '') != ?))",
+                        (_utc_now_str(), _pending_session, bot_id, user_id, _pending_session))
         row = c.execute('SELECT payload FROM fs_pending WHERE bot_id=? AND user_id=?',
-                        (bot_id, user_id)).fetchone()
-    c.close()
+                        (bot_id, user_id)).fetchone() if cur.rowcount else None
+        c.commit()
+    finally:
+        c.close()
     if row is None:
         return None
     try:
@@ -283,13 +549,35 @@ def fs_claim_pending(bot_id: int, user_id: int):
     except Exception:
         return []
 
-def fs_restore_pending(bot_id: int, user_id: int, items: list):
-    """Возвращает очередь в состояние pending (с отметками о доставленном)."""
+def _save_pending_progress(bot_id: int, user_id: int, items: list, finish=False):
+    """Сохраняет результат захваченной пачки, не затрагивая новые сообщения."""
     c = _conn()
-    c.execute("UPDATE fs_pending SET payload=?, status='pending', updated_at=? "
-              'WHERE bot_id=? AND user_id=?',
-              (json_dumps(items), _utc_now_str(), bot_id, user_id))
-    c.commit(); c.close()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        row = c.execute('SELECT payload FROM fs_pending WHERE bot_id=? AND user_id=? '
+                        'AND claim_session=?', (bot_id, user_id, _pending_session)).fetchone()
+        if not row:
+            c.commit()
+            return []
+        progress = {it['mid']: it for it in items}
+        merged = [progress.get(it['mid'], it) for it in json_loads(row[0])]
+        if finish:
+            merged = [it for it in merged if not it.get('done')]
+        if finish and not merged:
+            c.execute('DELETE FROM fs_pending WHERE bot_id=? AND user_id=?', (bot_id, user_id))
+        else:
+            c.execute('UPDATE fs_pending SET payload=?, status=?, updated_at=? '
+                      'WHERE bot_id=? AND user_id=?',
+                      (json_dumps(merged), 'pending' if finish else 'sending',
+                       _utc_now_str(), bot_id, user_id))
+        c.commit()
+        return merged
+    finally:
+        c.close()
+
+
+def fs_restore_pending(bot_id: int, user_id: int, items: list):
+    return _save_pending_progress(bot_id, user_id, items, finish=True)
 
 def fs_delete_pending(bot_id: int, user_id: int):
     c = _conn()
@@ -405,8 +693,7 @@ def _is_bot_blocked(e) -> bool:
 
 def _is_chat_not_found(e) -> bool:
     s = _err_low(e)
-    return ('chat not found' in s or 'user deactivated' in s or 'peer id invalid' in s
-            or 'message to copy not found' in s or 'message to forward not found' in s)
+    return 'chat not found' in s or 'user deactivated' in s or 'peer id invalid' in s
 
 
 # ══════════════════════════════════════════════════════════════
@@ -508,16 +795,28 @@ def fs_touch_user(pbot, bot_id: int, u) -> bool:
 # ══════════════════════════════════════════════════════════════
 #  Создание темы и закреплённого сообщения
 # ══════════════════════════════════════════════════════════════
+_topic_locks = tuple(threading.RLock() for _ in range(256))
+
+
+def _topic_lock(bot_id, uid):
+    return _topic_locks[hash((bot_id, uid)) % len(_topic_locks)]
+
+
 def _get_or_create_topic(pbot, bot_id: int, gid: int, u, depth: int = 0) -> int:
-    """Возвращает message_thread_id темы пользователя.
-    Конкурентная защита: claim-запись в БД + ожидание/захват залипшей заявки."""
+    """Живой создатель удерживает блокировку на всё время запроса Telegram."""
+    with _topic_lock(bot_id, u.id):
+        return _create_topic_locked(pbot, bot_id, gid, u)
+
+
+def _create_topic_locked(pbot, bot_id, gid, u):
     uid = u.id
     title = fs_topic_title(u)
     row = fs_get_topic(bot_id, uid)
     if row and row[0] > 0:
         return row[0]
-    if depth > 3:
-        raise RuntimeError('topic claim loop')
+    # При свободной блокировке нулевая заявка осталась от завершённого runtime
+    if row:
+        fs_delete_topic_row(bot_id, uid)
     if fs_claim_topic(bot_id, uid, title):
         # мы выиграли гонку — создаём тему
         try:
@@ -527,17 +826,7 @@ def _get_or_create_topic(pbot, bot_id: int, gid: int, u, depth: int = 0) -> int:
         except Exception:
             fs_delete_topic_row(bot_id, uid)  # отпускаем заявку
             raise
-    # кто-то другой создаёт — ждём результат (без удержания БД)
-    for _ in range(20):
-        time.sleep(0.5)
-        row = fs_get_topic(bot_id, uid)
-        if row and row[0] > 0:
-            return row[0]
-    # залипшая заявка (поток-создатель умер) — захватываем
-    row = fs_get_topic(bot_id, uid)
-    if row and row[0] == 0:
-        fs_delete_topic_row(bot_id, uid)
-    return _get_or_create_topic(pbot, bot_id, gid, u, depth + 1)
+    raise RuntimeError('topic claim busy')
 
 
 def _ensure_pinned_info(pbot, bot_id: int, gid: int, thread: int, u, trow):
@@ -581,8 +870,19 @@ def _ensure_pinned_info(pbot, bot_id: int, gid: int, thread: int, u, trow):
 
 def fs_ensure_topic_info(pbot, bot_id: int, group_row, u) -> int:
     """Тема + закреплённая информация + актуальное название темы. → thread_id"""
+    with _topic_lock(bot_id, u.id):
+        for attempt in range(2):
+            thread = _get_or_create_topic(pbot, bot_id, group_row[1], u)
+            try:
+                return _ensure_topic_info_locked(pbot, bot_id, group_row, u, thread)
+            except Exception as e:
+                if attempt or not _is_topic_err(e):
+                    raise
+                _recover_topic(pbot, bot_id, group_row[1], u, thread)
+
+
+def _ensure_topic_info_locked(pbot, bot_id, group_row, u, thread):
     gid = group_row[1]
-    thread = _get_or_create_topic(pbot, bot_id, gid, u)
     trow = fs_get_topic(bot_id, u.id)
     _ensure_pinned_info(pbot, bot_id, gid, thread, u, trow)
     title = fs_topic_title(u)
@@ -705,13 +1005,17 @@ def _rebuild_media_group(msgs):
 
 def _recover_topic(pbot, bot_id: int, gid: int, u, thread: int):
     """Тема закрыта/удалена: переоткрываем или пересоздаём. → новый thread_id"""
-    try:
-        _api(pbot.reopen_forum_topic, gid, thread)
-        return thread
-    except Exception:
-        pass
-    fs_delete_topic_row(bot_id, u.id)
-    return _get_or_create_topic(pbot, bot_id, gid, u)
+    with _topic_lock(bot_id, u.id):
+        row = fs_get_topic(bot_id, u.id)
+        if row and row[0] > 0 and row[0] != thread:
+            return row[0]
+        try:
+            _api(pbot.reopen_forum_topic, gid, thread)
+            return thread
+        except Exception:
+            pass
+        fs_delete_topic_row(bot_id, u.id)
+        return _get_or_create_topic(pbot, bot_id, gid, u)
 
 def _is_topic_err(e) -> bool:
     return isinstance(e, ApiTelegramException) and _is_topic_gone(e)
@@ -722,22 +1026,23 @@ def _relay_to_topic(pbot, bot_id: int, group_row, u, from_chat, msg_id,
     gid = group_row[1]
     tries = 0
     while True:
-        if thread is None:
-            thread = fs_ensure_topic_info(pbot, bot_id, group_row, u)
         try:
+            if thread is None:
+                thread = fs_ensure_topic_info(pbot, bot_id, group_row, u)
             mid = _relay_single(pbot, gid, from_chat, msg_id, thread=thread,
                                 reply_msg_id=reply_msg_id, src_msg=src_msg)
             return mid, thread
         except Exception as e:
             tries += 1
-            if tries >= 2 or not _is_topic_err(e):
+            if tries >= 2 or thread is None or not _is_topic_err(e):
                 raise
-            thread = _recover_topic(pbot, bot_id, gid, u, thread)
+            _recover_topic(pbot, bot_id, gid, u, thread)
+            thread = None
 
 def _relay_batch_to_topic(pbot, bot_id: int, group_row, u, from_chat, ids,
                           msgs=None, thread=None):
     """Передача альбома: copy_messages → forward_messages → пересборка
-    медиагруппы → по одному. Возвращает список id (может быть короче ids)."""
+    медиагруппы → по одному. Возвращает только полный, однозначный результат."""
     gid = group_row[1]
     tries = 0
     while True:
@@ -747,7 +1052,7 @@ def _relay_batch_to_topic(pbot, bot_id: int, group_row, u, from_chat, ids,
         topic_err = None
         try:
             res = _api(pbot.copy_messages, gid, from_chat, ids, message_thread_id=thread)
-            sent = [r.message_id for r in res]
+            sent = _batch_message_ids(res, ids)
         except ApiTelegramException as e:
             if _is_topic_err(e):
                 topic_err = e
@@ -757,7 +1062,7 @@ def _relay_batch_to_topic(pbot, bot_id: int, group_row, u, from_chat, ids,
             try:
                 res = _api(pbot.forward_messages, gid, from_chat, ids,
                            message_thread_id=thread)
-                sent = [r.message_id for r in res]
+                sent = _batch_message_ids(res, ids)
             except ApiTelegramException as e:
                 if _is_topic_err(e):
                     topic_err = e
@@ -770,20 +1075,35 @@ def _relay_batch_to_topic(pbot, bot_id: int, group_row, u, from_chat, ids,
                 media = _rebuild_media_group(msgs or [])
                 if media:
                     mm = _api(pbot.send_media_group, gid, media, message_thread_id=thread)
-                    sent = [x.message_id for x in mm]
+                    sent = _batch_message_ids(mm, ids)
                 elif msgs:
                     sent = []
                     for ms in msgs:
                         mid = _relay_single(pbot, gid, from_chat, ms.message_id,
                                             thread=thread, src_msg=ms)
-                        if mid:
-                            sent.append(mid)
+                        if not mid:
+                            raise RuntimeError('album item not delivered')
+                        sent.append(mid)
+            if sent is None:
+                raise RuntimeError('album not delivered')
             return sent or [], thread
         except Exception as e:
             tries += 1
             if tries >= 2 or not _is_topic_err(e):
                 raise
-            thread = _recover_topic(pbot, bot_id, gid, u, thread)
+            _recover_topic(pbot, bot_id, gid, u, thread)
+            thread = None
+
+
+def _batch_message_ids(result, source_ids):
+    """Telegram может пропускать сообщения, не указывая исходные ID.
+
+    Неполный результат нельзя сопоставлять через zip или считать успехом
+    """
+    mids = [message.message_id for message in result]
+    if len(mids) != len(source_ids):
+        raise RuntimeError('incomplete batch delivery')
+    return mids
 
 
 
@@ -824,8 +1144,7 @@ def _flush_album(pbot, bot_id: int, key):
     u = None
     try:
         if not group or group[1] != buf['gid']:
-            log.warning(f'album flush bot#{bot_id}: группа изменилась/отвязана — пропущено')
-            return
+            raise RuntimeError('album destination changed')
         u = buf['msgs'][0].from_user
         sent, thread = _relay_batch_to_topic(
             pbot, bot_id, group, u, buf['chat_id'], buf['ids'], buf['msgs'], buf['thread'])
@@ -842,12 +1161,11 @@ def _flush_album(pbot, bot_id: int, key):
                 pass
     except Exception as e:
         log.warning(f'album flush bot#{bot_id} uid={uid}: {e}')
-        try:
-            pbot.send_message(buf['chat_id'],
-                              f'<b>{TE_CROSS}  Не удалось отправить сообщение. Попробуй позже.</b>',
-                              parse_mode='HTML')
-        except Exception:
-            pass
+        for message in buf['msgs']:
+            try:
+                queue_random_message(pbot, bot_id, message)
+            except Exception as queue_error:
+                log.warning(f'album queue bot#{bot_id} uid={uid}: {queue_error}')
 
 
 # ══════════════════════════════════════════════════════════════
@@ -961,6 +1279,9 @@ def fs_handle_group_message(pbot, bot_id: int, m, bot_self_id: int, pstate) -> N
       и обычное сообщение в теме без Reply;
     - ответ на закреплённое инфо-сообщение = внутренняя заметка (не доставляется);
     - служебные события и сообщения не-админов игнорируются."""
+    if _mgmt_is_message(pbot, bot_id, m):
+        _mgmt_handle_message(pbot, bot_id, m)
+        return
     if m.content_type == 'migrate_to_chat_id':
         # группа была преобразована: обновляем chat_id в привязке И в
         # соответствиях сообщений, иначе fs_get_mapping по новому chat_id
@@ -968,18 +1289,23 @@ def fs_handle_group_message(pbot, bot_id: int, m, bot_self_id: int, pstate) -> N
         new_chat_id = getattr(m, 'migrate_to_chat_id', None)
         if new_chat_id:
             c = _conn()
-            c.execute('UPDATE fs_groups SET chat_id=? WHERE bot_id=?', (new_chat_id, bot_id))
-            c.execute('UPDATE fs_msgs SET chat_id=? WHERE bot_id=?', (new_chat_id, bot_id))
-            c.commit(); c.close()
-            log.info(f'Bot #{bot_id}: группа мигрировала → chat_id {new_chat_id}')
+            try:
+                c.execute('BEGIN IMMEDIATE')
+                changed = c.execute('UPDATE fs_groups SET chat_id=? WHERE bot_id=? AND chat_id=?',
+                                    (new_chat_id, bot_id, m.chat.id)).rowcount
+                if changed:
+                    c.execute('UPDATE fs_msgs SET chat_id=? WHERE bot_id=? AND chat_id=?',
+                              (new_chat_id, bot_id, m.chat.id))
+                c.commit()
+            finally:
+                c.close()
+            if changed:
+                log.info(f'Bot #{bot_id}: группа мигрировала → chat_id {new_chat_id}')
         return
     if m.content_type in SERVICE_TYPES:
         return
     if not m.from_user or m.from_user.id == bot_self_id:
         return  # защита от циклической обработки собственных сообщений
-    group = fs_get_group(bot_id)
-    if not group or m.chat.id != group[1]:
-        return
     uid_sender = m.from_user.id
 
     # ── код подтверждения подключения группы ──
@@ -990,6 +1316,10 @@ def fs_handle_group_message(pbot, bot_id: int, m, bot_self_id: int, pstate) -> N
             _finish_connect(pbot, bot_id, uid_sender, m.chat.id,
                             m.chat.title or '', pstate)
             return
+
+    group = fs_get_group(bot_id)
+    if not group or m.chat.id != group[1]:
+        return
 
     # ── сообщения администрации ──
     if not fs_is_admin(bot_id, uid_sender):
@@ -1102,7 +1432,7 @@ def _flush_admin_album(pbot, bot_id: int, key):
             _topic_notice(pbot, buf['gid'], thread,
                           f'{TE_BLOCK} Пользователь заблокирован — ответ не доставлен.')
             return
-        _api(pbot.copy_messages, target_uid, buf['gid'], buf['ids'])
+        _batch_message_ids(_api(pbot.copy_messages, target_uid, buf['gid'], buf['ids']), buf['ids'])
         fs_log_admin_msg(bot_id, target_uid)
     except ApiTelegramException as e:
         if _is_bot_blocked(e):
@@ -1115,6 +1445,8 @@ def _flush_admin_album(pbot, bot_id: int, key):
             log.warning(f'admin album bot#{bot_id} → {target_uid}: {e}')
     except Exception as e:
         log.warning(f'admin album bot#{bot_id} → {target_uid}: {e}')
+        _topic_notice(pbot, buf['gid'], thread,
+                      'Не удалось доставить альбом, попробуй ещё раз')
 
 def fs_pin_callback(pbot, bot_id: int, cb):
     """Любое действие закрепа ограничено ботом, группой, темой и админом."""
@@ -1152,7 +1484,7 @@ def fs_pin_callback(pbot, bot_id: int, cb):
         templates = db_get_templates(bot_id)[:50]
         if not templates:
             pbot.answer_callback_query(cb.id,
-                'Шаблонов пока нет. Добавь их в личной панели бота: «Шаблоны» → «Добавить шаблон»',
+                'Шаблонов пока нет. Добавь их в теме «Управление»',
                 show_alert=True)
             return
         kb = InlineKeyboardMarkup()
@@ -1295,138 +1627,117 @@ def _group_pending_items(items):
     return groups
 
 
+def _pending_reply_markup(uid):
+    kb = InlineKeyboardMarkup()
+    kb.add(_fbtn('Ответить', icon='📤', style='primary', callback_data=f'p_reply_{uid}'))
+    return kb
+
+
 def _deliver_pending_payload(pbot, bot_id: int, items: list, uid: int) -> bool:
-    """Доставляет очередь подтверждения: в тему группы или админам в личку (forward).
-    Возвращает True, если всё доставлено; помечает доставленное в items['done']."""
+    """Точные соответствия и сохранённый прогресс по каждому получателю
+
+    У массовых методов Telegram нет исходных ID в результате и возможны пропуски
+    Поэтому сохранённую очередь доставляем по одному сообщению
+    """
     todo = [it for it in items if not it.get('done')]
-    if not todo:
-        return True
     group = fs_get_group(bot_id)
-    all_ok = True
-    if group:
-        # нужен объект пользователя для темы/инфо — берём из Telegram
+    if group and todo:
         try:
             chat_user = _api(pbot.get_chat, uid)
+            fs_touch_user(pbot, bot_id, chat_user)
         except Exception as e:
             log.warning(f'pending get_chat bot#{bot_id} uid={uid}: {e}')
-            if _is_chat_not_found(e) or _is_bot_blocked(e):
-                # терминальная ошибка: аккаунт удалён/заблокировал бота —
-                # очередь не может быть доставлена никогда: сбрасываем с уведомлением
-                try:
-                    pbot.send_message(uid, '<b>❌ Не удалось отправить ваши сообщения '
-                                           '(аккаунт недоступен). Очередь сброшена.</b>',
-                                      parse_mode='HTML')
-                except Exception:
-                    pass
-                return True  # очередь потреблена (сброшена), не бесконечный retry
             return False
-        fs_touch_user(pbot, bot_id, chat_user)
-        for mg, grp in _group_pending_items(todo):
-            ids = [it['mid'] for it in grp]
-            if any(it.get('done') for it in grp):
-                continue
-            try:
-                if len(ids) == 1:
-                    mid, thread = _relay_to_topic(pbot, bot_id, group, chat_user,
-                                                  uid, ids[0], src_msg=None)
-                    sent = [mid] if mid else []
-                else:
-                    sent, thread = _relay_batch_to_topic(pbot, bot_id, group,
-                                                         chat_user, uid, ids)
-            except ApiTelegramException as e:
-                if _is_chat_not_found(e):
-                    # юзер удалил свой аккаунт/сообщение — пропускаем без блокировки
-                    log.warning(f'pending skip bot#{bot_id} uid={uid}: {e}')
-                    for it in grp:
-                        it['done'] = 1
+    admins = db_get_bot_admins(bot_id) if not group else []
+    for it in todo:
+        try:
+            if group:
+                mid, thread = _relay_to_topic(pbot, bot_id, group, chat_user,
+                                              uid, it['mid'], src_msg=None)
+                if not mid:
                     continue
-                log.warning(f'pending deliver bot#{bot_id} uid={uid}: {e}')
-                all_ok = False
-                continue
-            except Exception as e:
-                log.warning(f'pending deliver bot#{bot_id} uid={uid}: {e}')
-                all_ok = False
-                continue
-            if not sent:
-                all_ok = False
-                continue
-            for src_id, gm_id in zip(ids, sent):
-                fs_map_message(bot_id, group[1], gm_id, uid, thread, src_id,
-                               media_group=mg)
-            for it in grp:
+                fs_map_message(bot_id, group[1], mid, uid, thread, it['mid'],
+                               media_group=it.get('mg', ''))
                 it['done'] = 1
-            fs_bump_ticket(bot_id, uid)
-            db_bump_user_contact(bot_id, uid)
-            db_log_message(bot_id, uid,
-                           grp[0]['type'] if len(grp) == 1
-                           else f"[{grp[0]['type']} x{len(grp)}]")
-    else:
-        # стандартный режим: пересылаем админам (сохраняет отправителя)
-        from database import db_get_bot_admins as _adm
-        admins = _adm(bot_id)
-        for mg, grp in _group_pending_items(todo):
-            ids = [it['mid'] for it in grp]
-            ok_all = True
-            for aid in admins:
-                try:
-                    if len(ids) == 1:
-                        _api(pbot.forward_message, aid, uid, ids[0])
-                    else:
-                        _api(pbot.forward_messages, aid, uid, ids)
-                except Exception as e:
-                    log.warning(f'pending forward bot#{bot_id} admin {aid}: {e}')
-                    ok_all = False
-            if ok_all:
-                for it in grp:
-                    it['done'] = 1
-                fs_bump_ticket(bot_id, uid)
-                db_log_message(bot_id, uid,
-                               grp[0]['type'] if len(grp) == 1
-                               else f"[{grp[0]['type']} x{len(grp)}]")
+                _save_pending_progress(bot_id, uid, items)
             else:
-                all_ok = False
-    return all_ok
+                delivered = it.setdefault('admins', [])
+                # Сохраняем ID пересылки до добавления кнопки: сбой кнопки
+                # требует повторить только её, а не саму доставку
+                forwarded = it.setdefault('forwarded', {})
+                for aid in admins:
+                    if aid in delivered:
+                        continue
+                    try:
+                        key = str(aid)
+                        if key not in forwarded:
+                            sent = _api(pbot.forward_message, aid, uid, it['mid'])
+                            forwarded[key] = sent.message_id
+                            _save_pending_progress(bot_id, uid, items)
+                        _api(pbot.edit_message_reply_markup, aid, forwarded[key],
+                             reply_markup=_pending_reply_markup(uid))
+                        delivered.append(aid)
+                        _save_pending_progress(bot_id, uid, items)
+                    except Exception as e:
+                        log.warning(f'pending forward bot#{bot_id} admin {aid}: {e}')
+                if admins and all(aid in delivered for aid in admins):
+                    it['done'] = 1
+                    _save_pending_progress(bot_id, uid, items)
+            if it.get('done'):
+                fs_bump_ticket(bot_id, uid)
+                db_bump_user_contact(bot_id, uid)
+                db_log_message(bot_id, uid, it['type'])
+        except Exception as e:
+            log.warning(f'pending deliver bot#{bot_id} uid={uid}: {e}')
+    return all(it.get('done') for it in items)
 
 
 def confirm_send(pbot, bot_id: int, cb) -> None:
-    """Обработка кнопки «Отправить администратору»."""
+    """Обработка кнопки «Отправить администратору»"""
     uid = cb.from_user.id
     if db_is_blocked(bot_id, uid):
-        # заблокирован после постановки в очередь — не доставляем
         fs_delete_pending(bot_id, uid)
         pbot.answer_callback_query(cb.id, '🚫 Вы заблокированы администратором',
                                    show_alert=True)
         return
-    row = fs_get_pending(bot_id, uid)
-    if not row or row[1] != 'pending':
+    if not fs_get_pending(bot_id, uid):
         pbot.answer_callback_query(cb.id, 'Очередь пуста или уже отправляется')
         return
-    # rate limit «мягко»: при лимите очередь сохраняется, ничего не теряется
     if rate_limited(bot_id, uid, mark=False):
-        pbot.answer_callback_query(
-            cb.id, f'⏳ Подожди {RATE_LIMIT_SEC} сек и нажми кнопку ещё раз — '
-            'сообщения не потеряются', show_alert=True)
+        pbot.answer_callback_query(cb.id,
+                                  f'⏳ Подожди {RATE_LIMIT_SEC} сек и нажми кнопку ещё раз',
+                                  show_alert=True)
         return
-    items = fs_claim_pending(bot_id, uid)
+    with _pending_activity_lock:
+        items = None if (bot_id, uid) in _pending_active else fs_claim_pending(bot_id, uid)
+        if items is not None:
+            _pending_active.add((bot_id, uid))
     if items is None:
         pbot.answer_callback_query(cb.id, 'Уже отправляется')
         return
     rate_limited(bot_id, uid, mark=True)
-    ok = _deliver_pending_payload(pbot, bot_id, items, uid)
-    if ok:
-        fs_delete_pending(bot_id, uid)
-        pbot.answer_callback_query(cb.id, '✅ Отправлено')
+    ok = False
+    try:
+        ok = _deliver_pending_payload(pbot, bot_id, items, uid)
+    finally:
         try:
-            _edit(pbot, f'<b>{TE_CHECK}  Сообщение отправлено</b>',
-                                   cb.message.chat.id, cb.message.message_id,
-                                   parse_mode='HTML')
-        except Exception:
-            pass
+            remaining = fs_restore_pending(bot_id, uid, items)
+        finally:
+            with _pending_activity_lock:
+                _pending_active.discard((bot_id, uid))
+    if ok:
+        pbot.answer_callback_query(cb.id, '✅ Отправлено')
+        # Новое окно могло появиться во время доставки захваченной пачки
+        if not remaining:
+            try:
+                _edit(pbot, f'<b>{TE_CHECK}  Сообщение отправлено</b>',
+                      cb.message.chat.id, cb.message.message_id, parse_mode='HTML')
+            except Exception:
+                pass
     else:
-        fs_restore_pending(bot_id, uid, items)
-        pbot.answer_callback_query(cb.id,
-                                   '❌ Не удалось отправить. Попробуй ещё раз '
-                                   'через минуту.', show_alert=True)
+        pbot.answer_callback_query(cb.id, '❌ Не удалось отправить, попробуй через минуту',
+                                   show_alert=True)
+
 
 def confirm_cancel(pbot, bot_id: int, cb) -> None:
     uid = cb.from_user.id
@@ -1485,6 +1796,8 @@ def fs_verify_group(pbot, chat_id: int, uid: int, bot_self_id: int, bot_id: int 
 
 def _finish_connect(pbot, bot_id: int, uid: int, chat_id: int, title: str, pstate):
     """Проверка + привязка группы + создание темы статистики."""
+    if not _can_manage_group(bot_id, uid):
+        return
     try:
         bot_self_id = pbot.get_me().id
     except Exception:
@@ -1524,6 +1837,7 @@ def _finish_connect(pbot, bot_id: int, uid: int, chat_id: int, title: str, pstat
         except Exception:
             pass
         return
+    fs_refresh_management(pbot, bot_id)
     pstate.pop(uid, None)
     try:
         pbot.send_message(
@@ -1892,11 +2206,33 @@ def register_forum_support(pbot, bot_id: int, pstate, is_admin, confirm_kb=_conf
     direct_route(m) — доставка случайного сообщения юзера СРАЗУ (тема/админы)
     без очереди подтверждения; очередь остаётся только анти-потерей при сбое.
     Возвращает route-функцию для маршрутизации обращений пользователя."""
+    _recover_pending_runtime(bot_id)
     bot_self_id = 0
     try:
         bot_self_id = pbot.get_me().id
     except Exception as e:
         log.warning(f'fs register get_me bot#{bot_id}: {e}')
+
+    fs_refresh_management(pbot, bot_id)
+
+    # Только служебная тема получает приоритет над состояниями личной панели.
+    @pbot.message_handler(func=lambda m: _mgmt_is_message(pbot, bot_id, m),
+                          content_types=GROUP_MSG_TYPES)
+    def _fs_management_msg(m):
+        try:
+            _mgmt_handle_message(pbot, bot_id, m)
+        except Exception as e:
+            log.warning(f'fs management message bot#{bot_id}: {e}')
+
+    pbot.message_handlers.insert(0, pbot.message_handlers.pop())
+
+    @pbot.callback_query_handler(func=lambda c: (c.data or '').startswith('fs_mgmt_'))
+    def _fs_management_cb(cb):
+        try:
+            fs_management_callback(pbot, bot_id, cb)
+        except Exception as e:
+            log.warning(f'fs management action bot#{bot_id}: {e}')
+            pbot.answer_callback_query(cb.id, 'Ошибка, попробуй ещё раз', show_alert=True)
 
     def route(m, _kb=confirm_kb):
         return route_user_message(pbot, bot_id, m, confirm_kb=_kb)

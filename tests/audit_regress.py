@@ -25,7 +25,7 @@ db.db_set_pending(7145919720, 555)
 check('db_get_pending возвращает инвойс владельца', db.db_get_pending(7145919720) == 555)
 check('у чужого юзера инвойса нет', db.db_get_pending(999) is None)
 db.db_del_pending(7145919720)
-check('привязка удаляется после оплаты', db.db_get_pending(7145919720) is None)
+check('удаление указателя сохраняет незачтённый счёт', db.db_get_pending(7145919720) == 555)
 
 print('── Реферальная скидка: однократность ──')
 db.db_set_referral(111, 222)
@@ -86,7 +86,7 @@ ths = [threading.Thread(target=cl) for _ in range(2)]
 for t in ths: t.start()
 for t in ths: t.join()
 check('захватов True ровно 1 (не 2)', claims.count(True) == 1, str(claims))
-check('привязка удалена после захвата', db.db_get_pending(60) is None)
+check('зачёт сохраняет грант вместе с отметкой счёта', db.db_get_pending(60) is None and db.db_peek_grant_days(60) == 30)
 check('чужой/несуществующий инвойс → False', db.db_claim_pending_payment(60, 888) is False)
 
 print('── Атомарное списание скидки (двойное нажатие) ──')

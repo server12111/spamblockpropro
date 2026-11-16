@@ -1,4 +1,5 @@
 import requests
+import safe_logging
 import time
 import threading
 import logging
@@ -70,7 +71,7 @@ def ton_payment_link(ton_amount: float, payment_code: str) -> str:
     nanotons = int(ton_amount * 1_000_000_000)
     return f"https://app.tonkeeper.com/transfer/{TON_WALLET}?amount={nanotons}&text={payment_code}"
 
-def ton_check_transfer(user_id: int, expected_ton: float, payment_code: str) -> bool:
+def ton_check_transfer(user_id: int, expected_ton: float, payment_code: str, *, return_tx=False):
     # Lock гарантує що два одночасних кліки "Перевірити" не зарахують одну транзакцію двічі
     with _ton_check_lock:
         try:
@@ -97,6 +98,8 @@ def ton_check_transfer(user_id: int, expected_ton: float, payment_code: str) -> 
                 if comment.strip() != payment_code: continue
                 tx_hash = tx.get('transaction_id', {}).get('hash', '')
                 if not tx_hash or db_is_tx_used(tx_hash): continue
+                if return_tx:
+                    return {'tx_hash': tx_hash, 'ton_amount': value / 1_000_000_000}
                 db_mark_tx_used(tx_hash, user_id)
                 return True
             return False
