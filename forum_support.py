@@ -20,6 +20,8 @@ import html
 import logging
 import os
 import random
+import re
+import secrets
 import sqlite3
 from functools import wraps
 import threading
@@ -29,7 +31,9 @@ from datetime import datetime, timedelta, timezone
 
 from telebot.apihelper import ApiTelegramException
 from telebot.types import (InlineKeyboardMarkup, InlineKeyboardButton,
-                           ReplyParameters, InputMediaPhoto, InputMediaVideo)
+                           ReplyParameters, InputMediaPhoto, InputMediaVideo,
+                           ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton,
+                           KeyboardButtonRequestChat, ChatAdministratorRights)
 
 from database import (_utc_now_str, db_get_topic_copies_by_src,
                       db_add_user, db_get_user_info, db_bump_user_contact,
@@ -1247,7 +1251,7 @@ def _notify_owner_error(pbot, bot_id: int, text: str, err):
 
 
 # ══════════════════════════════════════════════════════════════
-#  Группа: обработка сообщений (ответы админов через Reply, код подключения)
+#  Группа: обработка сообщений (ответы админов через Reply, автоподключение)
 # ══════════════════════════════════════════════════════════════
 SERVICE_TYPES = {
     'new_chat_members', 'left_chat_member', 'new_chat_title', 'new_chat_photo',
@@ -1265,7 +1269,7 @@ SERVICE_TYPES = {
 @_group_guard
 def fs_handle_group_message(pbot, bot_id: int, m, bot_self_id: int, pstate) -> None:
     """Сообщения из привязанной группы:
-    - код подтверждения подключения;
+    - автоматическое подключение по ссылке Telegram;
     - ЛЮБОЕ сообщение администратора в теме пользователя доставляется
       пользователю: и «Ответить» на его сообщение (с reply-контекстом),
       и обычное сообщение в теме без Reply;
@@ -1302,27 +1306,22 @@ def fs_handle_group_message(pbot, bot_id: int, m, bot_self_id: int, pstate) -> N
         return  # защита от циклической обработки собственных сообщений
     uid_sender = m.from_user.id
 
-    # ── код подтверждения подключения группы ──
+    # ── автоматический /start от Telegram после выбора группы по ссылке ──
     txt = (m.text or '').strip()
     parts = txt.split(maxsplit=1)
     command = parts[0] if parts else ''
     name, addressed, username = command.partition('@')
-    is_connect = name == '/connect'
-    if is_connect and addressed:
+    is_start = name == '/start'
+    if is_start and addressed:
         if username.casefold() != (pbot.get_me().username or '').casefold():
             return  # команда адресована другому боту
-    code = parts[1].strip() if is_connect and len(parts) == 2 else ('' if is_connect else txt)
-    if is_connect or (txt and len(txt) == 6):
-        pending = fs_get_connect_code(bot_id)
-        info = db_get_bot_info(bot_id)
-        if (pending and pending[1] == code and pending[2] > time.time()
-                and info and uid_sender in (pending[0], info[1])):
+    if is_start:
+        pending = fs_get_connect_request(bot_id, uid_sender)
+        if (pending and len(parts) == 2
+                and secrets.compare_digest(pending['token'], parts[1].strip())):
             _finish_connect(pbot, bot_id, uid_sender, m.chat.id,
-                            m.chat.title or '', pstate, reply_chat_id=m.chat.id)
-            return
-        if is_connect:
-            pbot.send_message(m.chat.id, CONNECT_INVALID)
-            return
+                            m.chat.title or '', pstate, expected_request=pending['request_id'])
+        return
 
     group = fs_get_group(bot_id)
     if not group or m.chat.id != group[1]:
@@ -1782,191 +1781,249 @@ def confirm_cancel(pbot, bot_id: int, cb) -> None:
 #  Подключение / отключение группы
 # ══════════════════════════════════════════════════════════════
 CONNECT_TTL = 15 * 60
-CONNECT_INVALID = ('Код не подошёл. Получи новый в боте: '
-                   '«Группа техподдержки» → «Подключить группу»')
-CONNECT_RIGHTS = 'Сделай бота администратором с правом управлять темами и отправь код ещё раз'
-CONNECT_TOPICS = 'Включи темы в настройках группы и отправь код ещё раз'
+CONNECT_EXPIRED = 'Подключение больше не активно — нажми «Подключить группу» ещё раз'
+CONNECT_INTRO = ('Выбери группу с темами кнопкой внизу — Telegram добавит бота с нужными правами\n'
+                 'Также можно добавить бота по ссылке или ввести ID группы\n\n'
+                 'Подключение доступно 15 минут')
+CONNECT_ID_PROMPT = ('Добавь бота в группу администратором с правами: управление темами, '
+                     'закрепление сообщений, удаление сообщений\n'
+                     'Потом отправь сюда ID группы (например -1001234567890)\n'
+                     'Можно без минуса или @username публичной группы')
+CONNECT_BAD_ID = 'Неверный ID группы — отправь -1001234567890, ID без минуса или @username публичной группы'
+CONNECT_RIGHT_NAMES = (('can_manage_topics', 'управление темами'),
+                       ('can_pin_messages', 'закрепление сообщений'),
+                       ('can_delete_messages', 'удаление сообщений'))
 
 
-def fs_get_connect_code(bot_id: int):
-    """(user_id, code, expires_at) — отдельная от диалогов заявка подключения."""
+def fs_get_connect_request(bot_id: int, uid=None):
+    """Отдельная от прочих диалогов заявка, сохраняющаяся после перезапуска."""
     c = _conn()
     try:
-        return c.execute('SELECT user_id, code, expires_at FROM fs_connect_codes WHERE bot_id=?',
-                         (bot_id,)).fetchone()
+        row = c.execute('SELECT user_id, token, request_id, expires_at, mode, chat_id, title '
+                        'FROM fs_connect_requests WHERE bot_id=?', (bot_id,)).fetchone()
     finally:
         c.close()
+    if not row or row[3] <= time.time() or (uid is not None and row[0] != uid):
+        return None
+    return dict(zip(('user_id', 'token', 'request_id', 'expires_at', 'mode', 'chat_id', 'title'), row))
 
 
-def _clear_connect_state(pstate, uid, code):
-    predicate = lambda st: isinstance(st, dict) and st.get('step') == 'fs_connect' and st.get('code') == code
+def _clear_connect_state(pstate, uid, request_id):
+    predicate = lambda st: (isinstance(st, dict) and st.get('step') == 'fs_connect'
+                            and (request_id is None or st.get('request_id') == request_id))
     if hasattr(pstate, 'take'):
         pstate.take(uid, predicate)
     elif predicate(pstate.get(uid)):
         pstate.pop(uid, None)
 
 
-def _gen_code() -> str:
-    alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-    return ''.join(random.choices(alphabet, k=6))
-
-def fs_verify_group(pbot, chat_id: int, uid: int, bot_self_id: int, bot_id: int = None):
-    """Проверки подключения. Возвращает (ok, текст_ошибки_html)."""
+def _connect_target(bot_id, request_id, chat_id, title):
+    c = _conn()
     try:
-        chat = _api(pbot.get_chat, chat_id)
+        c.execute('UPDATE fs_connect_requests SET chat_id=?, title=? '
+                  'WHERE bot_id=? AND request_id=?', (str(chat_id), title, bot_id, request_id))
+        c.commit()
+    finally:
+        c.close()
+
+
+def _connect_error(pbot, uid, text, request_id=None):
+    kb = InlineKeyboardMarkup()
+    if request_id is not None:
+        kb.add(_fbtn('Проверить снова', icon='🔄', callback_data=f'fs_connect_retry_{request_id}'))
+    else:
+        kb.add(_fbtn('Подключить группу', icon='🔗', callback_data='fs_connect'))
+    kb.add(_fbtn('Отмена', icon='❌', callback_data='fs_connect_cancel'))
+    pbot.send_message(uid, f'{TE_CROSS} {text}', parse_mode='HTML', reply_markup=kb)
+
+
+def _connect_rights():
+    return ChatAdministratorRights(is_anonymous=False, can_manage_chat=True,
+        can_delete_messages=True, can_manage_video_chats=False, can_restrict_members=False,
+        can_promote_members=False, can_change_info=False, can_invite_users=False,
+        can_pin_messages=True, can_manage_topics=True)
+
+
+def _connect_reply_kb(request_id, select=True):
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    if select:
+        request = KeyboardButtonRequestChat(request_id=request_id, chat_is_channel=False,
+            chat_is_forum=True, user_administrator_rights=_connect_rights(),
+            bot_administrator_rights=_connect_rights(), request_title=True)
+        kb.add(KeyboardButton('Выбрать группу', request_chat=request,
+                             icon_custom_emoji_id=_ICON['💬'], style='primary'))
+    kb.add(KeyboardButton('Отмена', icon_custom_emoji_id=_ICON['❌']))
+    return kb
+
+
+def _parse_group_id(text):
+    text = text.strip()
+    if re.fullmatch(r'-?100[0-9]+', text):
+        return -abs(int(text))
+    if re.fullmatch(r'@[A-Za-z][A-Za-z0-9_]{3,31}', text):
+        return text
+    return None
+
+
+def fs_verify_group(pbot, chat_id: int, uid: int, bot_self_id: int, bot_id: int = None,
+                    chat=None):
+    """Единая проверка прав и группы для всех способов подключения."""
+    try:
+        chat = chat if chat is not None else _api(pbot.get_chat, chat_id)
     except Exception:
-        return False, (f'{TE_CROSS} Не удалось получить информацию о чате. '
-                       'Убедись, что бот добавлен в группу.')
-    if getattr(chat, 'type', '') != 'supergroup':
-        return False, CONNECT_TOPICS
-    if not getattr(chat, 'is_forum', False):
-        return False, CONNECT_TOPICS
+        return False, 'Не удалось найти группу — проверь ID и добавь бота в группу'
+    if getattr(chat, 'type', '') != 'supergroup' or not getattr(chat, 'is_forum', False):
+        return False, 'В группе не включены темы — включи их в настройках группы'
     try:
         me = _api(pbot.get_chat_member, chat_id, bot_self_id)
     except Exception:
-        return False, CONNECT_RIGHTS
+        return False, 'Бот не администратор в группе — добавь бота и назначь администратором'
     if getattr(me, 'status', '') != 'administrator':
-        return False, CONNECT_RIGHTS
-    if not (getattr(me, 'can_manage_topics', False) and getattr(me, 'can_pin_messages', False)):
-        return False, CONNECT_RIGHTS
+        return False, 'Бот не администратор в группе — назначь бота администратором'
+    missing = [label for key, label in CONNECT_RIGHT_NAMES if not getattr(me, key, False)]
+    if missing:
+        return False, 'Боту не хватает прав: ' + ', '.join(missing) + ' — выдай их в настройках администраторов'
     try:
         member = _api(pbot.get_chat_member, chat_id, uid)
     except Exception:
-        return False, f'{TE_CROSS} Не удалось проверить твои права в группе.'
+        return False, 'Не удалось проверить твои права в группе — убедись, что ты администратор, и повтори проверку'
     if getattr(member, 'status', '') not in ('creator', 'administrator'):
-        return False, (f'{TE_CROSS} Подключать группу может только её '
-                       '<b>владелец или администратор</b>.')
+        return False, 'Ты не администратор этой группы — попроси владельца назначить тебя администратором'
     if bot_id is not None:
         other = fs_get_group_by_chat(chat_id)
         if other and other[0] != bot_id:
-            return False, (f'{TE_CROSS} Эта группа уже подключена к другому боту '
-                           f'(Bot #{other[0]}).')
+            return False, 'Группа уже подключена к другому боту — сначала отключи её в том боте'
     return True, ''
 
+
 @_group_guard
-def _finish_connect(pbot, bot_id: int, uid: int, chat_id: int, title: str, pstate,
-                    reply_chat_id=None, expected_code=None):
-    """Проверка + привязка группы + создание темы статистики."""
+def _finish_connect(pbot, bot_id: int, uid: int, chat_id, title: str, pstate,
+                    expected_request=None):
+    """Проверка, привязка, обе служебные темы и уведомления в группе и личке."""
     if not _can_manage_group(bot_id, uid):
         return
-    pending = fs_get_connect_code(bot_id)
-    if expected_code is not None and (pending != expected_code or pending[2] <= time.time()):
-        return  # пересылка уже проверялась для другой/истёкшей заявки
-    destination = reply_chat_id if reply_chat_id is not None else uid
-    try:
-        bot_self_id = pbot.get_me().id
-    except Exception:
-        bot_self_id = 0
-    ok, err = fs_verify_group(pbot, chat_id, uid, bot_self_id, bot_id=bot_id)
-    if not ok:
-        try:
-            pbot.send_message(destination, err, parse_mode='HTML')
-        except Exception:
-            pass
+    pending = fs_get_connect_request(bot_id, uid)
+    if expected_request is not None and (not pending or pending['request_id'] != expected_request):
         return
+    request_id = pending['request_id'] if pending else None
+    if request_id is not None:
+        _connect_target(bot_id, request_id, chat_id, title)
+    try:
+        chat = _api(pbot.get_chat, chat_id)
+    except Exception:
+        _connect_error(pbot, uid, 'Не удалось найти группу — проверь ID и добавь бота в группу', request_id)
+        return
+    chat_id = chat.id
+    title = getattr(chat, 'title', None) or title or 'Группа'
+    if request_id is not None:
+        _connect_target(bot_id, request_id, chat_id, title)
+    ok, err = fs_verify_group(pbot, chat_id, uid, pbot.get_me().id, bot_id=bot_id, chat=chat)
+    if not ok:
+        _connect_error(pbot, uid, err, request_id)
+        return
+    # Запросы Telegram могут занять время: истёкшая заявка не должна привязывать группу
+    if expected_request is not None:
+        current = fs_get_connect_request(bot_id, uid)
+        if not current or current['request_id'] != expected_request:
+            _connect_error(pbot, uid, CONNECT_EXPIRED)
+            return
     old = fs_get_group(bot_id)
-    # Подготовить тему до изменения привязки: сбой не уничтожает рабочую группу
     try:
         stats = old[3] if old and old[1] == chat_id else None
         if not stats:
             stats = _api(pbot.create_forum_topic, chat_id, '📊 Статистика').message_thread_id
-    except Exception as exc:
-        log.warning('stats topic create bot#%s: %s', bot_id, exc)
-        pbot.send_message(destination, f'{TE_CROSS} Не удалось подключить группу, попробуй ещё раз', parse_mode='HTML')
+    except Exception:
+        _connect_error(pbot, uid, 'Не удалось создать тему «Статистика» — проверь права бота и повтори проверку', request_id)
         return
+    if expected_request is not None:
+        current = fs_get_connect_request(bot_id, uid)
+        if not current or current['request_id'] != expected_request:
+            _connect_error(pbot, uid, CONNECT_EXPIRED)
+            return
     try:
         fs_bind_group(bot_id, chat_id, title)
     except sqlite3.IntegrityError:
-        try:
-            pbot.send_message(destination, f'{TE_CROSS} Эта группа уже подключена к другому боту.',
-                              parse_mode='HTML')
-        except Exception:
-            pass
+        _connect_error(pbot, uid, 'Группа уже подключена к другому боту — сначала отключи её в том боте', request_id)
         return
     fs_set_stats_thread(bot_id, stats)
     fs_refresh_management(pbot, bot_id)
     if pending:
         c = _conn()
         try:
-            c.execute('DELETE FROM fs_connect_codes WHERE bot_id=?', (bot_id,))
+            c.execute('DELETE FROM fs_connect_requests WHERE bot_id=? AND request_id=?', (bot_id, request_id))
             c.commit()
         finally:
             c.close()
-        _clear_connect_state(pstate, pending[0], pending[1])
+        _clear_connect_state(pstate, uid, request_id)
     try:
-        pbot.send_message(chat_id, f'{TE_CHECK} <b>Группа техподдержки подключена!</b>', parse_mode='HTML')
+        pbot.send_message(chat_id, f'{TE_CHECK} <b>Группа техподдержки подключена</b>', parse_mode='HTML')
     except Exception:
         pass
     try:
-        pbot.send_message(
-            uid,
-            f'{TE_CHECK} <b>Группа техподдержки подключена!</b>\n\n'
-            f'{TE_CLIP} {html.escape(title or "Группа")} (<code>{chat_id}</code>)\n\n'
-            'Теперь обращения пользователей создают отдельные темы.\n'
+        pbot.send_message(uid,
+            f'{TE_CHECK} <b>Группа техподдержки подключена</b>\n\n'
+            f'{TE_CLIP} {html.escape(title)} (<code>{chat_id}</code>)\n\n'
+            'Теперь обращения пользователей создают отдельные темы\n'
             'Чтобы ответить — просто напиши в теме пользователя '
-            '(или через «Ответить» на его сообщение).\n'
-            f'Служебная тема «{TE_STATS} Статистика» будет получать еженедельные отчёты.',
-            parse_mode='HTML')
+            '(или через «Ответить» на его сообщение)\n'
+            f'Служебная тема «{TE_STATS} Статистика» будет получать еженедельные отчёты',
+            parse_mode='HTML', reply_markup=ReplyKeyboardRemove())
     except Exception:
         pass
-    log.info(f'Bot #{bot_id}: support group {chat_id} connected by {uid}')
+    log.info('Bot #%s: support group %s connected by %s', bot_id, chat_id, uid)
+
 
 @_group_guard
 def connect_start(pbot, bot_id: int, cb, pstate):
     uid = cb.from_user.id
-    code = _gen_code()
-    previous = fs_get_connect_code(bot_id)
-    while previous and code == previous[1]:
-        code = _gen_code()
+    previous = fs_get_connect_request(bot_id)
+    request_id = secrets.randbelow(2 ** 31 - 1) + 1
+    token = secrets.token_urlsafe(24)
     c = _conn()
     try:
-        c.execute('INSERT OR REPLACE INTO fs_connect_codes (bot_id,user_id,code,expires_at) '
-                  'VALUES (?,?,?,?)', (bot_id, uid, code, time.time() + CONNECT_TTL))
+        c.execute('INSERT OR REPLACE INTO fs_connect_requests '
+                  '(bot_id,user_id,token,request_id,expires_at) VALUES (?,?,?,?,?)',
+                  (bot_id, uid, token, request_id, time.time() + CONNECT_TTL))
         c.commit()
     finally:
         c.close()
     if previous:
-        _clear_connect_state(pstate, previous[0], previous[1])
-    pstate[uid] = {'step': 'fs_connect', 'code': code}
+        _clear_connect_state(pstate, previous['user_id'], previous['request_id'])
+    pstate[uid] = {'step': 'fs_connect', 'request_id': request_id}
     kb = InlineKeyboardMarkup()
+    username = pbot.get_me().username
+    kb.add(_fbtn('Добавить в группу', icon='🔗',
+        url=f'https://t.me/{username}?startgroup={token}&admin=manage_topics+pin_messages+delete_messages'))
+    kb.add(_fbtn('Ввести ID группы', icon='🪪', callback_data='fs_connect_id'))
     kb.add(_fbtn('Отмена', icon='❌', callback_data='fs_connect_cancel'))
-    try:
-        _edit(pbot, 
-            f'<b>{TE_LINK}  Подключение группы техподдержки</b>\n\n'
-            '1️⃣ Добавь бота в свою группу с темами и назначь администратором с правами:\n'
-            '   • Управление темами\n'
-            '   • Закрепление сообщений\n'
-            '   • Удаление сообщений\n\n'
-            '2️⃣ Подтверди, что группа твоя, одним из способов:\n'
-            '   • Перешли в этот чат любое сообщение из группы\n'
-            '   • Или отправь в группу эту команду (со своего аккаунта):\n'
-            f'   <code>/connect {code}</code>\n\n'
-            'Код действует 15 минут. Новый код заменяет старый\n\n'
-            f'{TE_EXCLAM} Группа должна быть супергруппой с включёнными темами.\n'
-            'Один бот = одна группа. Подключённая группа включит форум-режим.',
-            cb.message.chat.id, cb.message.message_id, parse_mode='HTML',
-            reply_markup=kb)
-    except Exception as e:
-        log.warning(f'connect_start edit: {e}')
+    _edit(pbot, f'<b>{TE_LINK} Подключение группы техподдержки</b>\n\n' + CONNECT_INTRO,
+          cb.message.chat.id, cb.message.message_id, parse_mode='HTML', reply_markup=kb)
+    pbot.send_message(uid, f'{TE_CHAT} Нажми «Выбрать группу» на клавиатуре внизу',
+                      parse_mode='HTML', reply_markup=_connect_reply_kb(request_id))
+
 
 @_group_guard
-def connect_cancel(pbot, bot_id: int, cb, pstate):
+def _cancel_connect(pbot, bot_id, uid, pstate):
+    # Не удаляем состояние другого диалога даже при просроченной заявке
     c = _conn()
     try:
-        c.execute('DELETE FROM fs_connect_codes WHERE bot_id=? AND user_id=?',
-                  (bot_id, cb.from_user.id))
+        row = c.execute('SELECT request_id FROM fs_connect_requests WHERE bot_id=? AND user_id=?',
+                        (bot_id, uid)).fetchone()
+        c.execute('DELETE FROM fs_connect_requests WHERE bot_id=? AND user_id=?', (bot_id, uid))
         c.commit()
     finally:
         c.close()
-    pstate.pop(cb.from_user.id, None)
-    try:
-        pbot.answer_callback_query(cb.id)
-    except Exception:
-        pass
-    try:
-        menu_show(pbot, bot_id, cb)
-    except Exception as e:
-        log.warning(f'connect_cancel menu bot#{bot_id}: {e}')
+    _clear_connect_state(pstate, uid, row[0] if row else None)
+    pbot.send_message(uid, f'{TE_CROSS} Подключение отменено', parse_mode='HTML',
+                      reply_markup=ReplyKeyboardRemove())
+
+
+@_group_guard
+def connect_cancel(pbot, bot_id: int, cb, pstate):
+    _cancel_connect(pbot, bot_id, cb.from_user.id, pstate)
+    pbot.answer_callback_query(cb.id)
+    menu_show(pbot, bot_id, cb)
+
 
 def disconnect_confirm(pbot, bot_id: int, cb):
     kb = InlineKeyboardMarkup()
@@ -2324,7 +2381,7 @@ def register_forum_support(pbot, bot_id: int, pstate, is_admin, confirm_kb=_conf
         except Exception as e:
             log.error(f'fs reaction bot#{bot_id}: {e}', exc_info=True)
 
-    # ── сообщения из групп (ответы админов, код подключения) ──
+    # ── сообщения из групп (ответы админов, автоподключение) ──
     @pbot.message_handler(func=lambda m: m.chat.type in ('group', 'supergroup'),
                           content_types=GROUP_MSG_TYPES)
     def _fs_group_msg(m):
@@ -2333,41 +2390,73 @@ def register_forum_support(pbot, bot_id: int, pstate, is_admin, confirm_kb=_conf
         except Exception as e:
             log.error(f'fs group msg bot#{bot_id}: {e}', exc_info=True)
 
-    # ── личные сообщения в процессе подключения группы ──
-    def _private_connect_pending(m):
-        if m.chat.type != 'private' or not m.from_user:
-            return None
-        pending = fs_get_connect_code(bot_id)
-        if (pending and pending[0] == m.from_user.id and pending[2] > time.time()
-                and _can_manage_group(bot_id, m.from_user.id)):
-            return pending
-        return None
+    # ── события подключения и ввод ID имеют приоритет над личными состояниями ──
+    def _connect_guard(fn):
+        @wraps(fn)
+        def call(event):
+            with _mgmt_lock(bot_id):
+                return fn(event)
+        return call
 
-    @pbot.message_handler(
-        func=lambda m: bool(_private_connect_pending(m)),
-        content_types=USER_MSG_TYPES)
+    @pbot.my_chat_member_handler()
+    @_connect_guard
+    def _fs_member(update):
+        if (update.chat.type not in ('group', 'supergroup') or not update.from_user
+                or update.new_chat_member.user.id != bot_self_id
+                or update.new_chat_member.status not in ('member', 'administrator')
+                or not _can_manage_group(bot_id, update.from_user.id)):
+            return
+        pending = fs_get_connect_request(bot_id, update.from_user.id)
+        if not pending:
+            return
+        _finish_connect(pbot, bot_id, update.from_user.id, update.chat.id,
+                        update.chat.title or '', pstate, expected_request=pending['request_id'])
+
+    def _private_connect_input(m):
+        if m.chat.type != 'private' or not m.from_user or not _can_manage_group(bot_id, m.from_user.id):
+            return False
+        if m.content_type == 'chat_shared':
+            return True
+        pending = fs_get_connect_request(bot_id, m.from_user.id)
+        st = pstate.get(m.from_user.id)
+        own_state = isinstance(st, dict) and st.get('step') == 'fs_connect'
+        if (m.text or '').strip() == 'Отмена':
+            return bool(pending or own_state)
+        return bool(((pending and pending['mode'] == 'id') or own_state)
+                    and not (m.text or '').startswith('/')
+                    and (st is None or own_state))
+
+    @pbot.message_handler(func=_private_connect_input, content_types=['text', 'chat_shared'])
+    @_connect_guard
     def _fs_connect_private(m):
-        try:
-            pending = _private_connect_pending(m)
-            if not pending:
+        uid = m.from_user.id
+        if (m.text or '').strip() == 'Отмена':
+            _cancel_connect(pbot, bot_id, uid, pstate)
+            pbot.send_message(uid, menu_text(bot_id), parse_mode='HTML', reply_markup=menu_kb(bot_id))
+            return
+        pending = fs_get_connect_request(bot_id, uid)
+        if not pending:
+            _connect_error(pbot, uid, CONNECT_EXPIRED)
+            return
+        if m.content_type == 'chat_shared':
+            shared = m.chat_shared
+            if shared.request_id != pending['request_id']:
                 return
-            fwd_chat = m.forward_from_chat
-            if fwd_chat is None:
-                fo = getattr(m, 'forward_origin', None)
-                if fo is not None:
-                    fwd_chat = getattr(fo, 'chat', None) or getattr(fo, 'sender_chat', None)
-            if fwd_chat is not None and getattr(fwd_chat, 'type', '') in ('group', 'supergroup'):
-                _finish_connect(pbot, bot_id, m.from_user.id, fwd_chat.id,
-                                fwd_chat.title or '', pstate, expected_code=pending)
-            elif m.text and m.text.strip().upper().endswith(pending[1]):
-                try:
-                    pbot.send_message(m.chat.id,
-                                      f'{TE_CROSS} Код нужно отправить <b>в саму группу</b>, '
-                                      'а не сюда.', parse_mode='HTML')
-                except Exception:
-                    pass
-        except Exception as e:
-            log.error(f'fs connect private bot#{bot_id}: {e}', exc_info=True)
+            pbot.send_message(uid, f'{TE_CLOCK} Проверяю группу', parse_mode='HTML',
+                              reply_markup=ReplyKeyboardRemove())
+            _finish_connect(pbot, bot_id, uid, shared.chat_id, shared.title or '', pstate,
+                            expected_request=pending['request_id'])
+            return
+        if pending['mode'] != 'id':
+            return
+        chat_id = _parse_group_id(m.text or '')
+        if chat_id is None:
+            pbot.send_message(uid, f'{TE_CROSS} {CONNECT_BAD_ID}', parse_mode='HTML',
+                              reply_markup=_connect_reply_kb(pending['request_id'], select=False))
+            return
+        _finish_connect(pbot, bot_id, uid, chat_id, '', pstate, expected_request=pending['request_id'])
+
+    pbot.message_handlers.insert(1, pbot.message_handlers.pop())
 
     # ── случайные сообщения пользователя (без кнопки p_send) ──
     # доставляются СРАЗУ (direct_route); очередь — только анти-потеря при сбое
@@ -2412,6 +2501,45 @@ def register_forum_support(pbot, bot_id: int, pstate, is_admin, confirm_kb=_conf
                                        'главный админ бота', show_alert=True)
             return
         connect_start(pbot, bot_id, cb, pstate)
+
+    @pbot.callback_query_handler(func=lambda c: c.data == 'fs_connect_id')
+    @_connect_guard
+    def _fs_connect_id_cb(cb):
+        uid = cb.from_user.id
+        if not _can_manage_group(bot_id, uid):
+            return
+        pending = fs_get_connect_request(bot_id, uid)
+        if not pending:
+            _connect_error(pbot, uid, CONNECT_EXPIRED)
+            return
+        c = _conn()
+        try:
+            c.execute("UPDATE fs_connect_requests SET mode='id' WHERE bot_id=? AND request_id=?",
+                      (bot_id, pending['request_id']))
+            c.commit()
+        finally:
+            c.close()
+        pstate[uid] = {'step': 'fs_connect', 'request_id': pending['request_id']}
+        pbot.answer_callback_query(cb.id)
+        pbot.send_message(uid, f'{TE_ID} {CONNECT_ID_PROMPT}', parse_mode='HTML',
+                          reply_markup=_connect_reply_kb(pending['request_id'], select=False))
+
+    @pbot.callback_query_handler(func=lambda c: (c.data or '').startswith('fs_connect_retry_'))
+    @_connect_guard
+    def _fs_connect_retry_cb(cb):
+        uid = cb.from_user.id
+        if not _can_manage_group(bot_id, uid):
+            return
+        pending = fs_get_connect_request(bot_id, uid)
+        if not pending or cb.data != f"fs_connect_retry_{pending['request_id']}":
+            _connect_error(pbot, uid, CONNECT_EXPIRED)
+            return
+        pbot.answer_callback_query(cb.id)
+        if pending['chat_id']:
+            chat_id = _parse_group_id(pending['chat_id'])
+            if chat_id is not None:
+                _finish_connect(pbot, bot_id, uid, chat_id, pending['title'], pstate,
+                                expected_request=pending['request_id'])
 
     @pbot.callback_query_handler(func=lambda c: c.data == 'fs_connect_cancel')
     def _fs_connect_cancel_cb(cb):

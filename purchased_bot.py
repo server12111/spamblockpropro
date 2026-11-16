@@ -1703,7 +1703,7 @@ def launch_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None) -> bool
             while active():
                 try:
                     pbot.infinity_polling(timeout=60, long_polling_timeout=5,
-                                  allowed_updates=['message', 'callback_query', 'message_reaction'])
+                                  allowed_updates=['message', 'callback_query', 'message_reaction', 'my_chat_member'])
                 except Exception as e:
                     if not active():
                         break

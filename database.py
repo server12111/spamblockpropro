@@ -329,11 +329,15 @@ def init_db():
             used       INTEGER DEFAULT 0
         );
         -- ── Forum Topics: группы техподдержки ──────────────
-        CREATE TABLE IF NOT EXISTS fs_connect_codes (
+        CREATE TABLE IF NOT EXISTS fs_connect_requests (
             bot_id     INTEGER PRIMARY KEY,
             user_id    INTEGER NOT NULL,
-            code       TEXT NOT NULL,
-            expires_at REAL NOT NULL
+            token      TEXT NOT NULL,
+            request_id INTEGER NOT NULL,
+            expires_at REAL NOT NULL,
+            mode       TEXT NOT NULL DEFAULT 'select',
+            chat_id    TEXT,
+            title      TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS fs_groups (
             bot_id       INTEGER PRIMARY KEY,

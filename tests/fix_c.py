@@ -58,12 +58,13 @@ class Bot:
                 return self.fail[name](*args, **kw)
             SEQ += 1
             if name == 'get_me':
-                return t.User(999, True, 'Бот')
+                return t.User(999, True, 'Бот', username='support_bot')
             if name == 'get_chat':
                 return types.SimpleNamespace(id=args[0], first_name='Юзер', last_name='', username='',
                                              type='supergroup', is_forum=True)
             if name == 'get_chat_member':
-                return types.SimpleNamespace(status='administrator', can_manage_topics=True, can_pin_messages=True)
+                return types.SimpleNamespace(status='administrator', can_manage_topics=True,
+                                             can_pin_messages=True, can_delete_messages=True)
             if name == 'create_forum_topic':
                 return types.SimpleNamespace(message_thread_id=SEQ)
             if name in ('copy_messages', 'forward_messages'):
@@ -210,8 +211,8 @@ def connect():
     for gid in (-90001, -90002):
         state = {}
         fs.connect_start(bot, bid, cb(owner), state)
-        code = state[owner]['code']
-        fs.fs_handle_group_message(bot, bid, msg(owner, text=code, chat=gid), 999, state)
+        pending = fs.fs_get_connect_request(bid, owner)
+        fs.fs_handle_group_message(bot, bid, msg(owner, text='/start ' + pending['token'], chat=gid), 999, state)
         assert fs.fs_get_group(bid)[1] == gid and owner not in state
 
 
@@ -391,7 +392,7 @@ with patch.object(telebot.TeleBot, 'get_me', return_value=t.User(999, True, 'Б�
     check('Сетевой сбой альбома сохраняет очередь', album_failure)
     check('Перезапуск освобождает захваченную очередь', restart)
     check('Повторная регистрация освобождает прерванный захват', reregister)
-    check('Код подключает первую и новую группу', connect)
+    check('Ссылка Telegram подключает первую и новую группу', connect)
     check('Удалённая тема восстанавливается', deleted_topic)
     check('Долгое создание не порождает две темы', slow_topic)
     check('Сбой прямой доставки не дублирует очередь', duplicate_direct)

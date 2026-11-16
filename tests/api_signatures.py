@@ -3,9 +3,12 @@
 Ловит рассинхрон код↔библиотека, который не виден статическим анализом.
 Запуск: py tests/api_signatures.py"""
 import inspect
+import json
 import sys
 import telebot
 from telebot.types import ReplyParameters, MessageReactionUpdated, ReactionTypeEmoji, ReactionTypeCustomEmoji
+from telebot.types import (KeyboardButtonRequestChat, ChatAdministratorRights,
+                           KeyboardButton, ReplyKeyboardMarkup, ChatShared, Message)
 
 PASS, FAIL = [], []
 def chk(name, cond, extra=''):
@@ -48,6 +51,29 @@ chk('ReactionTypeEmoji.emoji', hasattr(ReactionTypeEmoji('👍'), 'emoji'))
 chk('ReactionTypeCustomEmoji.custom_emoji_id',
     hasattr(ReactionTypeCustomEmoji('123'), 'custom_emoji_id'))
 chk('message_reaction_handler существует', hasattr(telebot.TeleBot, 'message_reaction_handler'))
+chk('my_chat_member_handler существует', hasattr(telebot.TeleBot, 'my_chat_member_handler'))
+
+rights = ChatAdministratorRights(is_anonymous=False, can_manage_chat=True,
+    can_delete_messages=True, can_manage_video_chats=False, can_restrict_members=False,
+    can_promote_members=False, can_change_info=False, can_invite_users=False,
+    can_pin_messages=True, can_manage_topics=True)
+request = KeyboardButtonRequestChat(request_id=1, chat_is_channel=False, chat_is_forum=True,
+    user_administrator_rights=rights, bot_administrator_rights=rights, request_title=True)
+kb = ReplyKeyboardMarkup().add(KeyboardButton('Выбрать группу', request_chat=request,
+    icon_custom_emoji_id='5443038326535759644', style='primary'))
+button = json.loads(kb.to_json())['keyboard'][0][0]
+shared = button['request_chat']
+for key in ('chat_is_forum', 'request_title', 'user_administrator_rights', 'bot_administrator_rights'):
+    chk('KeyboardButtonRequestChat.' + key + ' сериализуется', bool(shared.get(key)))
+for key in ('can_manage_topics', 'can_pin_messages', 'can_delete_messages'):
+    chk('ChatAdministratorRights.' + key + ' сериализуется', shared['bot_administrator_rights'].get(key) is True)
+chk('KeyboardButton поддерживает премиум-иконку и стиль',
+    button.get('icon_custom_emoji_id') == '5443038326535759644' and button.get('style') == 'primary')
+msg = Message.de_json({'message_id': 1, 'date': 0, 'chat': {'id': 1, 'type': 'private'},
+    'chat_shared': {'request_id': 1, 'chat_id': -1001234567890, 'title': 'Поддержка'}})
+chk('Message.chat_shared разбирается с title и request_id',
+    msg.content_type == 'chat_shared' and isinstance(msg.chat_shared, ChatShared)
+    and msg.chat_shared.request_id == 1 and msg.chat_shared.title == 'Поддержка')
 
 print(f'ИТОГО: {len(PASS)} OK, {len(FAIL)} FAIL')
 sys.exit(1 if FAIL else 0)

@@ -394,10 +394,8 @@ pstate = db.DBState(1)
 cb = make_cb('fs_connect', from_id=UID_OWNER)
 fs.connect_start(fb, 1, cb, pstate)
 st = pstate.get(UID_OWNER)
-check('состояние fs_connect с кодом', isinstance(st, dict) and st.get('step') == 'fs_connect'
-      and len(st.get('code', '')) == 6)
-# подключение через код из группы
-gm = make_group_msg(GID, None, UID_OWNER, 9001, text=st['code'])
+check('заявка выбора группы сохранена', isinstance(st, dict) and st.get('step') == 'fs_connect'
+      and st.get('request_id') == fs.fs_get_connect_request(1, UID_OWNER)['request_id'])
 fs._finish_connect(fb, 1, UID_OWNER, GID, 'Support', pstate)
 g = fs.fs_get_group(1)
 check('группа привязана', g and g[1] == GID)

@@ -143,7 +143,7 @@ def run():
     dispatch_cb(pb, ucb('fs_connect', 7145919720, 204))
     check('инструкция подключения', any('Подключение группы' in str(c[1]) for c in API[-2:]))
     st = __import__('database').DBState(bot_id).get(7145919720)
-    check('код подключения', isinstance(st, dict) and st.get('code'))
+    check('заявка подключения', isinstance(st, dict) and st.get('request_id'))
 
     dispatch_cb(pb, ucb('p_stats', 7145919720, 206))
     check('статистика дочернего', any('Статистика' in str(c[1]) for c in API[-3:]))

@@ -45,10 +45,10 @@ def patch(name):
         if name == 'get_me':
             return t.User(999, True, 'Бот', username='test_bot')
         if name == 'get_chat':
-            return types.SimpleNamespace(type='supergroup', is_forum=True)
+            return types.SimpleNamespace(id=args[0], type='supergroup', is_forum=True)
         if name == 'get_chat_member':
             return types.SimpleNamespace(status='administrator', can_manage_topics=True,
-                                         can_pin_messages=True)
+                                         can_pin_messages=True, can_delete_messages=True)
         if name == 'create_forum_topic':
             time.sleep(0.03)  # второй поток успевает увидеть незавершённую заявку
             MID += 1
