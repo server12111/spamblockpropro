@@ -127,18 +127,19 @@ check('без гранта = None (фолбэк 30)', db.db_take_grant_days(504)
 
 print('── send_to_admins возвращает результат доставки ──')
 # здесь нужен запущенный pbot — проверяем через мок из button_fuzz
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import telebot
 import telebot.types as t
 sends = []
 telebot.TeleBot.get_me = lambda self, *a, **kw: t.User(id=1, is_bot=True, first_name='B', username='x')
 telebot.TeleBot.send_message = lambda self, cid, text=None, **kw: (
-    sends.append((cid, text or '')), t.MessageID(message_id=1))
+    sends.append((cid, text or '')) or t.MessageID(message_id=1))
 telebot.TeleBot.get_chat = lambda self, cid, *a, **kw: t.Chat(id=cid, type='private', first_name='X')
 telebot.TeleBot.get_chat_member = lambda self, cid, uid, *a, **kw: t.ChatMemberMember(
     user=t.User(id=uid, is_bot=False, first_name='M'), status='creator')
 telebot.TeleBot.edit_message_text = lambda self, *a, **kw: True
 telebot.TeleBot.answer_callback_query = lambda self, *a, **kw: True
+from delivery_queue import pump_delivery
 import purchased_bot as PB
 pb = PB.make_purchased_bot(77, '123:FAKE_audit_123456789012345', 9, None)
 
@@ -158,7 +159,9 @@ def dmsg(m):
                 cmd = m.text.split()[0][1:].split('@')[0]
                 if cmd in flt['commands']: return h['function'](m)
             continue
-        return h['function'](m)
+        result = h['function'](m)
+        pump_delivery(pb)
+        return result
 def dcb(cb):
     for h in pb.callback_query_handlers:
         flt = h['filters']

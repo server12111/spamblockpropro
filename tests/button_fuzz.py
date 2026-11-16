@@ -67,6 +67,7 @@ payments.cb_check_invoice = lambda iid: None
 payments.ton_check_transfer = lambda *a, **kw: False
 payments.get_ton_amount = lambda: 0.5
 import handlers as H
+H.launch_bot = lambda *a, **kw: True
 H.cb_create_invoice = payments.cb_create_invoice
 H.cb_check_invoice = payments.cb_check_invoice
 H.ton_check_transfer = payments.ton_check_transfer

@@ -131,6 +131,7 @@ def fs_unbind_group(bot_id: int):
     c.execute('DELETE FROM fs_groups WHERE bot_id=?', (bot_id,))
     c.execute('DELETE FROM fs_topics WHERE bot_id=?', (bot_id,))
     c.execute('DELETE FROM fs_msgs WHERE bot_id=?', (bot_id,))
+    c.execute('DELETE FROM delivery_sources WHERE bot_id=?', (bot_id,))
     c.commit(); c.close()
     return row[0] if row else None
 
@@ -495,6 +496,9 @@ def fs_append_pending(bot_id: int, user_id: int, item: dict):
                 items = json_loads(row[0])
             except Exception:
                 items = []
+            if any(it['mid'] == item['mid'] for it in items):
+                c.commit()
+                return len(items), row[1]
             if len(items) >= PENDING_MAX:
                 c.execute('ROLLBACK')
                 c.close()
@@ -664,6 +668,10 @@ def fs_is_admin(bot_id: int, user_id: int) -> bool:
 # ══════════════════════════════════════════════════════════════
 def _api(fn, *args, **kwargs):
     """Вызов Telegram API с ограниченным числом повторов при 429 Too Many Requests."""
+    from delivery_queue import current_sender
+    sender = current_sender()
+    if sender is not None:
+        return sender.api(fn, *args, **kwargs)
     attempts = 0
     while True:
         try:
@@ -1014,6 +1022,10 @@ def _recover_topic(pbot, bot_id: int, gid: int, u, thread: int):
             return thread
         except Exception:
             pass
+        from delivery_queue import current_sender
+        sender = current_sender()
+        if sender is not None:
+            sender.forget_topic(gid, fs_topic_title(u))
         fs_delete_topic_row(bot_id, u.id)
         return _get_or_create_topic(pbot, bot_id, gid, u)
 
@@ -1174,61 +1186,14 @@ def _flush_album(pbot, bot_id: int, key):
 def route_user_message(pbot, bot_id: int, m, confirm_kb=None) -> bool:
     """Доставка обращения пользователя.
 
-    True  — группа подключена, сообщение ушло в тему (или пользователю показана
-            ошибка; повторная отправка админам не выполняется);
+    True  — группа подключена, сообщение сохранено для фоновой доставки;
     False — группа не подключена: вызывающий код использует стандартный режим.
     """
     group = fs_get_group(bot_id)
     if not group:
         return False
-    uid = m.from_user.id
-    fs_touch_user(pbot, bot_id, m.from_user)
-    if m.media_group_id:
-        # альбом: темы создаются по первому элементу, доставка группой
-        try:
-            thread = fs_ensure_topic_info(pbot, bot_id, group, m.from_user)
-        except Exception as e:
-            log.warning(f'route album topic bot#{bot_id} uid={uid}: {e}')
-            _notify_owner_error(pbot, bot_id,
-                                'Не удалось создать тему в группе техподдержки', e)
-            # сообщение не теряем — в очередь подтверждения
-            try:
-                queue_random_message(pbot, bot_id, m)
-            except Exception as e2:
-                log.warning(f'route album fail -> queue failed: {e2}')
-            return True
-        _buffer_album(pbot, bot_id, group[1], thread, m, confirm_kb)
-        return True
-    try:
-        mid, thread = _relay_to_topic(pbot, bot_id, group, m.from_user,
-                                      m.chat.id, m.message_id, src_msg=m)
-        if not mid:
-            raise RuntimeError('не удалось передать сообщение (copy/forward/resend)')
-        fs_map_message(bot_id, group[1], mid, uid, thread, m.message_id, '')
-        fs_bump_ticket(bot_id, uid)
-        db_bump_user_contact(bot_id, uid)
-        db_log_message(bot_id, uid, m.text or f'[{m.content_type}]')
-        if confirm_kb:
-            try:
-                pbot.send_message(m.chat.id, f'<b>{TE_CHECK}  Сообщение отправлено</b>',
-                                  parse_mode='HTML', reply_markup=confirm_kb())
-            except Exception:
-                pass
-        return True
-    except Exception as e:
-        log.warning(f'route user msg bot#{bot_id} uid={uid}: {e}')
-        err_s = str(e).lower()
-        if _is_bot_blocked(e) or _is_chat_not_found(e) or 'not enough rights' in err_s:
-            # группа недоступна боту (удалена/потеряны права) — уведомляем владельца
-            _notify_owner_error(pbot, bot_id,
-                                'Бот не может писать в группу техподдержки', e)
-        # НЕ теряем сообщение: кладём в очередь подтверждения —
-        # когда доставка восстановится, юзер отправит его одной кнопкой
-        try:
-            queue_random_message(pbot, bot_id, m)
-        except Exception as e2:
-            log.warning(f'route fail -> queue failed: {e2}')
-        return True
+    from delivery_queue import get_sender
+    return get_sender(pbot, bot_id).enqueue(m, confirm_kb)
 
 
 def _notify_owner_error(pbot, bot_id: int, text: str, err):
@@ -1295,6 +1260,8 @@ def fs_handle_group_message(pbot, bot_id: int, m, bot_self_id: int, pstate) -> N
                                     (new_chat_id, bot_id, m.chat.id)).rowcount
                 if changed:
                     c.execute('UPDATE fs_msgs SET chat_id=? WHERE bot_id=? AND chat_id=?',
+                              (new_chat_id, bot_id, m.chat.id))
+                    c.execute('UPDATE delivery_sources SET chat_id=? WHERE bot_id=? AND chat_id=?',
                               (new_chat_id, bot_id, m.chat.id))
                 c.commit()
             finally:
@@ -1547,6 +1514,10 @@ def queue_random_message(pbot, bot_id: int, m) -> None:
         return
     item = {'mid': m.message_id, 'type': m.content_type,
             'mg': m.media_group_id or ''}
+    from database import db_delivery_rows
+    if any(r['user_id'] == uid and r['message_id'] == m.message_id
+           and r['status'] == 'fallback' for r in db_delivery_rows(bot_id)):
+        item['delivery_queue'] = True
     lock = _queue_prompt_locks[hash((bot_id, uid)) % len(_queue_prompt_locks)]
     with lock:
         cnt, prompt_id = fs_append_pending(bot_id, uid, item)
@@ -1639,6 +1610,13 @@ def _deliver_pending_payload(pbot, bot_id: int, items: list, uid: int) -> bool:
     У массовых методов Telegram нет исходных ID в результате и возможны пропуски
     Поэтому сохранённую очередь доставляем по одному сообщению
     """
+    from database import db_delivery_resume
+    from delivery_queue import get_sender
+    if db_delivery_resume(bot_id, uid):
+        for it in items:
+            if it.get('delivery_queue'):
+                it['done'] = 1
+        get_sender(pbot, bot_id).wake.set()
     todo = [it for it in items if not it.get('done')]
     group = fs_get_group(bot_id)
     if group and todo:
@@ -1696,6 +1674,8 @@ def confirm_send(pbot, bot_id: int, cb) -> None:
     """Обработка кнопки «Отправить администратору»"""
     uid = cb.from_user.id
     if db_is_blocked(bot_id, uid):
+        from database import db_delivery_resume
+        db_delivery_resume(bot_id, uid, cancel=True)
         fs_delete_pending(bot_id, uid)
         pbot.answer_callback_query(cb.id, '🚫 Вы заблокированы администратором',
                                    show_alert=True)
@@ -1741,6 +1721,8 @@ def confirm_send(pbot, bot_id: int, cb) -> None:
 
 def confirm_cancel(pbot, bot_id: int, cb) -> None:
     uid = cb.from_user.id
+    from database import db_delivery_resume
+    db_delivery_resume(bot_id, uid, cancel=True)
     fs_delete_pending(bot_id, uid)
     pbot.answer_callback_query(cb.id, 'Очередь отменена')
     try:

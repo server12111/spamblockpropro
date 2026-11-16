@@ -266,6 +266,8 @@ def duplicate_direct():
         return msg(mid=888)
     bot.send_message = send
     bot.process_new_messages([msg(mid=42)])
+    from delivery_queue import pump_delivery
+    pump_delivery(bot, bid)
     assert [it['mid'] for it in payload(bid)] == [42]
 
 

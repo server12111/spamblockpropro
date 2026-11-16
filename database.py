@@ -402,6 +402,41 @@ def init_db():
             updated_at    TIMESTAMP,
             PRIMARY KEY (bot_id, user_id)
         );
+        CREATE TABLE IF NOT EXISTS delivery_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            media_group_id TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            ready_at REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            next_at REAL NOT NULL DEFAULT 0,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            progress TEXT NOT NULL DEFAULT '{}',
+            finished_at REAL,
+            UNIQUE(bot_id, chat_id, message_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_delivery_ready
+            ON delivery_queue(bot_id, status, user_id, id);
+        CREATE TABLE IF NOT EXISTS delivery_limits (
+            bot_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            not_before REAL NOT NULL,
+            PRIMARY KEY(bot_id, chat_id)
+        );
+        CREATE TABLE IF NOT EXISTS delivery_sources (
+            bot_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            group_msg_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            src_msg_id INTEGER NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY(bot_id, chat_id, group_msg_id, src_msg_id)
+        );
         -- Еженедельные отчёты (защита от дублей по периоду)
         CREATE TABLE IF NOT EXISTS fs_weekly_reports (
             bot_id       INTEGER NOT NULL,
@@ -458,6 +493,170 @@ def init_db():
                  'WHERE NOT EXISTS (SELECT 1 FROM setup_grants s WHERE s.user_id=p.user_id)')
     conn.commit()
     conn.close()
+
+# ── Устойчивая очередь доставки ─────────────────────────
+def db_delivery_rows(bot_id, active=True):
+    c = _conn()
+    try:
+        cur = c.execute('SELECT * FROM delivery_queue WHERE bot_id=? ' +
+                        ("AND status IN ('accepting','pending','working','fallback') " if active else '') +
+                        'ORDER BY id', (bot_id,))
+        names = [col[0] for col in cur.description]
+        return [dict(zip(names, row)) for row in cur.fetchall()]
+    finally:
+        c.close()
+
+
+def db_delivery_enqueue(bot_id, m, payload, ready_at):
+    c = _conn()
+    try:
+        cur = c.execute('INSERT OR IGNORE INTO delivery_queue '
+                        '(bot_id,user_id,chat_id,message_id,media_group_id,kind,payload,created_at,ready_at,status) '
+                        "VALUES (?,?,?,?,?,?,?,?,?,'accepting')",
+                        (bot_id, m.from_user.id, m.chat.id, m.message_id,
+                         m.media_group_id or '', m.content_type, payload, time.time(), ready_at))
+        c.commit()
+        return cur.lastrowid if cur.rowcount > 0 else None
+    finally:
+        c.close()
+
+
+def db_delivery_update(ids, **values):
+    allowed = {'status', 'next_at', 'attempts', 'progress', 'finished_at', 'ready_at'}
+    if not ids or not values or not values.keys() <= allowed:
+        raise ValueError('invalid delivery update')
+    c = _conn()
+    try:
+        c.execute('UPDATE delivery_queue SET ' + ','.join(k + '=?' for k in values) +
+                  ' WHERE id IN (' + ','.join('?' for _ in ids) + ')',
+                  (*values.values(), *ids))
+        c.commit()
+    finally:
+        c.close()
+
+
+def db_delivery_limit(bot_id, chat_id, until=None):
+    c = _conn()
+    try:
+        if until is not None:
+            c.execute('INSERT INTO delivery_limits VALUES (?,?,?) '
+                      'ON CONFLICT(bot_id,chat_id) DO UPDATE SET '
+                      'not_before=MAX(not_before,excluded.not_before)', (bot_id, chat_id, until))
+            c.commit()
+        row = c.execute('SELECT not_before FROM delivery_limits WHERE bot_id=? AND chat_id=?',
+                        (bot_id, chat_id)).fetchone()
+        return row[0] if row else 0
+    finally:
+        c.close()
+
+
+def db_delivery_finish(rows, mappings):
+    """Соответствия, статистика и отметка доставки — одна транзакция.
+
+    mappings: (chat_id, sent_id, thread_id, [исходные message_id]). Для склейки
+    основной Reply указывает на последний исходный, обратный поиск хранит все.
+    """
+    c = _conn()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        now = time.time()
+        bot_id, uid = rows[0]['bot_id'], rows[0]['user_id']
+        for chat, mid, thread, sources in mappings:
+            c.execute('INSERT OR REPLACE INTO fs_msgs '
+                      '(chat_id,group_msg_id,bot_id,user_id,thread_id,src_msg_id,media_group) '
+                      'VALUES (?,?,?,?,?,?,?)',
+                      (chat, mid, bot_id, uid, thread, sources[-1], rows[0]['media_group_id']))
+            for src in sources:
+                c.execute('INSERT OR IGNORE INTO delivery_sources VALUES (?,?,?,?,?,?)',
+                          (bot_id, chat, mid, uid, src, now))
+        for row in rows:
+            changed = c.execute("UPDATE delivery_queue SET status='delivered',finished_at=? "
+                                "WHERE id=? AND status IN ('pending','working')",
+                                (now, row['id'])).rowcount
+            if not changed:
+                continue
+            stamp = datetime.utcfromtimestamp(row['created_at']).strftime('%Y-%m-%d %H:%M:%S')
+            ticket = c.execute('SELECT id,last_at FROM fs_tickets WHERE bot_id=? AND user_id=? '
+                               'AND closed_at IS NULL ORDER BY id DESC LIMIT 1', (bot_id, uid)).fetchone()
+            if ticket and ticket[1] and (datetime.fromisoformat(stamp) -
+                                        datetime.fromisoformat(ticket[1])).total_seconds() < 21600:
+                c.execute('UPDATE fs_tickets SET msgs=msgs+1,last_at=? WHERE id=?', (stamp, ticket[0]))
+            else:
+                if ticket:
+                    c.execute('UPDATE fs_tickets SET closed_at=last_at WHERE id=?', (ticket[0],))
+                c.execute('INSERT INTO fs_tickets (bot_id,user_id,opened_at,last_at,msgs) '
+                          'VALUES (?,?,?,?,1)', (bot_id, uid, stamp, stamp))
+            c.execute('UPDATE bot_users SET contact_count=contact_count+1,'
+                      'first_contact_at=COALESCE(first_contact_at,?) WHERE bot_id=? AND user_id=?',
+                      (stamp, bot_id, uid))
+            message = json.loads(row['payload'])
+            c.execute('INSERT INTO bot_messages (bot_id,user_id,timestamp,text) VALUES (?,?,?,?)',
+                      (bot_id, uid, stamp, message.get('text') or '[' + row['kind'] + ']'))
+        c.commit()
+    finally:
+        c.close()
+
+
+def db_delivery_cleanup(bot_id):
+    c = _conn()
+    try:
+        cutoff = time.time() - 7 * 86400
+        c.execute('DELETE FROM delivery_queue WHERE bot_id=? AND finished_at<? '
+                  "AND status IN ('delivered','deleted','cancelled')", (bot_id, cutoff))
+        c.execute('DELETE FROM delivery_limits WHERE bot_id=? AND not_before<?', (bot_id, time.time()))
+        c.execute('DELETE FROM delivery_sources WHERE bot_id=? AND NOT EXISTS '
+                  '(SELECT 1 FROM fs_msgs m WHERE m.bot_id=delivery_sources.bot_id '
+                  'AND m.chat_id=delivery_sources.chat_id AND m.group_msg_id=delivery_sources.group_msg_id)',
+                  (bot_id,))
+        c.commit()
+    finally:
+        c.close()
+
+
+def db_delivery_resume(bot_id, user_id, cancel=False):
+    """Окно страховки управляет всеми сохранёнными обращениями пользователя."""
+    c = _conn()
+    try:
+        rows = c.execute("SELECT id,progress FROM delivery_queue WHERE bot_id=? AND user_id=? "
+                         "AND status='fallback' ORDER BY id", (bot_id, user_id)).fetchall()
+        for ident, saved in rows:
+            progress = json.loads(saved)
+            progress.pop('unavailable', None)
+            c.execute('UPDATE delivery_queue SET status=?,next_at=0,progress=?,finished_at=? WHERE id=?',
+                      ('cancelled' if cancel else 'pending', json.dumps(progress),
+                       time.time() if cancel else None, ident))
+        c.commit()
+        return len(rows)
+    finally:
+        c.close()
+
+
+def db_delivery_fallback(rows):
+    """Переход в страховку и её durable указатель сохраняются атомарно."""
+    c = _conn()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        bot_id, uid = rows[0]['bot_id'], rows[0]['user_id']
+        old = c.execute('SELECT payload FROM fs_pending WHERE bot_id=? AND user_id=?', (bot_id, uid)).fetchone()
+        items = json.loads(old[0]) if old else []
+        for row in rows:
+            c.execute("UPDATE delivery_queue SET status='fallback' WHERE id=?", (row['id'],))
+            existing = next((it for it in items if it['mid'] == row['message_id']), None)
+            if existing is not None:
+                existing['delivery_queue'] = True
+            elif len(items) < 20:
+                items.append(dict(mid=row['message_id'], type=row['kind'], mg=row['media_group_id'], delivery_queue=True))
+        stamp = _utc_now_str()
+        if old:
+            c.execute('UPDATE fs_pending SET payload=?,updated_at=? WHERE bot_id=? AND user_id=?',
+                      (json.dumps(items), stamp, bot_id, uid))
+        else:
+            c.execute('INSERT INTO fs_pending (bot_id,user_id,payload,updated_at) VALUES (?,?,?,?)',
+                      (bot_id, uid, json.dumps(items), stamp))
+        c.commit()
+    finally:
+        c.close()
+
 
 # ── Bots ──────────────────────────────────────────────
 def db_add_bot(owner_id, token, admin_id, days: int = 30):
@@ -1111,8 +1310,11 @@ def db_get_topic_copies_by_src(bot_id: int, user_id: int, src_msg_id: int) -> li
     c = _conn()
     rows = c.execute(
         'SELECT chat_id, group_msg_id, thread_id FROM fs_msgs '
-        'WHERE bot_id=? AND user_id=? AND src_msg_id=?',
-        (bot_id, user_id, src_msg_id)
+        'WHERE bot_id=? AND user_id=? AND src_msg_id=? '
+        'UNION SELECT s.chat_id, s.group_msg_id, m.thread_id FROM delivery_sources s '
+        'JOIN fs_msgs m ON m.chat_id=s.chat_id AND m.group_msg_id=s.group_msg_id '
+        'WHERE s.bot_id=? AND s.user_id=? AND s.src_msg_id=?',
+        (bot_id, user_id, src_msg_id, bot_id, user_id, src_msg_id)
     ).fetchall()
     c.close()
     return rows

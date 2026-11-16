@@ -19,6 +19,7 @@ def check(name, cond, extra=''):
     (PASS if cond else FAIL).append(name)
 
 import telebot
+from delivery_queue import pump_delivery
 import telebot.types as t
 
 # ── моки Telegram API (как в button_fuzz) ──
@@ -111,6 +112,7 @@ H.ton_check_transfer = payments.ton_check_transfer
 H.get_ton_amount = payments.get_ton_amount
 
 main_bot = telebot.TeleBot('111:FAKE_fx6')
+H.launch_bot = lambda *a, **kw: True
 H.register(main_bot)
 SUPER = 7145919720
 
@@ -130,7 +132,9 @@ def dmsg(bot, m):
                 cmd = m.text.split()[0][1:].split('@')[0]
                 if cmd in flt['commands']: return h['function'](m)
             continue
-        return h['function'](m)
+        result = h['function'](m)
+        pump_delivery(bot)
+        return result
 
 def dcb(bot, cb):
     for h in bot.callback_query_handlers:

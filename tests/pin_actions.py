@@ -81,6 +81,7 @@ for name in ('get_me', 'send_message', 'create_forum_topic', 'pin_chat_message',
 
 import database as db
 import forum_support as fs
+from delivery_queue import pump_delivery
 import purchased_bot as pb
 
 OK, FAIL = [], []
@@ -127,8 +128,9 @@ def run():
     API.clear()
     fs.route_user_message(bot, bid, message(800, 'первое', 1, uid=800,
                           first_name='<Имя>', last_name='Фамилия', username='name'))
+    pump_delivery(bot, bid)
     thread, _, pinned, first_hash = fs.fs_get_topic(bid, 800)
-    info = calls('send_message')[0]
+    info = next(c for c in calls('send_message') if c[1][0] == gid)
     expected = (f'<b>{fs.TE_USER} &lt;Имя&gt; Фамилия</b>\n'
                 f'{fs.TE_LINK} @name\n{fs.TE_ID} <code>800</code>')
     check('закреп: ровно имя, username и ID, с экранированием', info[1][1] == expected)
@@ -148,8 +150,9 @@ def run():
     API.clear()
     fs.route_user_message(bot, bid, message(800, 'второе', 2, uid=800,
                           first_name='<Имя>', last_name='Фамилия', username='name'))
+    pump_delivery(bot, bid)
     check('второе сообщение: закреп не отправляется и не правится',
-          not calls('send_message') and not calls('edit_message_text')
+          not any(c[1][0] == gid for c in calls('send_message')) and not calls('edit_message_text')
           and not calls('edit_message_reply_markup') and not calls('pin_chat_message'))
     check('счётчики продолжают расти', db.db_get_user_info(bid, 800)['contact_count'] == 2
           and db.db_fs_user_tickets_total(bid, 800) == 1

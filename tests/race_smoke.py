@@ -13,6 +13,7 @@ PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJ)
 
 import telebot
+from delivery_queue import pump_delivery
 import telebot.types as t
 
 _mid = [1]
@@ -51,13 +52,15 @@ import database as db
 from database import init_db, db_get_all_bots_for_checker
 init_db()
 from handlers import register
+import handlers
+# Polling is tested separately; these scenarios dispatch updates explicitly.
+handlers.launch_bot = lambda *a, **kw: True
 from forum_support import start_weekly_scheduler, route_user_message, fs_handle_group_message, fs_bind_group, fs_get_topic
 
-FAIL = []
+PASS, FAIL = [], []
 def check(name, cond, extra=''):
     print(('  [OK]   ' if cond else '  [FAIL] ') + name + (' ' + str(extra) if extra and not cond else ''))
-    if not cond:
-        FAIL.append(name)
+    (PASS if cond else FAIL).append(name)
 
 def umsg(uid, text, mid):
     return t.Message.de_json({'message_id': mid, 'from': {'id': uid, 'is_bot': False,
@@ -82,9 +85,13 @@ def dispatch_msg(bot, m):
             if m.content_type == 'text' and m.text and m.text.startswith('/'):
                 cmd = m.text.split()[0][1:].split('@')[0]
                 if cmd in flt['commands']:
-                    return h['function'](m)
+                    result = h['function'](m)
+                    pump_delivery(bot)
+                    return result
             continue
-        return h['function'](m)
+        result = h['function'](m)
+        pump_delivery(bot)
+        return result
 
 def dispatch_cb(bot, cb):
     for h in bot.callback_query_handlers:
@@ -195,4 +202,5 @@ if __name__ == '__main__':
     finally:
         for n, o in ORIG.items():
             setattr(telebot.TeleBot, n, o)
+    print(f'\u0418\u0422\u041e\u0413\u041e: {len(PASS)} OK, {len(FAIL) or int(bool(code))} FAIL')
     sys.exit(code)

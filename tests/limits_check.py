@@ -9,7 +9,7 @@ os.environ['SUPER_ADMIN'] = '7145919720'
 os.environ['FS_STATS_TZ'] = '3'
 PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJ)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import telebot
 from telebot.types import InlineKeyboardButton

@@ -31,6 +31,7 @@ from telebot.apihelper import ApiTelegramException
 
 import database as db
 import forum_support as fs
+from delivery_queue import pump_delivery
 from forum_support import rate_limited
 
 PASS, FAIL = [], []
@@ -432,6 +433,7 @@ print('\n── 7. Маршрутизация сообщения пользов�
 fb3 = FakeBot()
 msg = make_user_msg(uid=555, mid=111, text='Здравствуйте, у меня проблема')
 handled = fs.route_user_message(fb3, 1, msg)
+pump_delivery(fb3, 1)
 check('группа подключена → route=True', handled is True)
 copies = [c for c in fb3.calls if c[0] == 'copy_message']
 check('сообщение скопировано в тему', len(copies) == 1 and copies[0][1][0] == GID
@@ -451,6 +453,7 @@ check('закреп содержит только три строки лично
 calls_before = len(fb3.calls)
 msg2 = make_user_msg(uid=555, mid=112, text='второе сообщение')
 fs.route_user_message(fb3, 1, msg2)
+pump_delivery(fb3, 1)
 pins2 = [c for c in fb3.calls if c[0] == 'pin_chat_message']
 check('повторное обращение — пин не создаётся заново', len(pins2) == 1)
 check('повторное обращение — закреп не редактируется',
@@ -471,6 +474,7 @@ u_changed = make_user(uid=555)
 u_changed.username = 'newname'
 t.User
 fs.route_user_message(fb3, 1, msg3)  # с прежним username (без изменений)
+pump_delivery(fb3, 1)
 # теперь сообщение от пользователя с новым username
 d = {
     'message_id': 114,
@@ -480,6 +484,7 @@ d = {
 }
 msg4 = t.Message.de_json(d)
 fs.route_user_message(fb3, 1, msg4)
+pump_delivery(fb3, 1)
 edits = [c for c in fb3.calls if c[0] == 'edit_message_text']
 renames = [c for c in fb3.calls if c[0] == 'edit_forum_topic']
 check('пин отредактирован при смене username', len(edits) >= 1)
@@ -584,6 +589,7 @@ fb4 = FakeBot()
 fb4.fail_copy = True
 m4 = make_user_msg(uid=560, mid=201, text='текст для фолбэка')
 fs.route_user_message(fb4, 1, m4)
+pump_delivery(fb4, 1)
 fw = [c for c in fb4.calls if c[0] == 'forward_message']
 check('fallback: пересылка', len(fw) == 1)
 check('fallback: соответствие записано', fs.fs_get_mapping(GID, fb4._mid) is not None)
@@ -862,6 +868,7 @@ class _ClosedOnce(FakeBot):
 fb8c = _ClosedOnce()
 m8 = make_user_msg(uid=810, mid=601, text='в закрытую тему')
 handled = fs.route_user_message(fb8c, 1, m8)
+pump_delivery(fb8c, 1)
 check('закрытая тема: сообщение доставлено', handled and
       any(c[0] == 'reopen_forum_topic' for c in fb8c.calls))
 # тема «удалена» — пересоздаётся
@@ -877,6 +884,7 @@ class _DeletedOnce(FakeBot):
 fb8d = _DeletedOnce()
 m8b = make_user_msg(uid=811, mid=602, text='в удалённую тему')
 fs.route_user_message(fb8d, 1, m8b)
+pump_delivery(fb8d, 1)
 creates8 = [c for c in fb8d.calls if c[0] == 'create_forum_topic']
 check('удалённая тема: создана новая', len(creates8) == 1)
 row811 = fs.fs_get_topic(1, 811)
@@ -1035,6 +1043,7 @@ def _worker(uid):
         for i in range(3):
             m = make_user_msg(uid=uid, mid=1000 + uid * 10 + i, text=f'msg {i}')
             fs.route_user_message(fb12, 1, m)
+            pump_delivery(fb12, 1)
     except Exception as e:
         errs.append(traceback.format_exc())
 threads = [threading.Thread(target=_worker, args=(2000 + i,)) for i in range(N_USERS)]
@@ -1063,6 +1072,7 @@ t0 = time.time()
 for i in range(200):
     m = make_user_msg(uid=555, mid=3000 + i, text=f'spam {i}')
     fs.route_user_message(fb13, 1, m)
+    pump_delivery(fb13, 1)
 dt = time.time() - t0
 print(f'  ⏱ 200 сообщений (1 пользователь, та же тема): {dt:.2f}s')
 c = sqlite3.connect(db.DB_PATH)
@@ -1079,7 +1089,9 @@ m_evil = make_user_msg(uid=666, mid=8001, text="'; DROP TABLE fs_msgs;--")
 class FB20(FakeBot):
     def get_chat(self, chat_id):
         return t.Chat(de_json={'id': 666, 'type': 'private', 'first_name': 'E'})
-fs.route_user_message(FB20(), 20, m_evil)
+fb20 = FB20()
+fs.route_user_message(fb20, 20, m_evil)
+pump_delivery(fb20, 20)
 c = sqlite3.connect(db.DB_PATH)
 bots_alive = c.execute('SELECT COUNT(*) FROM bots').fetchone()[0] >= 0
 c.close()
@@ -1142,7 +1154,9 @@ try:
                 continue
             if flt.get('commands'):
                 continue
-            return h['function'](m)
+            result = h['function'](m)
+            pump_delivery(bot)
+            return result
         return None
     def dispatch_cb(bot, cb):
         for h in bot.callback_query_handlers:
@@ -1290,6 +1304,7 @@ t0 = time.time()
 for i in range(200):
     m = make_user_msg(uid=555, mid=4000 + i, text=f'spam {i}')
     fs.route_user_message(fb13, 1, m)
+    pump_delivery(fb13, 1)
 dt_route = time.time() - t0
 print(f'  ⏱ 200 сообщений через route: {dt_route:.2f}s ({dt_route / 200 * 1000:.0f} мс/сообщ)')
 check('маршрутизация быстрее 15 мс/сообщение (было ~22)', dt_route / 200 < 0.015,

@@ -27,6 +27,7 @@ from telebot import types as t
 from telebot.apihelper import ApiTelegramException
 import database as db
 import forum_support as FS
+from delivery_queue import pump_delivery
 import purchased_bot as PB
 
 db.init_db()
@@ -55,6 +56,7 @@ def callback(bot, uid, data, original=None):
 
 def dispatch(bot, msg):
     bot.process_new_messages([msg])
+    pump_delivery(bot)
 
 
 def api(name):
@@ -64,6 +66,8 @@ def api(name):
             plain = html.unescape(re.sub(r'<[^>]*>', '', text)) if kw.get('parse_mode') == 'HTML' else text
             assert len(plain.encode('utf-16-le')) // 2 <= 4096, 'message is too long'
         API.append((name, args, kw))
+        if name == 'copy_messages':
+            return [t.MessageID(message(1).message_id) for _ in args[2]]
         if name == 'get_me':
             return t.User(999, True, 'Бот', username='test_bot')
         return message(args[0] if args and isinstance(args[0], int) else 1, 'ok')
@@ -73,7 +77,7 @@ def api(name):
 for name in ('get_me', 'send_message', 'send_photo', 'send_video', 'send_document',
              'send_audio', 'send_voice', 'send_video_note', 'send_animation', 'send_sticker',
              'forward_message', 'copy_message', 'edit_message_text', 'delete_message',
-             'answer_callback_query', 'edit_message_reply_markup', 'delete_webhook'):
+             'answer_callback_query', 'edit_message_reply_markup', 'delete_webhook', 'copy_messages'):
     setattr(telebot.TeleBot, name, api(name))
 PB.get_ton_amount = lambda: 1
 
@@ -203,6 +207,10 @@ class DeferredThread:
         self.target = target
     def start(self):
         self.pending.append(self.target)
+    def join(self):
+        pass
+    def is_alive(self):
+        return False
 
 
 def no_drop():
@@ -313,9 +321,12 @@ def one_queue():
     with patch.object(bot, 'send_message', fail):
         m = message(721, 'Не терять')
         dispatch(bot, m)
-    pending = FS.fs_get_pending(bid, 721)
-    payload = json.loads(pending[0])
-    assert len(payload) == 1 and payload[0]['mid'] == m.message_id
+    pending = db.db_delivery_rows(bid)
+    assert len(pending) == 1 and pending[0]['message_id'] == m.message_id
+    assert not FS.fs_get_pending(bid, 721)
+    db.db_delivery_update([pending[0]['id']], next_at=0)
+    pump_delivery(bot)
+    assert not db.db_delivery_rows(bid) and sent_to(owner)
 
 
 def album_limit():
@@ -330,7 +341,12 @@ def album_limit():
         for i in range(2):
             dispatch(bot, message(723, None, media_group_id='accepted', photo=[
                 {'file_id': f'a{i}', 'file_unique_id': f'v{i}', 'width': 10, 'height': 10}]))
-    assert len(sent_to(owner, 'send_photo')) == 2 and limiter.call_count == 1
+    import delivery_queue
+    with patch.object(delivery_queue.time, 'time', return_value=__import__('time').time() + 1):
+        pump_delivery(bot)
+    albums = sent_to(owner, 'copy_messages')
+    assert len(albums) == 1 and len(albums[0][0][2]) == 2 and limiter.call_count == 1
+    assert all(db.db_get_topic_copies_by_src(bid, 723, mid) for mid in albums[0][0][2])
 
 
 def broadcast_retry(photo=False):

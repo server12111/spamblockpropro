@@ -7,6 +7,7 @@ import math
 from safe_logging import register_secret
 from telegram_text import send_long, edit_html, protect_text_lengths
 from datetime import datetime
+from functools import wraps
 from database import subscription_days_left
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from keyboards import _ICON, TE_ANNOUNCE, TE_BLOCK, TE_CALENDAR, TE_CHART, TE_CHAT, TE_CHECK, TE_CLOCK, TE_CROSS, TE_CROWN, TE_DIAMOND, TE_DOLLAR, TE_EXCLAM, TE_FIRE, TE_GIFT, TE_GREEN, TE_HOURGLASS, TE_ID, TE_INBOX, TE_KEYBOARD, TE_LINK, TE_MAIL, TE_MASKS, TE_MIC, TE_MONEY, TE_NOTE, TE_PENCIL, TE_PICTURE, TE_PLUS, TE_REFRESH, TE_ROBOT, TE_ROCKET, TE_SEND, TE_STATS, TE_USER, TE_USERS, TE_VIDEO
@@ -26,7 +27,7 @@ from database import (db_add_user, db_get_bot_users, db_deactivate_bot, DBState,
                       db_set_primary_admin,
                       db_get_templates, db_add_template, db_del_template, db_get_template,
                       db_log_message, db_get_bot_msg_stats, db_get_last_user_messages,
-                      db_get_username, db_bump_user_contact,
+                      db_get_username,
                       db_is_marketplace_enabled,
                       db_get_bot_earnings, db_deduct_bot_earnings,
                       db_create_withdrawal, db_renew_bot,
@@ -35,13 +36,21 @@ from keyboards import broadcast_type_kb, PE_MONEY, PE_CHECK, PE_GIFT, PE_FIRE
 from config import SUPER_ADMIN, WITHDRAWAL_CHANNEL, BOT_USERNAME
 from payments import get_ton_amount
 from forum_support import (register_forum_support, RATE_LIMIT_SEC, rate_limited,
-                           fs_bump_ticket, queue_random_message, html_safe_chunks,
                            fs_refresh_pin_markup, fs_refresh_management)
 
 log = logging.getLogger(__name__)
 
 running_bots    = {}  # {token: TeleBot}
 running_bot_ids = {}  # {db_bot_id: token}
+_lifecycle_lock = threading.RLock()
+
+
+def _serialize_lifecycle(fn):
+    @wraps(fn)
+    def call(*args, **kwargs):
+        with _lifecycle_lock:
+            return fn(*args, **kwargs)
+    return call
 
 def _is_rate_limited(bot_id: int, user_id: int) -> bool:
     """Единый rate limit (кэш и логика в forum_support.rate_limited)."""
@@ -69,8 +78,12 @@ def _safe_photo(b, uid, photo, caption):
 
 def _close_bot(bot):
     """Остановить polling и освободить worker_pool также при неудачном запуске"""
+    sender = getattr(bot, '_delivery_sender', None)
+    if sender is not None:
+        sender.stop()
     bot.stop_bot()
 
+@_serialize_lifecycle
 def stop_bot(token: str) -> bool:
     bot_obj = running_bots.get(token)
     if not bot_obj:
@@ -187,87 +200,6 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         else:
             pbot.send_message(event.chat.id, "Доступно только владельцу бота")
         return False
-
-    def send_to_admins(text, reply_markup=None):
-        # длинные обращения: заголовок (до первого \n\n) отдельно, тело —
-        # в send_to_admins_long (куски через html_safe_chunks)
-        if len(text) > 4000:
-            hdr, _, raw = text.partition('\n\n')
-            return send_to_admins_long(hdr, raw, reply_markup=reply_markup)
-        ok = False
-        for aid in db_get_bot_admins(db_bot_id):
-            try:
-                pbot.send_message(aid, text, parse_mode='HTML', reply_markup=reply_markup)
-                ok = True
-            except Exception as e:
-                log.warning(f'send_to_admins bot#{db_bot_id} admin {aid}: {e}')
-        return ok
-
-    def send_to_admins_long(header, body_raw, reply_markup=None):
-        ok = False
-        for aid in db_get_bot_admins(db_bot_id):
-            try:
-                _send_long(aid, header, body_raw, reply_markup=reply_markup)
-                ok = True
-            except Exception as e:
-                log.warning(f'send_to_admins_long bot#{db_bot_id} admin {aid}: {e}')
-        return ok
-
-    def send_media_to_admins(m, header):
-        """Forward any media type to all admins with user info header.
-        Возвращает True, если хотя бы один админ получил сообщение
-        (БЕЗ return вызывающий p_user_media считает доставку провалом и
-        кладёт сообщение в очередь → двойная доставка при подтверждении).
-        try на КАЖДОГО админа: сбой одному не обрывает доставку остальным.
-        Подпись Telegram ограничена 1024 символами, а экранирование может
-        раздуть её (заголовок + подпись с '<') — тогда подпись уходит
-        отдельным текстом после медиа."""
-        kb = pk_reply(m.from_user.id)
-        ct = m.content_type
-        cap_full = header + (f"\n\n{TE_CHAT} {html.escape(m.caption)}" if m.caption else "")
-        cap_overflow = len(cap_full) > 1000 and bool(m.caption)
-        cap = cap_full if len(cap_full) <= 1000 else header
-        ok = False
-        for aid in db_get_bot_admins(db_bot_id):
-            try:
-                if ct == 'photo':
-                    pbot.send_photo(aid, m.photo[-1].file_id, caption=cap,
-                                    parse_mode='HTML', reply_markup=kb)
-                elif ct == 'video':
-                    pbot.send_video(aid, m.video.file_id, caption=cap,
-                                    parse_mode='HTML', reply_markup=kb)
-                elif ct == 'document':
-                    pbot.send_document(aid, m.document.file_id, caption=cap,
-                                       parse_mode='HTML', reply_markup=kb)
-                elif ct == 'audio':
-                    pbot.send_audio(aid, m.audio.file_id, caption=cap,
-                                    parse_mode='HTML', reply_markup=kb)
-                elif ct == 'voice':
-                    pbot.send_message(aid, header + f"\n{TE_MIC} Голосовое сообщение:",
-                                      parse_mode='HTML', reply_markup=kb)
-                    pbot.send_voice(aid, m.voice.file_id)
-                elif ct == 'video_note':
-                    pbot.send_message(aid, header + f"\n{TE_VIDEO} Видеосообщение:",
-                                      parse_mode='HTML', reply_markup=kb)
-                    pbot.send_video_note(aid, m.video_note.file_id)
-                elif ct == 'sticker':
-                    pbot.send_message(aid, header + f"\n{TE_MASKS} Стикер:",
-                                      parse_mode='HTML', reply_markup=kb)
-                    pbot.send_sticker(aid, m.sticker.file_id)
-                elif ct == 'animation':
-                    pbot.send_animation(aid, m.animation.file_id, caption=cap,
-                                        parse_mode='HTML', reply_markup=kb)
-                else:
-                    # контакты, геолокация, опросы и прочее — пересылка как есть
-                    pbot.forward_message(aid, m.chat.id, m.message_id)
-                    pbot.send_message(aid, header, parse_mode='HTML', reply_markup=kb)
-                if cap_overflow:
-                    for chunk in html_safe_chunks(html.escape(m.caption)):
-                        pbot.send_message(aid, chunk, parse_mode='HTML')
-                ok = True
-            except Exception as e:
-                log.warning(f'send_media_to_admins bot#{db_bot_id} admin {aid}: {e}')
-        return ok
 
     # ── Клавиатуры ─────────────────────────────────────
     def pk_start(show_admin: bool = False):
@@ -523,10 +455,6 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             pass
 
     # ── Отправить сообщение ────────────────────────────
-    # fs_route назначается в конце make_purchased_bot после регистрации
-    # обработчиков форум-режима; до этого обращения идут по стандартному пути.
-    fs_route = None
-
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_send')
     def p_user_send(cb):
         if db_is_blocked(db_bot_id, cb.from_user.id):
@@ -576,51 +504,16 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             return False
         return True
 
-    def _make_header(m) -> str:
-        username = f"@{m.from_user.username}" if m.from_user.username else "нет"
-        return (f"<b>{TE_INBOX} Сообщение от:</b>\n"
-                f"{TE_USER} Имя: <b>{html.escape(m.from_user.full_name)}</b>\n"
-                f"{TE_LINK} Username: {html.escape(username)}\n"
-                f"{TE_ID} ID: <code>{m.from_user.id}</code>")
-
     def _deliver_direct(m):
-        """ПОЛНАЯ доставка обращения юзера СРАЗУ (без очереди подтверждения):
-        форум-режим → тема пользователя, иначе — админам напрямую.
-        Используется и для сообщений по кнопке p_send, и для случайных
-        (рандомные раньше копились в очереди с промптами — неудобно).
-        True означает, что сообщение обработано, включая очередь восстановления"""
+        """Проверки и durable запись; доставка выполняется отправителем.
+
+        Один путь для p_send и обычных сообщений, в форум и админам в личку.
+        """
         if not _user_msg_checks(m):
             return True   # заблокирован/лимит — юзер уже уведомлён
-        if fs_route and fs_route(m):
-            return True   # ушло в тему (или юзеру показана ошибка доставки)
-        db_bump_user_contact(db_bot_id, m.from_user.id)
-        fs_bump_ticket(db_bot_id, m.from_user.id)   # обращение учитывается и без группы
-        header = _make_header(m)
-        if m.content_type == 'text':
-            user_body = m.text or ''
-            if len(header) + len(html.escape(user_body)) + 10 > 4000:
-                delivered = send_to_admins_long(header, user_body,
-                                                reply_markup=pk_reply(m.from_user.id))
-            else:
-                delivered = send_to_admins(f"{header}\n\n{TE_CHAT} {html.escape(user_body)}",
-                                           reply_markup=pk_reply(m.from_user.id))
-            log_text = m.text or ''
-        else:
-            delivered = send_media_to_admins(m, header)
-            log_text = f'[{m.content_type}]'
-        if not delivered:
-            # ни один админ не получил (Telegram недоступен) — не теряем сообщение
-            queue_random_message(pbot, db_bot_id, m)
-            return True
-        db_log_message(db_bot_id, m.from_user.id, log_text)
-        try:
-            pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Сообщение отправлено</b>",
-                parse_mode='HTML', reply_markup=pk_close())
-        except Exception:
-            pass
-        return True
+        from delivery_queue import get_sender
+        return get_sender(pbot, db_bot_id).enqueue(m, pk_close)
 
-    # ── Текст ──────────────────────────────────────────
     @pbot.message_handler(func=lambda m: pstate.get(m.from_user.id) == 'await_msg')
     def p_user_text(m):
         if _take_flow(m.from_user.id, 'await_msg') is None: return
@@ -1294,7 +1187,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     # Регистрируется последним: все обработчики состояний выше имеют приоритет,
     # форум-обработчики ловят только то, что не перехватили они.
     # direct_route: случайные сообщения юзеров доставляются СРАЗУ (без очереди)
-    fs_route = register_forum_support(pbot, db_bot_id, pstate, is_admin,
+    register_forum_support(pbot, db_bot_id, pstate, is_admin,
                                       confirm_kb=pk_close, direct_route=_deliver_direct)
 
     return pbot
@@ -1304,7 +1197,11 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
 cb_from_user_id_placeholder = -1
 
 
+@_serialize_lifecycle
 def launch_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None) -> bool:
+    existing_token = running_bot_ids.get(db_bot_id)
+    if existing_token is not None and existing_token != token:
+        return False
     if token in running_bots: return True
     pbot = None
     try:
@@ -1319,6 +1216,8 @@ def launch_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None) -> bool
         db_update_bot_username(db_bot_id, me.username or '')
         running_bots[token]        = pbot
         running_bot_ids[db_bot_id] = token
+        from delivery_queue import get_sender
+        get_sender(pbot, db_bot_id).start()
 
         def polling_loop():
             def active():
@@ -1347,6 +1246,9 @@ def launch_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None) -> bool
                     # infinity_polling возвращается после остановки экземпляра
                     # Прежний токен в реестре не означает, что это тот же бот
                     break
+            sender = getattr(pbot, '_delivery_sender', None)
+            if sender is not None:
+                sender.stop()
             log.info(f'Bot #{db_bot_id} polling stopped.')
 
         threading.Thread(target=polling_loop, daemon=True).start()
