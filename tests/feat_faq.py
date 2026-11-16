@@ -24,7 +24,7 @@ def run():
     q.dispatch(bot,q.message(777,3,'Быстро',entities=[dict(type='bold',offset=0,length=6)]))
     node=db.db_faq_nodes(bid)[0]; nid=node['id']
     check('добавление и форматирование',node['title']=='Доставка' and node['text']=='<b>Быстро</b>')
-    check('FAQ появляется над отправкой',menu()[:2]==['FAQ','Отправить сообщение'])
+    check('FAQ появляется под отправкой',menu()[:2]==['Отправить сообщение','FAQ'])
     click(f'fq_name_{nid}'); q.dispatch(bot,q.message(777,4,'Срок доставки'))
     check('переименование',db.db_faq_get(bid,nid)['title']=='Срок доставки')
     click(f'fq_text_{nid}'); q.dispatch(bot,q.message(777,5,'Завтра',entities=[dict(type='italic',offset=0,length=6)]))
