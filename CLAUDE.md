@@ -46,6 +46,8 @@
   - забрать правки Codex сюда: `git pull --ff-only C:/Users/Sierafim/fespamblock-work/work codex-r1`
 - Полная проверка: `bash C:/Users/Sierafim/fespamblock-work/verify_all.sh` (все `tests/*.py` в `work/`;
   с аргументом — в указанной папке), итог `TOTAL FAILURES: 0`.
+  В `work/` нет `spambots.db`, поэтому 4 проверки «миграция копии» в `test_fs.py` там пропускаются —
+  перед установкой прогнать ещё и здесь: `bash C:/Users/Sierafim/fespamblock-work/verify_all.sh C:/Users/Sierafim/Desktop/boti/feSpamBlock`.
 
 ## Запуск бота локально
 ```bash
