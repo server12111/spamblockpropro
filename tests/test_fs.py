@@ -15,6 +15,7 @@ import threading
 import time
 import traceback
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJ)
@@ -602,11 +603,17 @@ row = fs.fs_get_pending(1, 600)
 check('сообщение в очереди', row and row[1] == 'pending')
 prompts = [c for c in fb6.calls if c[0] == 'send_message' and 'Отправить сообщение' in c[1][1]]
 check('промпт отправлен с кнопкой', len(prompts) == 1)
-# несколько сообщений → счётчик обновляется
+old_prompt = row[2]
+# несколько сообщений → новое окно внизу чата, старое удаляется
 m7 = make_user_msg(uid=600, mid=302, text='второе внеплановое')
 fs.queue_random_message(fb6, 1, m7)
-edits6 = [c for c in fb6.calls if c[0] == 'edit_message_text' and 'В очереди: <b>2</b>' in str(c[1])]
-check('несколько ожидающих сообщений обрабатываются', len(edits6) == 1)
+prompts = [c for c in fb6.calls if c[0] == 'send_message' and 'Отправить сообщение' in c[1][1]]
+new_prompt = fs.fs_get_pending(1, 600)[2]
+check('второе сообщение создаёт новое окно со счётчиком 2',
+      len(prompts) == 2 and 'В очереди: <b>2</b> сообщений' in prompts[-1][1][1])
+check('окно очереди не редактируется', not any(c[0] == 'edit_message_text' for c in fb6.calls))
+check('старое окно удалено', ('delete_message', (600, old_prompt), {}) in fb6.calls)
+check('в БД сохранён id нового окна', new_prompt is not None and new_prompt != old_prompt)
 # двойной claim
 items = fs.fs_claim_pending(1, 600)
 check('claim возвращает элементы', items and len(items) == 2)
@@ -634,6 +641,125 @@ mapped = fs.fs_get_mapping(GID, fb6._mid)
 check('соответствия очереди записаны', mapped is not None)
 check('rate limit зафиксирован после доставки',
       rate_limited(1, 600, mark=False) is True)
+
+
+class QueuePromptBot(FakeBot):
+    def __init__(self):
+        super().__init__()
+        self.fail_prompt = False
+        self.fail_delete = False
+        self.prompts = []
+        self.deletions = []
+        self.prompt_entered = threading.Event()
+        self.prompt_release = threading.Event()
+        self.pause_prompt = False
+
+    def send_message(self, chat_id, text, **kw):
+        if 'Отправить сообщение администратору?' not in text:
+            return super().send_message(chat_id, text, **kw)
+        if self.pause_prompt:
+            self.pause_prompt = False
+            self.prompt_entered.set()
+            if not self.prompt_release.wait(5):
+                raise RuntimeError('тест не разблокировал отправку окна')
+        if self.fail_prompt:
+            raise make_api_exc(403, 'Forbidden: bot was blocked by the user')
+        msg = super().send_message(chat_id, text, **kw)
+        self.prompts.append((msg.message_id, text, kw))
+        return msg
+
+    def delete_message(self, chat_id, message_id, **kw):
+        self._log('delete_message', chat_id, message_id, **kw)
+        self.deletions.append((message_id, fs.fs_get_pending(1, chat_id)[2]))
+        if self.fail_delete:
+            raise make_api_exc(400, "Bad Request: message can't be deleted")
+        self.deleted_messages.add(message_id)
+        return True
+
+
+# Сбой отправки: старое окно и его id сохраняются, обе записи остаются.
+fb_prompt = QueuePromptBot()
+fs.queue_random_message(fb_prompt, 1, make_user_msg(uid=603, mid=310))
+old_prompt = fs.fs_get_pending(1, 603)[2]
+fb_prompt.fail_prompt = True
+fs.queue_random_message(fb_prompt, 1, make_user_msg(uid=603, mid=311))
+row = fs.fs_get_pending(1, 603)
+check('сбой нового окна сохраняет старый id и обе записи',
+      row[2] == old_prompt and len(fs.json_loads(row[0])) == 2)
+check('при сбое отправки старое окно не удаляется', not fb_prompt.deletions)
+fb_prompt.fail_prompt = False
+fs.confirm_send(fb_prompt, 1, make_cb('fs_confirm_send', from_id=603, msg_mid=old_prompt))
+check('старое окно после сбоя отправки доставляет обе записи',
+      fs.fs_get_pending(1, 603) is None and any(
+          c[0] == 'copy_messages' and c[1][2] == (310, 311) for c in fb_prompt.calls))
+
+# Неудалённое устаревшее окно продолжает управлять всей очередью.
+fb_prompt = QueuePromptBot()
+fs.queue_random_message(fb_prompt, 1, make_user_msg(uid=604, mid=312))
+old_prompt = fs.fs_get_pending(1, 604)[2]
+fb_prompt.fail_delete = True
+with patch.object(fs.log, 'error') as prompt_error:
+    fs.queue_random_message(fb_prompt, 1, make_user_msg(uid=604, mid=313))
+check('сбой удаления не логируется как error', not prompt_error.called)
+new_prompt = fs.fs_get_pending(1, 604)[2]
+check('сбой удаления не мешает сохранению нового окна',
+      len(fb_prompt.prompts) == 2 and new_prompt == fb_prompt.prompts[-1][0]
+      and new_prompt != old_prompt)
+check('новый id сохранён до удаления старого окна', fb_prompt.deletions == [(old_prompt, new_prompt)])
+check('текст и кнопки нового окна сохранены',
+      fb_prompt.prompts[-1][1] == fb_prompt.prompts[0][1] + f'\n\n{fs.TE_NOTE} В очереди: <b>2</b> сообщений'
+      and fb_prompt.prompts[-1][2]['reply_markup'].to_dict() == fs._confirm_kb().to_dict())
+stale_cb = make_cb('fs_confirm_send', from_id=604, msg_mid=old_prompt)
+fs.confirm_send(fb_prompt, 1, stale_cb)
+check('устаревшее окно доставляет обе записи после сбоя удаления',
+      fs.fs_get_pending(1, 604) is None and any(
+          c[0] == 'copy_messages' and c[1][2] == (312, 313) for c in fb_prompt.calls))
+fs.confirm_send(fb_prompt, 1, stale_cb)
+check('повторное нажатие устаревшего окна сообщает о пустой очереди',
+      fb_prompt.calls[-1][0] == 'answer_callback_query'
+      and 'Очередь пуста' in fb_prompt.calls[-1][1][1])
+
+fb_prompt = QueuePromptBot()
+fs.queue_random_message(fb_prompt, 1, make_user_msg(uid=605, mid=314))
+old_prompt = fs.fs_get_pending(1, 605)[2]
+fb_prompt.fail_delete = True
+fs.queue_random_message(fb_prompt, 1, make_user_msg(uid=605, mid=315))
+fs.confirm_cancel(fb_prompt, 1, make_cb('fs_confirm_cancel', from_id=605, msg_mid=old_prompt))
+check('отмена из устаревшего окна очищает всю очередь', fs.fs_get_pending(1, 605) is None)
+
+# Два воркера: первая отправка окна задержана, пока приходит второе сообщение.
+for race_uid, race_mg in ((606, None), (607, 'queue_album')):
+    race_bot = QueuePromptBot()
+    race_bot.pause_prompt = True
+    race_errors = []
+    second_done = threading.Event()
+
+    def queue_worker(mid, done=None):
+        try:
+            fs.queue_random_message(race_bot, 1, make_user_msg(
+                uid=race_uid, mid=mid, mg=race_mg, ct='photo' if race_mg else 'text'))
+        except Exception as e:
+            race_errors.append(e)
+        finally:
+            if done is not None:
+                done.set()
+
+    first = threading.Thread(target=queue_worker, args=(316,))
+    second = threading.Thread(target=queue_worker, args=(317, second_done))
+    first.start()
+    entered = race_bot.prompt_entered.wait(5)
+    second.start()
+    second_done.wait(0.2)
+    race_bot.prompt_release.set()
+    first.join(5)
+    second.join(5)
+    row = fs.fs_get_pending(1, race_uid)
+    live = [p for p in race_bot.prompts if p[0] not in race_bot.deleted_messages]
+    check(f'гонка {race_mg or "текст"}: осталось одно окно с верным счётчиком и id',
+          entered and not first.is_alive() and not second.is_alive() and not race_errors
+          and row is not None and len(fs.json_loads(row[0])) == 2
+          and len(live) == 1 and live[0][0] == row[2] and 'В очереди: <b>2</b>' in live[0][1])
+
 # отмена очереди
 fb6b = FakeBot()
 m6b = make_user_msg(uid=601, mid=303, text='отменяемое')

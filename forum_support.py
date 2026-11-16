@@ -27,8 +27,7 @@ from datetime import datetime, timedelta, timezone
 
 from telebot.apihelper import ApiTelegramException
 from telebot.types import (InlineKeyboardMarkup, InlineKeyboardButton,
-                           ReplyParameters, InputMediaPhoto, InputMediaVideo,
-                           Message)
+                           ReplyParameters, InputMediaPhoto, InputMediaVideo)
 
 from database import (_utc_now_str, db_get_topic_copies_by_src,
                       db_add_user, db_get_user_info, db_bump_user_contact,
@@ -1199,6 +1198,11 @@ def _topic_notice(pbot, chat_id: int, thread: int, text: str):
 # ══════════════════════════════════════════════════════════════
 #  Очередь подтверждения: сбор случайных сообщений и отправка
 # ══════════════════════════════════════════════════════════════
+# Фиксированный набор блокировок не растёт с числом пользователей.
+# Добавление в очередь и замена окна одного пользователя идут последовательно.
+_queue_prompt_locks = tuple(threading.Lock() for _ in range(256))
+
+
 def queue_random_message(pbot, bot_id: int, m) -> None:
     """Пользователь пишет без кнопки p_send: очередь + запрос подтверждения."""
     uid = m.from_user.id
@@ -1211,39 +1215,31 @@ def queue_random_message(pbot, bot_id: int, m) -> None:
         return
     item = {'mid': m.message_id, 'type': m.content_type,
             'mg': m.media_group_id or ''}
-    cnt, prompt_id = fs_append_pending(bot_id, uid, item)
-    if cnt is None:
-        try:
-            pbot.send_message(m.chat.id,
-                              f'<b>{TE_NOTE} Очередь полна ({PENDING_MAX} сообщений) — '
-                              'сначала отправь её администратору.</b>', parse_mode='HTML')
-        except Exception:
-            pass
-        return
-    text = f'<b>{TE_CHAT}  Отправить сообщение администратору?</b>'
-    if cnt > 1:
-        text += f'\n\n{TE_NOTE} В очереди: <b>{cnt}</b> сообщений'
-    kb = _confirm_kb()
-    if prompt_id:
-        try:
-            res = _edit(pbot, text, m.chat.id, prompt_id,
-                        parse_mode='HTML', reply_markup=kb)
-            # если фолбэк создал новое сообщение — обновляем id промпта,
-            # чтобы счётчик очереди продолжал работать и после 48 часов
-            if isinstance(res, Message) and res.message_id != prompt_id:
-                fs_set_prompt(bot_id, uid, res.message_id)
+    lock = _queue_prompt_locks[hash((bot_id, uid)) % len(_queue_prompt_locks)]
+    with lock:
+        cnt, prompt_id = fs_append_pending(bot_id, uid, item)
+        if cnt is None:
+            try:
+                pbot.send_message(m.chat.id,
+                                  f'<b>{TE_NOTE} Очередь полна ({PENDING_MAX} сообщений) — '
+                                  'сначала отправь её администратору.</b>', parse_mode='HTML')
+            except Exception:
+                pass
             return
-        except ApiTelegramException as e:
-            if 'not modified' in _err_low(e):
-                return  # промпт уже актуален
-            # промпт удалён — отправим новый ниже
-        except Exception:
-            pass
-    try:
-        msg = pbot.send_message(m.chat.id, text, parse_mode='HTML', reply_markup=kb)
-        fs_set_prompt(bot_id, uid, msg.message_id)
-    except Exception as e:
-        log.warning(f'queue prompt bot#{bot_id} uid={uid}: {e}')
+        text = f'<b>{TE_CHAT}  Отправить сообщение администратору?</b>'
+        if cnt > 1:
+            text += f'\n\n{TE_NOTE} В очереди: <b>{cnt}</b> сообщений'
+        try:
+            msg = pbot.send_message(m.chat.id, text, parse_mode='HTML', reply_markup=_confirm_kb())
+            fs_set_prompt(bot_id, uid, msg.message_id)
+        except Exception as e:
+            log.warning(f'queue prompt bot#{bot_id} uid={uid}: {e}')
+            return
+        if prompt_id:
+            try:
+                pbot.delete_message(m.chat.id, prompt_id)
+            except Exception:
+                pass
 
 
 
