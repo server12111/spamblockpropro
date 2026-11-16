@@ -270,16 +270,16 @@ def register(bot: telebot.TeleBot):
     def _reset_flow(uid, preserve_purchase=False):
         with token_flow_lock:
             token_candidates.pop(uid, None)
-        current = state.pop(uid, None)
-        current = current if isinstance(current, dict) else {}
-        target, via = purchase_context(current)
-        clean = {}
-        if via:
-            clean['via_bot_id'] = via
-        if preserve_purchase and target:
-            clean.update(step='renewing', bot_id=target)
-        if clean:
-            state[uid] = clean
+            current = state.pop(uid, None)
+            current = current if isinstance(current, dict) else {}
+            target, via = purchase_context(current)
+            clean = {}
+            if via:
+                clean['via_bot_id'] = via
+            if preserve_purchase and target:
+                clean.update(step='renewing', bot_id=target)
+            if clean:
+                state[uid] = clean
 
     def _resume_bot(bot_id):
         with _lifecycle_lock:
@@ -799,6 +799,7 @@ def register(bot: telebot.TeleBot):
         if not _binfo or uid not in (_binfo[2], _binfo[1]):
             bot.answer_callback_query(cb.id, "❌ Это не твой бот", show_alert=True)
             return
+        if not _purchase_allowed(cb, dict(step='renewing', bot_id=bot_id)): return
         cur = state.get(uid)
         new_state = {'step': 'renewing', 'bot_id': bot_id}
         if isinstance(cur, dict) and 'via_bot_id' in cur:
@@ -847,11 +848,26 @@ def register(bot: telebot.TeleBot):
             parse_mode='HTML', reply_markup=cancel_kb())
 
     # ── Использовать скидку ──────────────────────────────
+    def _purchase_allowed(cb, context):
+        from purchase_store import renewal_error
+        target, _ = purchase_context(context)
+        error = renewal_error(target, cb.from_user.id) if target else None
+        if error:
+            bot.answer_callback_query(cb.id, error, show_alert=True)
+            return False
+        return True
+
     @bot.callback_query_handler(func=lambda c: c.data == 'use_discount')
     def use_discount_cb(cb):
         uid = cb.from_user.id
         context = state.get(uid)
-        if not db_use_purchase_discount(uid, context):
+        if not _purchase_allowed(cb, context): return
+        try:
+            used = db_use_purchase_discount(uid, context)
+        except ValueError as exc:
+            bot.answer_callback_query(cb.id, str(exc), show_alert=True)
+            return
+        if not used:
             bot.answer_callback_query(cb.id, "Нет доступной скидки или настройка уже оплачена", show_alert=True)
             return
         _after_payment_confirmed(uid, cb.message.chat.id, cb.message.message_id,
@@ -860,6 +876,7 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data == 'pay_cryptobot')
     def pay_cryptobot_cb(cb):
         context = state.get(cb.from_user.id)
+        if not _purchase_allowed(cb, context): return
         invoice = cb_create_invoice(cb.from_user.id)
         if not invoice:
             bot.answer_callback_query(cb.id, "Не удалось создать счёт — попробуй ещё раз", show_alert=True)
@@ -900,7 +917,13 @@ def register(bot: telebot.TeleBot):
 
     @bot.callback_query_handler(func=lambda c: c.data == 'pay_ton')
     def pay_ton_cb(cb):
-        cur = state.get(cb.from_user.id)
+        with token_flow_lock:
+            cur, revision = state.snapshot(cb.from_user.id)
+            if revision is None:
+                # Даже покупка без предыдущего шага получает версию для отмены
+                state[cb.from_user.id] = {'step': 'ton_quote'}
+                _, revision = state.snapshot(cb.from_user.id)
+        if not _purchase_allowed(cb, cur): return
         quoted_price = get_price()
         bot.answer_callback_query(cb.id, "⏳ Получаю курс TON...")
         ton_amount = get_ton_amount(quoted_price)
@@ -917,7 +940,7 @@ def register(bot: telebot.TeleBot):
             new_state.update(bot_id=target, renewing=True)
         if via:
             new_state['via_bot_id'] = via
-        state[cb.from_user.id] = new_state
+        if not state.transition(cb.from_user.id, revision, new_state): return
         kb = InlineKeyboardMarkup()
         kb.add(_btn('Открыть TON Keeper и оплатить', icon='💎', style='primary', url=link))
         kb.add(_btn('Я оплатил — проверить', icon='✔️', style='success', callback_data=f'ton_check_{payment_code}'))
@@ -1133,12 +1156,15 @@ def register(bot: telebot.TeleBot):
     def service_input(m):
         import service_broadcast as svc
         # Сериализация элементов альбома включает чтение и смену состояния
-        with svc._lock:
+        with svc._lock, token_flow_lock:
             value = state.get(m.from_user.id)
+            if not (isinstance(value, str) and value.startswith('bcast_') or
+                    isinstance(value, dict) and value.get('step') == 'service_broadcast'): return
             scope = value.rsplit('_', 1)[1] if isinstance(value, str) else value['scope']
             previous = value.get('job_id') if isinstance(value, dict) else None
             jid = svc.append(bot, m.from_user.id, m.chat.id, scope, m, previous)
             state[m.from_user.id] = dict(step='service_broadcast', job_id=jid, scope=scope, album=m.media_group_id)
+            _, revision = state.snapshot(m.from_user.id)
         if m.media_group_id:
             svc.schedule_preview(bot, jid)
         else:
@@ -1146,7 +1172,7 @@ def register(bot: telebot.TeleBot):
             except Exception as exc:
                 log.warning('service preview failed: %s', exc)
                 svc.fail_preview(bot, jid)
-                state[m.from_user.id] = 'bcast_any_' + scope
+                state.transition(m.from_user.id, revision, 'bcast_any_' + scope)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith('bcast_') and not c.data.endswith('_p'))
     def broadcast_type(cb):
@@ -1273,9 +1299,9 @@ def register(bot: telebot.TeleBot):
             return
         token, _, _, _ = info
         owner_id = info[2]
+        db_deactivate_bot(bot_id, deleted=True)
         if token in running_bots:
             stop_bot(token)
-        db_deactivate_bot(bot_id)
         bot.answer_callback_query(cb.id, f"🗑 Bot #{bot_id} удалён", show_alert=True)
         try:
             bot.send_message(owner_id,
@@ -1496,7 +1522,11 @@ def register(bot: telebot.TeleBot):
                 parse_mode='HTML')
             return
         state.pop(m.from_user.id, None)
-        new_exp = db_renew_bot(target_bot_id, days)
+        try:
+            new_exp = db_renew_bot(target_bot_id, days)
+        except ValueError as exc:
+            bot.send_message(m.chat.id, str(exc))
+            return
         started = _resume_bot(target_bot_id)
         if not started:
             bot.send_message(m.chat.id, "Подписка продлена, но бот не запустился — попробуй позже")

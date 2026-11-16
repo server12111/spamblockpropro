@@ -64,12 +64,16 @@ def destinations(main_bot, scope):
     return bots
 
 
-def recipients(main_bot, scope):
+def routes(main_bot, scope):
     users = {}
     for bid in sorted(destinations(main_bot, scope)):
         for uid in sorted(db.db_get_bot_users(bid)):
-            if uid not in users and not db.db_is_blocked(bid, uid): users[uid] = bid
+            if not db.db_is_blocked(bid, uid): users.setdefault(uid, []).append(bid)
     return users
+
+
+def recipients(main_bot, scope):
+    return {uid: bids[0] for uid, bids in routes(main_bot, scope).items()}
 
 
 def _source(m):
@@ -188,11 +192,15 @@ def preview(main_bot, job_id):
         current = job(job_id)
         if not current or current['status'] != 'draft': return
         prepare_files(main_bot, job_id)
-        users = recipients(main_bot, current['scope'])
+        saved_routes = routes(main_bot, current['scope'])
+        users = {uid: bids[0] for uid, bids in saved_routes.items()}
         c = db._conn()
         try:
             c.execute('BEGIN IMMEDIATE')
             c.execute('DELETE FROM service_recipients WHERE job_id=?', (job_id,))
+            c.execute('DELETE FROM service_routes WHERE job_id=?', (job_id,))
+            c.executemany('INSERT INTO service_routes(job_id,user_id,bot_id) VALUES(?,?,?)',
+                          [(job_id, uid, bid) for uid, bids in saved_routes.items() for bid in bids])
             c.executemany('INSERT INTO service_recipients(job_id,user_id,bot_id) VALUES(?,?,?)',
                           [(job_id, uid, bid) for uid, bid in users.items()])
             c.commit()
@@ -287,6 +295,13 @@ def _pump(main_bot, bid, *, limit=1000):
                 query("UPDATE service_recipients SET next_at=MAX(next_at,?) WHERE bot_id=? AND status='pending'",
                       (time.time() + delay, bid), write=True)
                 break  # 429 останавливает весь бот до retry_after
+            alternate = query('SELECT bot_id FROM service_routes WHERE job_id=? AND user_id=? '
+                              'AND bot_id>? ORDER BY bot_id LIMIT 1', (jid, uid, bid))
+            if alternate:
+                query('UPDATE service_recipients SET bot_id=?,next_at=0 WHERE job_id=? AND user_id=?',
+                      (alternate[0][0], jid, uid), write=True)
+                count += 1
+                continue
             state = 'failed'
         query('UPDATE service_recipients SET status=? WHERE job_id=? AND user_id=?', (state, jid, uid), write=True)
         count += 1

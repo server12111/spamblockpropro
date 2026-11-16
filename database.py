@@ -544,6 +544,9 @@ def _init_db_connection(conn, *, schema=False):
         CREATE TABLE IF NOT EXISTS service_files (
             job_id INTEGER NOT NULL, source_id TEXT NOT NULL, name TEXT NOT NULL, data BLOB NOT NULL,
             PRIMARY KEY(job_id,source_id));
+        CREATE TABLE IF NOT EXISTS service_routes (
+            job_id INTEGER NOT NULL, user_id INTEGER NOT NULL, bot_id INTEGER NOT NULL,
+            PRIMARY KEY(job_id,user_id,bot_id));
         CREATE TABLE IF NOT EXISTS service_file_ids (
             job_id INTEGER NOT NULL, bot_id INTEGER NOT NULL, source_id TEXT NOT NULL, file_id TEXT NOT NULL,
             PRIMARY KEY(job_id,bot_id,source_id));
@@ -564,6 +567,7 @@ def _init_db_connection(conn, *, schema=False):
     for stmt in [
         'ALTER TABLE bots ADD COLUMN username TEXT DEFAULT ""',
         'ALTER TABLE bots ADD COLUMN expires_at TIMESTAMP',
+        'ALTER TABLE bots ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0',
         "ALTER TABLE bot_messages ADD COLUMN text TEXT DEFAULT ''",
         "ALTER TABLE bot_users ADD COLUMN username TEXT DEFAULT ''",
         # Расширение bot_users для forum-режима (старые строки получают NULL = «Неизвестно»)
@@ -591,6 +595,11 @@ def _init_db_connection(conn, *, schema=False):
         except Exception:
             pass
     # Только добавление: прежние таблицы остаются совместимыми
+    # Старые квитанции также сохраняют идемпотентность после обновления
+    conn.execute("UPDATE OR IGNORE balance_operations SET operation_key="
+                 "(SELECT substr(token,1,instr(token,':')-1) FROM bots WHERE id=bot_id) || ':' || operation_key "
+                 "WHERE (operation_key LIKE 'renew:%' OR operation_key LIKE 'withdraw:%') "
+                 "AND EXISTS(SELECT 1 FROM bots WHERE id=bot_id)")
     for user_id, invoice_id, state_json in conn.execute(
             'SELECT p.user_id, p.invoice_id, s.state FROM pending_payments p '
             'LEFT JOIN states s ON s.bot_id=0 AND s.user_id=p.user_id').fetchall():
@@ -625,8 +634,8 @@ def validate_restore(path):
 def db_bot_can_run(bot_id):
     c = _conn()
     try:
-        row = c.execute('SELECT active,expires_at FROM bots WHERE id=?', (bot_id,)).fetchone()
-        if not row or not row[0]: return False
+        row = c.execute('SELECT active,expires_at,deleted FROM bots WHERE id=?', (bot_id,)).fetchone()
+        if not row or not row[0] or row[2]: return False
         return not row[1] or datetime.fromisoformat(str(row[1])) > datetime.now()
     finally: c.close()
 
@@ -1095,10 +1104,12 @@ def db_update_bot_username(bot_id: int, username: str):
     c.execute('UPDATE bots SET username=? WHERE id=?', (username or '', bot_id))
     c.commit(); c.close()
 
-def db_deactivate_bot(bot_id: int, expected_expires=None):
+def db_deactivate_bot(bot_id: int, expected_expires=None, *, deleted=False):
     c = _conn()
     try:
-        if expected_expires is None:
+        if deleted:
+            cur = c.execute('UPDATE bots SET active=0,deleted=1 WHERE id=?', (bot_id,))
+        elif expected_expires is None:
             cur = c.execute('UPDATE bots SET active=0 WHERE id=?', (bot_id,))
         else:
             cur = c.execute('UPDATE bots SET active=0 WHERE id=? AND expires_at=?', (bot_id, expected_expires))
@@ -1718,12 +1729,18 @@ def db_spend_balance(bot_id, owner_id, amount, operation_key, *, address=None, d
     """Списание, результат и ключ повтора фиксируются одной транзакцией"""
     if not math.isfinite(amount) or amount <= 0:
         raise ValueError('Неверная сумма')
+    if amount != round(amount, 10):
+        raise ValueError('Сумма слишком маленькая')
     c = _conn()
     try:
         c.execute('BEGIN IMMEDIATE')
-        row = c.execute('SELECT owner_id FROM bots WHERE id=?', (bot_id,)).fetchone()
+        row = c.execute('SELECT owner_id,token FROM bots WHERE id=?', (bot_id,)).fetchone()
         if not row or row[0] != owner_id:
             raise ValueError('Доступно только владельцу бота')
+        if days is not None:
+            from purchase_store import require_renewable
+            require_renewable(c, bot_id)
+        operation_key = row[1].split(':', 1)[0] + ':' + operation_key
         previous = c.execute('SELECT result FROM balance_operations WHERE bot_id=? AND operation_key=?',
                              (bot_id, operation_key)).fetchone()
         if previous:
@@ -1825,6 +1842,8 @@ def db_fs_user_tickets_total(bot_id: int, user_id: int) -> int:
 
 # ── Еженедельное обслуживание БД (долгий срок) ────────────────
 BACKUPS_TO_KEEP = 4
+DAILY_BACKUPS_TO_KEEP = 7
+_backup_lock = threading.Lock()
 
 def db_maintenance():
     """Чистка служебных таблиц, которые иначе растут месяцами:
@@ -1852,11 +1871,17 @@ def db_maintenance():
         c.close()
 
 def db_backup(dest_dir: str) -> str:
-    """Онлайн-бэкап через sqlite3 backup API (безопасен при живых соединениях).
-    Возвращает путь к файлу. Старые бэкапы: остаются BACKUPS_TO_KEEP шт."""
+    """Семь ежедневных копий плюс четыре последних текущих"""
+    with _backup_lock:
+        return _db_backup(dest_dir)
+
+
+def _db_backup(dest_dir):
     import glob as _glob
+    import shutil
     os.makedirs(dest_dir, exist_ok=True)
-    stamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    now = datetime.utcnow()
+    stamp = now.strftime('%Y%m%d_%H%M%S_%f')
     dest_path = os.path.join(dest_dir, f'spambots_{stamp}.db')
     src = sqlite3.connect(DB_PATH, timeout=15)
     dst = sqlite3.connect(dest_path)
@@ -1871,11 +1896,20 @@ def db_backup(dest_dir: str) -> str:
         except Exception:
             pass
         src.close()
-    # ротация: оставляем последние BACKUPS_TO_KEEP
-    backups = sorted(_glob.glob(os.path.join(dest_dir, 'spambots_*.db')))
+    daily = os.path.join(dest_dir, f'spambots_daily_{now:%Y%m%d}.db')
+    if not os.path.exists(daily):
+        shutil.copyfile(dest_path, daily + '.tmp')
+        os.replace(daily + '.tmp', daily)
+    backups = sorted(p for p in _glob.glob(os.path.join(dest_dir, 'spambots_*.db'))
+                     if not os.path.basename(p).startswith('spambots_daily_'))
     for old in backups[:-BACKUPS_TO_KEEP]:
         try:
             os.remove(old)
         except OSError:
             pass
+    cutoff = (now - timedelta(days=DAILY_BACKUPS_TO_KEEP-1)).strftime('%Y%m%d')
+    for old in _glob.glob(os.path.join(dest_dir, 'spambots_daily_*.db')):
+        if os.path.basename(old)[len('spambots_daily_'):-3] < cutoff:
+            try: os.remove(old)
+            except OSError: pass
     return dest_path

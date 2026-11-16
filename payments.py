@@ -146,6 +146,8 @@ def reconcile_payments(main_bot):
                     paid = claim_ton_transfer(uid, invoice_id, found)
             if paid:
                 count += 1
+                order = db_get_payment(uid, invoice_id, provider)
+                if order['receipt'].get('setup_grant'): order['bot_id'] = None
                 from keyboards import TE_CHECK, _btn
                 from telebot.types import InlineKeyboardMarkup
                 kb = InlineKeyboardMarkup()

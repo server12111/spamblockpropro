@@ -297,10 +297,11 @@ from unittest.mock import patch
 sys.modules['dotenv']=types.SimpleNamespace(load_dotenv=lambda *a,**k:None)
 import database as db, purchased_bot as pb, telebot
 db.DB_PATH=sys.argv[1];bid=int(sys.argv[2]);kind=sys.argv[3]
-bot=telebot.TeleBot(os.environ['BOT_TOKEN'],threaded=False)
+token=db.db_get_bot_info(bid)[0]
+bot=telebot.TeleBot(token,threaded=False)
 bot.get_me=lambda:types.SimpleNamespace(id=999)
 with patch.object(telebot,'TeleBot',return_value=bot),patch.object(pb,'register_forum_support'):
-    bot=pb.make_purchased_bot(bid,os.environ['BOT_TOKEN'],777)
+    bot=pb.make_purchased_bot(bid,token,777)
 needle='INSERT INTO withdrawal_requests' if kind=='withdraw' else 'UPDATE bots SET expires_at'
 original=db._CachedConn.execute
 def execute(conn,sql,*a,**kw):

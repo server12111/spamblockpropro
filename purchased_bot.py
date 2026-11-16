@@ -61,6 +61,21 @@ def _serialize_lifecycle(fn):
             return fn(*args, **kwargs)
     return call
 
+
+def _outside_telegram_worker(fn):
+    """Остановка ждёт workers: действия с lifecycle lock исполняются вне их пула"""
+    @wraps(fn)
+    def call(*args, **kwargs):
+        if isinstance(threading.current_thread(), telebot.util.WorkerThread):
+            def run():
+                try: fn(*args, **kwargs)
+                except Exception: log.exception('Не удалось обработать действие с подпиской')
+            threading.Thread(target=run,
+                             name='bot-lifecycle', daemon=True).start()
+            return
+        return fn(*args, **kwargs)
+    return call
+
 def _is_rate_limited(bot_id: int, user_id: int) -> bool:
     """Единый rate limit (кэш и логика в forum_support.rate_limited)."""
     return rate_limited(bot_id, user_id, mark=True)
@@ -259,33 +274,38 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
     pstate = DBState(db_bot_id)
     protect_text_lengths(pbot)
     flow_lock = threading.RLock()
-    faq_input = {}
+    def _faq_pending(uid):
+        value, revision = pstate.snapshot(uid)
+        if not isinstance(value, dict) or value.get('step') != 'faq_input': return None
+        return dict(value, _revision=revision)
 
-    def _commit_input(uid, expected, save, revision=None, next_faq=None):
+    def _commit_input(uid, expected, save, revision=None, next_faq=None, next_state=None):
         """Проверка актуальности и запись не могут перемежаться с отменой ввода"""
         with flow_lock:
             if revision is not None:
                 if pstate.snapshot(uid)[1] != revision: return False
-            elif faq_input.get(uid) is not expected:
-                return False
+            else:
+                revision = expected.get('_revision') if expected else None
+                if revision is None or pstate.snapshot(uid)[1] != revision: return False
             save()
-            if revision is not None: pstate.finish(uid, revision)
-            elif next_faq is not None: faq_input[uid] = next_faq
-            else: faq_input.pop(uid, None)
+            if next_faq is not None:
+                pstate.transition(uid, revision, dict(next_faq, step='faq_input'))
+            elif next_state is not None:
+                pstate.transition(uid, revision, next_state)
+            else:
+                pstate.finish(uid, revision)
             return True
 
     def _set_flow(uid, state, revision=None):
         with flow_lock:
             if revision is not None and not pstate.transition(uid, revision, state):
                 return False
-            faq_input.pop(uid, None)
             if revision is None:
                 pstate[uid] = state
             return True
 
     def _reset_flow(uid):
         with flow_lock:
-            faq_input.pop(uid, None)
             state = pstate.pop(uid, None)
             return state
 
@@ -294,8 +314,6 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         # стереть новый диалог, даже если заново выбран тот же адресат
         with flow_lock:
             state = pstate.take(uid, lambda v: isinstance(v, str) and v.startswith(prefix))
-            if state is not None:
-                faq_input.pop(uid, None)
             return state
 
     def _edit(text, chat_id, message_id, reply_markup=None, parse_mode='HTML'):
@@ -366,6 +384,19 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         else:
             pbot.send_message(event.chat.id, "Доступно только владельцу бота")
         return False
+
+    def _require_renewal(cb):
+        if not _require_owner(cb): return False
+        info = db_get_bot_info(db_bot_id)
+        if info[0].split(':', 1)[0] != token.split(':', 1)[0]:
+            pbot.answer_callback_query(cb.id, 'Этот бот больше не подключён', show_alert=True)
+            return False
+        from purchase_store import renewal_error
+        error = renewal_error(db_bot_id)
+        if error:
+            pbot.answer_callback_query(cb.id, error, show_alert=True)
+            return False
+        return True
 
     # ── Клавиатуры ─────────────────────────────────────
     def pk_start(show_admin: bool = False):
@@ -733,13 +764,13 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
     def faq_prompt(cb, action, node_id, expected=None, **values):
         prompts = {'add': 'Введи название кнопки (1–40 символов)',
                    'name': 'Введи новое название (1–40 символов)',
-                   'text': 'Введи текст раздела. Форматирование сохраняется',
-                   'new_text': 'Введи текст раздела или нажми «Пропустить». Форматирование сохраняется'}
+                   'text': 'Введи текст раздела\nФорматирование сохраняется',
+                   'new_text': 'Введи текст раздела или нажми «Пропустить»\nФорматирование сохраняется'}
         value = dict(action=action, node_id=node_id, **values)
         if expected is not None:
             if not _commit_input(cb.from_user.id, expected, lambda: None, next_faq=value): return
         else:
-            with flow_lock: faq_input[cb.from_user.id] = value
+            _set_flow(cb.from_user.id, dict(value, step='faq_input'))
         rows = [[('Отмена', f'fq_e_{node_id}_0')]]
         if action == 'new_text': rows.insert(0, [('Пропустить', f'fq_skip_{node_id}')])
         settings_show(cb, prompts[action], rows)
@@ -753,8 +784,8 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             node_id = int(parts[2]); page = int(parts[3]) if len(parts) == 4 else 0
         except ValueError: return
         if action != 'u' and not settings_access(cb): return
-        pending = faq_input.get(cb.from_user.id)
-        _reset_flow(cb.from_user.id)
+        pending = _faq_pending(cb.from_user.id)
+        if action != 'skip': _reset_flow(cb.from_user.id)
         if action in ('u', 'e', 'v'):
             faq_show(cb, node_id, page, action)
             return
@@ -769,7 +800,11 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                 faq_prompt(cb, action, node_id)
             elif action == 'skip':
                 if not pending or pending['action'] != 'new_text' or pending['node_id'] != node_id: return
-                new_id = db.db_faq_add(db_bot_id, node_id or None, pending['title'])
+                new_id = None
+                def save():
+                    nonlocal new_id
+                    new_id = db.db_faq_add(db_bot_id, node_id or None, pending['title'])
+                if not _commit_input(cb.from_user.id, pending, save): return
                 faq_show(cb, new_id, mode='e')
             elif action in ('up', 'down') and node:
                 db.db_faq_move(db_bot_id, node_id, -1 if action == 'up' else 1)
@@ -793,13 +828,13 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
         cb = SimpleNamespace(message=SimpleNamespace(chat=m.chat, message_id=sent.message_id))
         faq_show(cb, node_id, mode='e')
 
-    @pbot.message_handler(func=lambda m: m.from_user.id in faq_input
-                         and pstate.get(m.from_user.id) is None and not m.reply_to_message
+    @pbot.message_handler(func=lambda m: _faq_pending(m.from_user.id) is not None and not m.reply_to_message
                          and (m.text or '').split(' ', 1)[0].split('@', 1)[0]
                          not in ('/start', '/admin', '/status', '/templates'))
     def faq_save_input(m):
         if not settings_access(m): return
-        state = faq_input.get(m.from_user.id)
+        state = _faq_pending(m.from_user.id)
+        if state is None: return
         action, node_id = state['action'], state['node_id']
         try:
             if action in ('add', 'name'):
@@ -1170,11 +1205,11 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                                          and pstate[m.from_user.id].startswith('await_add_tpl_'))
     def p_save_template(m):
         if not is_admin(m.from_user.id): return
-        state = _take_flow(m.from_user.id, 'await_add_tpl_')
-        if state is None: return
+        state, revision = pstate.snapshot(m.from_user.id)
+        if not isinstance(state, str) or not state.startswith('await_add_tpl_'): return
         target = int(state.split('_')[-1])
-        _set_flow(m.from_user.id, f'await_reply_{target}')
-        db_add_template(db_bot_id, m.text)
+        if not _commit_input(m.from_user.id, state, lambda: db_add_template(db_bot_id, m.text),
+                             revision, next_state=f'await_reply_{target}'): return
         fs_refresh_management(pbot, db_bot_id)
         pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Шаблон сохранён</b>",
             parse_mode='HTML', reply_markup=pk_reply_input_with_templates(target))
@@ -1536,20 +1571,21 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                                          and pstate[m.from_user.id].get('step') == 'p_await_ton_address')
     def p_save_ton_address(m):
         if not _require_owner(m): return
-        address = m.text.strip()
+        s, revision = pstate.snapshot(m.from_user.id)
+        if not isinstance(s, dict) or s.get('step') != 'p_await_ton_address': return
+        address = (m.text or '').strip()
         if not (32 <= len(address) <= 128):
             pbot.send_message(m.chat.id, f"<b>{TE_CROSS}  Неверный TON-адрес. Попробуй ещё раз:</b>",
                 parse_mode='HTML')
             return
-        s = pstate[m.from_user.id]
         s['address'] = address
         s['step'] = 'p_await_withdraw_amount'
         s['operation_key'] = uuid.uuid4().hex
-        _set_flow(m.from_user.id, s)
+        if not _set_flow(m.from_user.id, s, revision): return
         balance = s['balance']
         pbot.send_message(m.chat.id,
-            f"<b>{TE_MONEY} Адрес принят.</b>\n\n"
-            f"Введи сумму для вывода (USDT) или отправь <code>всё</code> чтобы вывести весь баланс.\n\n"
+            f"<b>{TE_MONEY} Адрес принят</b>\n\n"
+            f"Введи сумму вывода в USDT или отправь <code>всё</code>\n\n"
             f"Доступно: <b>{balance:.4f} USDT</b>",
             parse_mode='HTML', reply_markup=pk_back_admin())
 
@@ -1581,6 +1617,9 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             if wr_id is None:
                 pbot.send_message(m.chat.id, f'{TE_CROSS} Недостаточно средств или заявка уже создана', parse_mode='HTML')
                 return
+        except ValueError as e:
+            pbot.send_message(m.chat.id, str(e), reply_markup=pk_back_admin())
+            return
         except Exception as e:
             log.warning(f'withdrawal create failed bot#{db_bot_id}: {e}')
             pbot.send_message(m.chat.id,
@@ -1615,7 +1654,7 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
 
     @pbot.callback_query_handler(func=lambda c: c.data == 'p_renew_balance')
     def p_renew_balance_cb(cb):
-        if not _require_owner(cb): return
+        if not _require_renewal(cb): return
         balance, _ = db_get_bot_earnings(db_bot_id)
         if balance <= 0:
             pbot.answer_callback_query(cb.id, "❌ Баланс равен нулю", show_alert=True)
@@ -1657,9 +1696,10 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             parse_mode='HTML', reply_markup=kb)
 
     @pbot.callback_query_handler(func=lambda c: c.data.startswith('p_renew_bal_'))
+    @_outside_telegram_worker
     @_serialize_lifecycle
     def p_renew_bal_cb(cb):
-        if not _require_owner(cb): return
+        if not _require_renewal(cb): return
         from database import get_price as _get_price
         balance, _ = db_get_bot_earnings(db_bot_id)
         price = _get_price()
@@ -1684,6 +1724,9 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             info = db_get_bot_info(db_bot_id)
             if info and info[0] not in running_bots:
                 launch_bot(db_bot_id, info[0], info[1], main_bot)
+        except ValueError as e:
+            pbot.answer_callback_query(cb.id, str(e), show_alert=True)
+            return
         except Exception as e:
             log.warning(f'p_renew_bal renew failed bot#{db_bot_id}: {e}')
             pbot.answer_callback_query(cb.id,

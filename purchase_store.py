@@ -12,6 +12,7 @@ def _conn():
 def purchase_context(value):
     value = value if isinstance(value, dict) else {}
     target = value.get('bot_id') if value.get('step') == 'renewing' or value.get('renewing') else None
+    if value.get('receipt', {}).get('setup_grant'): target = None
     return target, value.get('via_bot_id')
 
 
@@ -20,6 +21,8 @@ def db_set_pending(user_id, invoice_id, *, context=None, amount=None,
     target, via = purchase_context(context)
     c = _conn()
     try:
+        c.execute('BEGIN IMMEDIATE')
+        if target: require_renewable(c, target, user_id)
         c.execute('INSERT OR IGNORE INTO payment_orders '
                   '(provider, invoice_id, user_id, amount, target_bot_id, via_bot_id, expires_at, expected_ton) '
                   'VALUES (?,?,?,?,?,?,?,?)',
@@ -76,10 +79,25 @@ def _grant(c, user_id, days):
     _sync_grants(c, user_id)
 
 
+def require_renewable(c, bot_id, user_id=None):
+    row = c.execute('SELECT expires_at, deleted, owner_id, admin_id FROM bots WHERE id=?', (bot_id,)).fetchone()
+    if not row: raise ValueError('Бот не найден')
+    if row[1]: raise ValueError('Бот удалён, продление недоступно')
+    if user_id is not None and user_id not in row[2:]: raise ValueError('Этот бот тебе недоступен')
+    return row
+
+
+def renewal_error(bot_id, user_id=None):
+    c = _conn()
+    try:
+        require_renewable(c, bot_id, user_id)
+    except ValueError as exc:
+        return str(exc)
+    finally: c.close()
+
+
 def renew_in_transaction(c, bot_id, days):
-    row = c.execute('SELECT expires_at FROM bots WHERE id=?', (bot_id,)).fetchone()
-    if not row:
-        raise ValueError('Bot missing')
+    row = require_renewable(c, bot_id)
     try:
         current = datetime.fromisoformat(str(row[0]))
     except (ValueError, TypeError):
@@ -89,13 +107,20 @@ def renew_in_transaction(c, bot_id, days):
     return expires
 
 
-def _apply_purchase(c, user_id, days, target=None, via=None, amount=None):
+def _apply_purchase(c, user_id, days, target=None, via=None, amount=None, paid_order=False):
     receipt = {}
     if target:
-        row = c.execute('SELECT owner_id, admin_id FROM bots WHERE id=?', (target,)).fetchone()
-        if not row or user_id not in row:
-            raise ValueError('Purchase target denied')
-        renew_in_transaction(c, target, days)
+        if paid_order:
+            row = c.execute('SELECT deleted FROM bots WHERE id=?', (target,)).fetchone()
+            if not row or row[0]:
+                _grant(c, user_id, days)
+                receipt['setup_grant'] = True
+            else:
+                # Доступ проверен при привязке счёта, передача роли не отменяет оплату
+                renew_in_transaction(c, target, days)
+        else:
+            require_renewable(c, target, user_id)
+            renew_in_transaction(c, target, days)
     else:
         _grant(c, user_id, days)
     if amount is None:
@@ -138,7 +163,7 @@ def db_claim_pending_payment(user_id, invoice_id, *, paid_amount=None, provider=
                                      (tx_hash, user_id)).rowcount:
             return False
         amount = paid_amount if paid_amount is not None else row[0]
-        receipt = _apply_purchase(c, user_id, 30, target=row[1], via=row[2], amount=amount)
+        receipt = _apply_purchase(c, user_id, 30, target=row[1], via=row[2], amount=amount, paid_order=True)
         c.execute('UPDATE payment_orders SET settled=1, receipt=? WHERE provider=? AND invoice_id=?',
                   (json.dumps(receipt), provider, str(invoice_id)))
         if provider == 'crypto':

@@ -600,6 +600,14 @@ def _save_pending_progress(bot_id: int, user_id: int, items: list, finish=False)
         progress = {it['mid']: it for it in items}
         merged = [progress.get(it['mid'], it) for it in json_loads(row[0])]
         if finish:
+            # После возобновления отправитель мог снова попасть в fallback
+            # Его новое подтверждение нельзя удалить результатом старого захвата
+            fallback = {r[0] for r in c.execute(
+                "SELECT message_id FROM delivery_queue WHERE bot_id=? AND user_id=? AND status='fallback'",
+                (bot_id, user_id))}
+            for it in merged:
+                if it.get('delivery_queue') and it['mid'] in fallback:
+                    it.pop('done', None)
             merged = [it for it in merged if not it.get('done')]
         if finish and not merged:
             c.execute('DELETE FROM fs_pending WHERE bot_id=? AND user_id=?', (bot_id, user_id))
@@ -2224,6 +2232,9 @@ def fs_weekly_report_text(bot_id: int, start_tz: datetime, end_tz: datetime) -> 
 @_group_guard
 def _publish_period(pbot, bot_id: int, chat_id: int, thread_stats,
                     start_tz: datetime, end_tz: datetime) -> None:
+    current = fs_get_group(bot_id)
+    if not current or current[1] != chat_id: return
+    thread_stats = current[3]
     ps_key = start_tz.strftime('%Y-%m-%d')
     pe_key = end_tz.strftime('%Y-%m-%d')
     row = fs_report_get(bot_id, ps_key)
@@ -2280,6 +2291,7 @@ def publish_due_reports(pbot_map: dict) -> int:
 
 def _weekly_loop():
     from purchased_bot import running_bot_ids, running_bots
+    maintained_week = None
     while True:
         try:
             now = _now_tz()
@@ -2295,10 +2307,13 @@ def _weekly_loop():
         except Exception:
             log.exception('weekly scheduler loop error')
             time.sleep(120)
-        # еженедельное обслуживание БД сразу после публикации отчётов
+        # Текущая копия каждые 30 минут, ежедневные хранит db_backup
         try:
             from database import db_maintenance, db_backup, DATA_DIR
-            db_maintenance()
+            week = _now_tz().strftime('%G-%V')
+            if week != maintained_week:
+                db_maintenance()
+                maintained_week = week
             db_backup(os.path.join(DATA_DIR, 'backups'))
         except Exception:
             log.exception('db maintenance failed')
