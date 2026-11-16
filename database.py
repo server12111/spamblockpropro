@@ -6,6 +6,7 @@ import threading
 import time
 import weakref
 import math
+import uuid
 from datetime import datetime, timedelta
 from config import PRICE_USDT
 
@@ -484,6 +485,24 @@ def init_db():
             PRIMARY KEY (bot_id, period_start)
         );
     ''')
+    conn.execute('CREATE TABLE IF NOT EXISTS balance_operations ('
+                 'bot_id INTEGER, operation_key TEXT, result TEXT NOT NULL, PRIMARY KEY(bot_id,operation_key))')
+    conn.executescript('''
+        CREATE TABLE IF NOT EXISTS service_broadcasts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, creator INTEGER NOT NULL, chat_id INTEGER NOT NULL,
+            scope TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', payload TEXT NOT NULL DEFAULT '[]',
+            updated_at REAL NOT NULL, notified INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS service_recipients (
+            job_id INTEGER NOT NULL, user_id INTEGER NOT NULL, bot_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', next_at REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY(job_id,user_id));
+        CREATE TABLE IF NOT EXISTS service_files (
+            job_id INTEGER NOT NULL, source_id TEXT NOT NULL, name TEXT NOT NULL, data BLOB NOT NULL,
+            PRIMARY KEY(job_id,source_id));
+        CREATE TABLE IF NOT EXISTS service_file_ids (
+            job_id INTEGER NOT NULL, bot_id INTEGER NOT NULL, source_id TEXT NOT NULL, file_id TEXT NOT NULL,
+            PRIMARY KEY(job_id,bot_id,source_id));
+    ''')
     conn.commit()
     # Миграции для старых схем (безопасны и повторяемы)
     for stmt in [
@@ -497,6 +516,7 @@ def init_db():
         'ALTER TABLE bot_users ADD COLUMN first_contact_at TIMESTAMP',
         'ALTER TABLE bot_users ADD COLUMN contact_count INTEGER DEFAULT 0',
         'ALTER TABLE states ADD COLUMN updated_at TIMESTAMP',
+        "ALTER TABLE states ADD COLUMN revision TEXT DEFAULT ''",
         'ALTER TABLE fs_groups ADD COLUMN thread_mgmt INTEGER',
         'ALTER TABLE fs_groups ADD COLUMN mgmt_msg_id INTEGER',
         'ALTER TABLE fs_groups ADD COLUMN mgmt_wait_admin INTEGER',
@@ -505,6 +525,7 @@ def init_db():
         'ALTER TABLE fs_pending ADD COLUMN claim_session TEXT',
         'ALTER TABLE support_notifications ADD COLUMN stage INTEGER NOT NULL DEFAULT 0',
         'ALTER TABLE payment_orders ADD COLUMN expected_ton REAL',
+        'ALTER TABLE payment_orders ADD COLUMN next_check REAL NOT NULL DEFAULT 0',
         "ALTER TABLE payment_orders ADD COLUMN receipt TEXT DEFAULT '{}'",
     ]:
         try:
@@ -767,7 +788,16 @@ def db_faq_get(bot_id, node_id):
         c.close()
 
 
+FAQ_TEXT_LIMIT = 3847  # 4096 минус 40*6 на название, <b></b> и два перевода строки
+
+
+def validate_faq_text(text):
+    if len(text.encode('utf-16-le')) // 2 > FAQ_TEXT_LIMIT:
+        raise ValueError(f'Текст раздела — не больше {FAQ_TEXT_LIMIT} символов')
+
+
 def db_faq_add(bot_id, parent_id, title, text=''):
+    validate_faq_text(text)
     if not 1 <= len(title.strip()) <= 40:
         raise ValueError('Название должно содержать от 1 до 40 символов')
     c = _conn()
@@ -794,6 +824,7 @@ def db_faq_add(bot_id, parent_id, title, text=''):
 
 
 def db_faq_edit(bot_id, node_id, field, value):
+    if field == 'text': validate_faq_text(value)
     if field not in ('title', 'text'): raise ValueError('Неизвестное поле')
     if field == 'title' and not 1 <= len(value.strip()) <= 40:
         raise ValueError('Название должно содержать от 1 до 40 символов')
@@ -979,10 +1010,17 @@ def db_update_bot_username(bot_id: int, username: str):
     c.execute('UPDATE bots SET username=? WHERE id=?', (username or '', bot_id))
     c.commit(); c.close()
 
-def db_deactivate_bot(bot_id: int):
+def db_deactivate_bot(bot_id: int, expected_expires=None):
     c = _conn()
-    c.execute('UPDATE bots SET active=0 WHERE id=?', (bot_id,))
-    c.commit(); c.close()
+    try:
+        if expected_expires is None:
+            cur = c.execute('UPDATE bots SET active=0 WHERE id=?', (bot_id,))
+        else:
+            cur = c.execute('UPDATE bots SET active=0 WHERE id=? AND expires_at=?', (bot_id, expected_expires))
+        c.commit()
+        return cur.rowcount > 0
+    finally:
+        c.close()
 
 def db_get_bot_info(bot_id: int):
     """Returns (token, admin_id, owner_id, created_at) or None."""
@@ -1206,9 +1244,9 @@ def set_price(price: float):
 # ── Persistent States ─────────────────────────────────
 def db_set_state(bot_id: int, user_id: int, value):
     c = _conn()
-    c.execute('INSERT OR REPLACE INTO states (bot_id, user_id, state, updated_at) '
-              'VALUES (?,?,?,?)',
-              (bot_id, user_id, json.dumps(value, ensure_ascii=False), _utc_now_str()))
+    c.execute('INSERT OR REPLACE INTO states (bot_id, user_id, state, updated_at, revision) '
+              'VALUES (?,?,?,?,?)',
+              (bot_id, user_id, json.dumps(value, ensure_ascii=False), _utc_now_str(), uuid.uuid4().hex))
     c.commit(); c.close()
 
 def db_get_state(bot_id: int, user_id: int):
@@ -1230,6 +1268,24 @@ class DBState:
         val = db_get_state(self.bot_id, user_id)
         return val if val is not None else default
 
+    def snapshot(self, user_id):
+        c = _conn()
+        try:
+            row = c.execute('SELECT state,revision FROM states WHERE bot_id=? AND user_id=?',
+                            (self.bot_id, user_id)).fetchone()
+            return (json.loads(row[0]), row[1]) if row else (None, None)
+        finally: c.close()
+
+    def finish(self, user_id, revision):
+        """Завершение долгой проверки не удаляет более новый ввод даже с тем же содержимым"""
+        c = _conn()
+        try:
+            cur = c.execute('DELETE FROM states WHERE bot_id=? AND user_id=? AND revision=?',
+                            (self.bot_id, user_id, revision))
+            c.commit()
+            return bool(cur.rowcount)
+        finally: c.close()
+
     def __setitem__(self, user_id: int, value):
         db_set_state(self.bot_id, user_id, value)
 
@@ -1240,9 +1296,23 @@ class DBState:
         return val
 
     def pop(self, user_id: int, default=None):
-        val = db_get_state(self.bot_id, user_id)
-        db_del_state(self.bot_id, user_id)
-        return val if val is not None else default
+        return self.take(user_id, default=default)
+
+    def take(self, user_id, predicate=lambda value: True, default=None):
+        """Захват до сетевого вызова не стирает следующий диалог"""
+        c = _conn()
+        try:
+            c.execute('BEGIN IMMEDIATE')
+            row = c.execute('SELECT state FROM states WHERE bot_id=? AND user_id=?',
+                            (self.bot_id, user_id)).fetchone()
+            value = json.loads(row[0]) if row else None
+            if row and predicate(value):
+                c.execute('DELETE FROM states WHERE bot_id=? AND user_id=?', (self.bot_id, user_id))
+                c.commit()
+                return value
+            return default
+        finally:
+            c.close()
 
     def __contains__(self, user_id: int):
         return db_get_state(self.bot_id, user_id) is not None
@@ -1528,12 +1598,56 @@ def db_claim_withdrawal(wr_id: int, status: str) -> bool:
     Защита от двойного confirm/reject двумя обработчиками."""
     c = _conn()
     try:
+        c.execute('BEGIN IMMEDIATE')
+        row = c.execute("SELECT bot_id,usdt_amount FROM withdrawal_requests WHERE id=? AND status='pending'",
+                        (wr_id,)).fetchone()
+        if not row:
+            return False
         cur = c.execute("UPDATE withdrawal_requests SET status=? WHERE id=? AND status='pending'",
                         (status, wr_id))
+        if status == 'rejected':
+            c.execute('INSERT INTO bot_earnings(bot_id,balance_usdt) VALUES(?,?) '
+                      'ON CONFLICT(bot_id) DO UPDATE SET balance_usdt=balance_usdt+excluded.balance_usdt', row)
         c.commit()
         return cur.rowcount > 0
     except Exception:
         c.rollback(); raise
+    finally:
+        c.close()
+
+
+def db_spend_balance(bot_id, owner_id, amount, operation_key, *, address=None, days=None, state=None):
+    """Списание, результат и ключ повтора фиксируются одной транзакцией"""
+    if not math.isfinite(amount) or amount <= 0:
+        raise ValueError('Неверная сумма')
+    c = _conn()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        row = c.execute('SELECT owner_id FROM bots WHERE id=?', (bot_id,)).fetchone()
+        if not row or row[0] != owner_id:
+            raise ValueError('Доступно только владельцу бота')
+        previous = c.execute('SELECT result FROM balance_operations WHERE bot_id=? AND operation_key=?',
+                             (bot_id, operation_key)).fetchone()
+        if previous:
+            return json.loads(previous[0])
+        if state is not None:
+            current = c.execute('SELECT state FROM states WHERE bot_id=? AND user_id=?', (bot_id, owner_id)).fetchone()
+            if not current or json.loads(current[0]) != state:
+                return None
+        if not c.execute('UPDATE bot_earnings SET balance_usdt=balance_usdt-? '
+                         'WHERE bot_id=? AND balance_usdt>=?', (amount, bot_id, amount)).rowcount:
+            return None
+        if days is not None:
+            result = renew_in_transaction(c, bot_id, days).isoformat()
+        else:
+            result = c.execute('INSERT INTO withdrawal_requests(bot_id,owner_id,ton_address,usdt_amount) '
+                               'VALUES(?,?,?,?)', (bot_id, owner_id, address, amount)).lastrowid
+        c.execute('INSERT INTO balance_operations(bot_id,operation_key,result) VALUES(?,?,?)',
+                  (bot_id, operation_key, json.dumps(result)))
+        if state is not None:
+            c.execute('DELETE FROM states WHERE bot_id=? AND user_id=?', (bot_id, owner_id))
+        c.commit()
+        return result
     finally:
         c.close()
 

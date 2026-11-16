@@ -1,5 +1,7 @@
 import requests
 import safe_logging
+import database as db
+from purchase_store import db_get_payment, db_claim_pending_payment, claim_ton_transfer
 import time
 import threading
 import logging
@@ -71,23 +73,16 @@ def ton_payment_link(ton_amount: float, payment_code: str) -> str:
     nanotons = int(ton_amount * 1_000_000_000)
     return f"https://app.tonkeeper.com/transfer/{TON_WALLET}?amount={nanotons}&text={payment_code}"
 
-def ton_check_transfer(user_id: int, expected_ton: float, payment_code: str, *, return_tx=False):
+def ton_check_transfer(user_id: int, expected_ton: float, payment_code: str, *, return_tx=False, expires_at=None):
     # Lock гарантує що два одночасних кліки "Перевірити" не зарахують одну транзакцію двічі
     with _ton_check_lock:
         try:
-            r = requests.get('https://toncenter.com/api/v2/getTransactions', params={
-                'address': TON_WALLET,
-                'limit':   50,
-                'api_key': TONCENTER_KEY,
-            }, timeout=15)
-            data = r.json()
-            if not data.get('ok'): return False
-
-            now      = time.time()
+            # Срок ограничивает дату перевода; оплата вовремя доступна и после перезапуска
+            end = expires_at if expires_at is not None else time.time()
+            start = end - 7200
             min_nano = int(expected_ton * 1_000_000_000 * 0.95)
-
-            for tx in data.get('result', []):
-                if now - tx.get('utime', 0) > 7200: continue
+            for tx in _ton_transactions(start):
+                if not start <= tx.get('utime', 0) <= end: continue
                 in_msg  = tx.get('in_msg', {})
                 value   = int(in_msg.get('value', 0))
                 if value < min_nano: continue
@@ -99,10 +94,87 @@ def ton_check_transfer(user_id: int, expected_ton: float, payment_code: str, *, 
                 tx_hash = tx.get('transaction_id', {}).get('hash', '')
                 if not tx_hash or db_is_tx_used(tx_hash): continue
                 if return_tx:
-                    return {'tx_hash': tx_hash, 'ton_amount': value / 1_000_000_000}
+                    return {'tx_hash': tx_hash, 'ton_amount': value / 1_000_000_000, 'utime': tx['utime']}
                 db_mark_tx_used(tx_hash, user_id)
                 return True
             return False
         except Exception as e:
             log.error(f'ton_check_transfer error: {e}')
             return False
+
+
+def _ton_transactions(start):
+    params = dict(address=TON_WALLET, limit=50, api_key=TONCENTER_KEY, archival=True)
+    cursors = set()
+    while True:
+        data = requests.get('https://toncenter.com/api/v2/getTransactions', params=dict(params), timeout=15).json()
+        if not data.get('ok'):
+            return
+        rows = data.get('result') or []
+        for tx in rows:
+            yield tx
+        if not rows or min(tx.get('utime', 0) for tx in rows) < start:
+            return
+        cursor = data.get('previous_transaction') or rows[-1].get('transaction_id', {})
+        key = (cursor.get('lt'), cursor.get('hash'))
+        if not all(key) or key in cursors or (len(rows) < 50 and not data.get('previous_transaction')):
+            return
+        cursors.add(key)
+        params.update(lt=key[0], hash=key[1])
+
+
+def reconcile_payments(main_bot):
+    """Проверка всех сохранённых счетов независимо от текущего экрана пользователя"""
+    c = db._conn()
+    try:
+        rows = c.execute('SELECT provider,invoice_id,user_id FROM payment_orders '
+                         'WHERE settled=0 AND next_check<=? ORDER BY next_check LIMIT 100', (time.time(),)).fetchall()
+    finally: c.close()
+    count = 0
+    for provider, invoice_id, uid in rows:
+        paid = False
+        try:
+            order = db_get_payment(uid, invoice_id, provider)
+            if provider == 'crypto':
+                invoice = cb_check_invoice(invoice_id)
+                if invoice and invoice.get('status') == 'paid':
+                    paid = db_claim_pending_payment(uid, invoice_id, paid_amount=invoice.get('amount') or order['amount'])
+            else:
+                found = ton_check_transfer(uid, order['ton'], invoice_id, return_tx=True, expires_at=order['expires_at'])
+                if found:
+                    paid = claim_ton_transfer(uid, invoice_id, found)
+            if paid:
+                count += 1
+                from keyboards import TE_CHECK, _btn
+                from telebot.types import InlineKeyboardMarkup
+                kb = InlineKeyboardMarkup()
+                kb.add(_btn('Купить бота', icon='💎', callback_data='buy_bot'))
+                if order['bot_id']:
+                    from purchased_bot import launch_bot, _lifecycle_lock
+                    with _lifecycle_lock:
+                        info = db.db_get_bot_info(order['bot_id'])
+                        if info: launch_bot(order['bot_id'], info[0], info[1], main_bot)
+                try:
+                    main_bot.send_message(uid, f'{TE_CHECK} Оплата зачтена' if order['bot_id'] else
+                        f'{TE_CHECK} Оплата зачтена, можно подключить бота', parse_mode='HTML',
+                        reply_markup=None if order['bot_id'] else kb)
+                except Exception: pass
+        except Exception:
+            log.exception('Не удалось проверить сохранённый счёт')
+        finally:
+            c = db._conn()
+            try:
+                c.execute('UPDATE payment_orders SET next_check=? WHERE provider=? AND invoice_id=?',
+                          (time.time() + (60 if paid or provider == 'crypto' else 300), provider, invoice_id))
+                c.commit()
+            finally: c.close()
+    return count
+
+
+def start_payment_checker(main_bot):
+    def run():
+        while True:
+            try: reconcile_payments(main_bot)
+            except Exception: log.exception('Проверка сохранённых счетов прервана')
+            time.sleep(30)
+    threading.Thread(target=run, name='payment-checker', daemon=True).start()

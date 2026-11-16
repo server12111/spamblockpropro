@@ -21,6 +21,7 @@ import logging
 import os
 import random
 import sqlite3
+from functools import wraps
 import threading
 import time
 import uuid
@@ -48,7 +49,6 @@ log = logging.getLogger(__name__)
 TICKET_GAP_SEC = 6 * 3600                              # пауза между сообщениями, открывающая новое обращение
 PENDING_MAX = 20                                       # максимум сообщений в очереди подтверждения
 TOPIC_NAME_LIMIT = 128                                 # лимит Telegram на название темы
-ADMIN_TTL = 30                                         # TTL кэша списка админов (сек)
 
 # ── Единый rate limit (используется и purchased_bot._is_rate_limited) ──
 # RATE_LIMIT_SEC импортируется из config (FS_RATE_LIMIT, по умолчанию 3 сек)
@@ -105,11 +105,35 @@ def fs_get_group_by_chat(chat_id: int):
                     (chat_id,)).fetchone()
     c.close(); return row
 
+def _group_guard(fn):
+    @wraps(fn)
+    def call(*args, **kwargs):
+        bot_id = kwargs['bot_id'] if 'bot_id' in kwargs else args[0 if fn.__name__ in ('fs_bind_group', 'fs_unbind_group') else 1]
+        with _mgmt_lock(bot_id):
+            return fn(*args, **kwargs)
+    return call
+
+
+def _require_current_group(bot_id, row):
+    current = fs_get_group(bot_id)
+    if not current or current[1] != row[1]:
+        from delivery_queue import RetryDelivery, current_sender
+        if current_sender() is not None:
+            raise RetryDelivery(0)
+        raise RuntimeError('Support group changed')
+
+
+@_group_guard
 def fs_bind_group(bot_id: int, chat_id: int, title: str):
     """Привязка группы. Повторная привязка тем же ботом обновляет запись;
     конфликт chat_id с другим ботом → IntegrityError (защита на уровне БД)."""
     c = _conn()
     try:
+        c.execute('BEGIN IMMEDIATE')
+        old = c.execute('SELECT chat_id FROM fs_groups WHERE bot_id=?', (bot_id,)).fetchone()
+        if old and old[0] != chat_id:
+            for table in ('fs_groups', 'fs_topics', 'fs_msgs', 'delivery_sources'):
+                c.execute(f'DELETE FROM {table} WHERE bot_id=?', (bot_id,))
         c.execute('INSERT INTO fs_groups (bot_id, chat_id, title) VALUES (?,?,?) '
                   'ON CONFLICT(bot_id) DO UPDATE SET chat_id=excluded.chat_id, '
                   'title=excluded.title', (bot_id, chat_id, title or ''))
@@ -122,6 +146,7 @@ def fs_set_stats_thread(bot_id: int, thread_id: int):
     c.execute('UPDATE fs_groups SET thread_stats=? WHERE bot_id=?', (thread_id, bot_id))
     c.commit(); c.close()
 
+@_group_guard
 def fs_unbind_group(bot_id: int):
     """Отвязка группы: темы и соответствия сообщений становятся неактуальными
     (thread_id действует только внутри своей группы), пользовательские данные
@@ -648,19 +673,8 @@ def fs_report_mark_sent(bot_id: int, period_start: str, message_id: int):
 
 
 # ── Кэш админов (TTL, ограничен числом ботов) ────────────────
-_admin_cache: dict = {}
-_admin_lock = threading.Lock()
-
 def fs_is_admin(bot_id: int, user_id: int) -> bool:
-    now = time.time()
-    with _admin_lock:
-        ent = _admin_cache.get(bot_id)
-        if ent and now - ent[0] < ADMIN_TTL:
-            return user_id in ent[1]
-    admins = db_get_bot_admins(bot_id)
-    with _admin_lock:
-        _admin_cache[bot_id] = (now, admins)
-    return user_id in admins
+    return user_id in db_get_bot_admins(bot_id)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -677,6 +691,8 @@ def _api(fn, *args, **kwargs):
         try:
             return fn(*args, **kwargs)
         except ApiTelegramException as e:
+            if 'not modified' in str(e).lower():
+                return True
             if e.error_code == 429 and attempts < 3:
                 try:
                     ra = int(e.result_json['parameters']['retry_after'])
@@ -876,8 +892,10 @@ def _ensure_pinned_info(pbot, bot_id: int, gid: int, thread: int, u, trow):
         log.warning(f'fs pin send bot#{bot_id} uid={u.id}: {e}')
 
 
+@_group_guard
 def fs_ensure_topic_info(pbot, bot_id: int, group_row, u) -> int:
     """Тема + закреплённая информация + актуальное название темы. → thread_id"""
+    _require_current_group(bot_id, group_row)
     with _topic_lock(bot_id, u.id):
         for attempt in range(2):
             thread = _get_or_create_topic(pbot, bot_id, group_row[1], u)
@@ -1032,9 +1050,11 @@ def _recover_topic(pbot, bot_id: int, gid: int, u, thread: int):
 def _is_topic_err(e) -> bool:
     return isinstance(e, ApiTelegramException) and _is_topic_gone(e)
 
+@_group_guard
 def _relay_to_topic(pbot, bot_id: int, group_row, u, from_chat, msg_id,
                     thread=None, reply_msg_id=None, src_msg=None):
     """Передача одного сообщения в тему пользователя с восстановлением темы."""
+    _require_current_group(bot_id, group_row)
     gid = group_row[1]
     tries = 0
     while True:
@@ -1051,10 +1071,12 @@ def _relay_to_topic(pbot, bot_id: int, group_row, u, from_chat, msg_id,
             _recover_topic(pbot, bot_id, gid, u, thread)
             thread = None
 
+@_group_guard
 def _relay_batch_to_topic(pbot, bot_id: int, group_row, u, from_chat, ids,
                           msgs=None, thread=None):
     """Передача альбома: copy_messages → forward_messages → пересборка
     медиагруппы → по одному. Возвращает только полный, однозначный результат."""
+    _require_current_group(bot_id, group_row)
     gid = group_row[1]
     tries = 0
     while True:
@@ -1146,11 +1168,15 @@ def _buffer_album(pbot, bot_id: int, gid: int, thread: int, m, confirm_kb=None):
     if t is None:
         _flush_album(pbot, bot_id, key)
 
+@_group_guard
 def _flush_album(pbot, bot_id: int, key):
     with _album_lock:
         buf = _album_buffers.pop(key, None)
     if not buf:
         return
+    from telegram_text import ordered_album
+    buf['ids'] = ordered_album(buf['ids'], key=int)
+    buf['msgs'] = ordered_album(buf['msgs'])
     uid = key[1]
     group = fs_get_group(bot_id)
     u = None
@@ -1236,6 +1262,7 @@ SERVICE_TYPES = {
     'paid_media',
 }
 
+@_group_guard
 def fs_handle_group_message(pbot, bot_id: int, m, bot_self_id: int, pstate) -> None:
     """Сообщения из привязанной группы:
     - код подтверждения подключения;
@@ -1384,12 +1411,18 @@ def _buffer_admin_album(pbot, bot_id: int, gid: int, target_uid: int,
     else:
         _flush_admin_album(pbot, bot_id, key)
 
+@_group_guard
 def _flush_admin_album(pbot, bot_id: int, key):
     with _admin_album_lock:
         buf = _admin_album_buffers.pop(key, None)
     if not buf:
         return
+    if buf.get('msgs'):
+        buf['ids'] = [m.message_id for m in buf['msgs'] if fs_is_admin(bot_id, m.from_user.id)]
+        if not buf['ids']: return
     target_uid, thread = key[1], buf['thread']
+    from telegram_text import ordered_album
+    buf['ids'] = ordered_album(set(buf['ids']), key=int)
     group = fs_get_group(bot_id)
     try:
         if not group or group[1] != buf['gid']:
@@ -1410,11 +1443,14 @@ def _flush_admin_album(pbot, bot_id: int, key):
                           f'{TE_EXCLAM} Не удалось доставить ответ: пользователь недоступен.')
         else:
             log.warning(f'admin album bot#{bot_id} → {target_uid}: {e}')
+            _topic_notice(pbot, buf['gid'], thread,
+                          f'{TE_EXCLAM} Не удалось доставить альбом, отправь ещё раз')
     except Exception as e:
         log.warning(f'admin album bot#{bot_id} → {target_uid}: {e}')
         _topic_notice(pbot, buf['gid'], thread,
-                      'Не удалось доставить альбом, попробуй ещё раз')
+                      f'{TE_EXCLAM} Не удалось доставить альбом, отправь ещё раз')
 
+@_group_guard
 def fs_pin_callback(pbot, bot_id: int, cb):
     """Любое действие закрепа ограничено ботом, группой, темой и админом."""
     parts = (cb.data or '').split('_')
@@ -1685,11 +1721,6 @@ def confirm_send(pbot, bot_id: int, cb) -> None:
     if not fs_get_pending(bot_id, uid):
         pbot.answer_callback_query(cb.id, 'Очередь пуста или уже отправляется')
         return
-    if rate_limited(bot_id, uid, mark=False):
-        pbot.answer_callback_query(cb.id,
-                                  f'⏳ Подожди {RATE_LIMIT_SEC} сек и нажми кнопку ещё раз',
-                                  show_alert=True)
-        return
     with _pending_activity_lock:
         items = None if (bot_id, uid) in _pending_active else fs_claim_pending(bot_id, uid)
         if items is not None:
@@ -1697,7 +1728,6 @@ def confirm_send(pbot, bot_id: int, cb) -> None:
     if items is None:
         pbot.answer_callback_query(cb.id, 'Уже отправляется')
         return
-    rate_limited(bot_id, uid, mark=True)
     ok = False
     try:
         ok = _deliver_pending_payload(pbot, bot_id, items, uid)
@@ -1717,7 +1747,7 @@ def confirm_send(pbot, bot_id: int, cb) -> None:
             except Exception:
                 pass
     else:
-        pbot.answer_callback_query(cb.id, '❌ Не удалось отправить, попробуй через минуту',
+        pbot.answer_callback_query(cb.id, '❌ Не получилось отправить, попробуй позже',
                                    show_alert=True)
 
 
@@ -1778,6 +1808,7 @@ def fs_verify_group(pbot, chat_id: int, uid: int, bot_self_id: int, bot_id: int 
                            f'(Bot #{other[0]}).')
     return True, ''
 
+@_group_guard
 def _finish_connect(pbot, bot_id: int, uid: int, chat_id: int, title: str, pstate):
     """Проверка + привязка группы + создание темы статистики."""
     if not _can_manage_group(bot_id, uid):
@@ -1794,8 +1825,15 @@ def _finish_connect(pbot, bot_id: int, uid: int, chat_id: int, title: str, pstat
             pass
         return
     old = fs_get_group(bot_id)
-    if old and old[1] != chat_id:
-        fs_unbind_group(bot_id)  # смена группы: старые темы/соответствия сбрасываются
+    # Подготовить тему до изменения привязки: сбой не уничтожает рабочую группу
+    try:
+        stats = old[3] if old and old[1] == chat_id else None
+        if not stats:
+            stats = _api(pbot.create_forum_topic, chat_id, '📊 Статистика').message_thread_id
+    except Exception as exc:
+        log.warning('stats topic create bot#%s: %s', bot_id, exc)
+        pbot.send_message(uid, f'{TE_CROSS} Не удалось подключить группу, попробуй ещё раз', parse_mode='HTML')
+        return
     try:
         fs_bind_group(bot_id, chat_id, title)
     except sqlite3.IntegrityError:
@@ -1805,22 +1843,7 @@ def _finish_connect(pbot, bot_id: int, uid: int, chat_id: int, title: str, pstat
         except Exception:
             pass
         return
-    # тема статистики
-    try:
-        t = _api(pbot.create_forum_topic, chat_id, '📊 Статистика')
-        fs_set_stats_thread(bot_id, t.message_thread_id)
-    except Exception as e:
-        fs_unbind_group(bot_id)
-        log.warning(f'stats topic create bot#{bot_id}: {e}')
-        try:
-            pbot.send_message(uid,
-                              f'{TE_CROSS} Группа подключена, но не удалось создать тему '
-                              f'«{TE_STATS} Статистика». Проверь право бота '
-                              '«управление темами» и попробуй ещё раз.',
-                              parse_mode='HTML')
-        except Exception:
-            pass
-        return
+    fs_set_stats_thread(bot_id, stats)
     fs_refresh_management(pbot, bot_id)
     pstate.pop(uid, None)
     try:
@@ -2105,6 +2128,7 @@ def _reaction_emoji(new_reaction: list) -> str:
             return em
     return '❤️'
 
+@_group_guard
 def fs_handle_reaction(pbot, bot_id: int, mr, bot_self_id: int) -> None:
     """Обрабатывает message_reaction: тема → уведомление в ЛС, ЛС → реакция в теме."""
     if not mr.new_reaction:

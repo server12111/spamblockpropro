@@ -6,6 +6,7 @@ import logging
 import math
 import re
 import json
+import uuid
 from html.parser import HTMLParser
 from datetime import timedelta, timezone
 import database as db
@@ -64,15 +65,12 @@ def _is_rate_limited(bot_id: int, user_id: int) -> bool:
 
 def _retry_send(send):
     """Лимит Telegram откладывает доставку, а не пропускает получателя"""
-    while True:
-        try:
-            send()
-            return True
-        except Exception as exc:
-            if getattr(exc, 'error_code', None) != 429:
-                return False
-            params = (getattr(exc, 'result_json', None) or {}).get('parameters', {})
-            time.sleep(max(1, float(params.get('retry_after', 1))))
+    from telegram_text import retry_telegram
+    try:
+        retry_telegram(send)
+        return True
+    except Exception:
+        return False
 
 
 def _safe_send(b, uid, text):
@@ -193,7 +191,17 @@ def matching_rules(bot_id, text, schedule=None):
 
 def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None):
     register_secret(token)
-    pbot   = telebot.TeleBot(token)
+    pbot = telebot.TeleBot(token)
+    try:
+        return _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot)
+    except BaseException:
+        _close_bot(pbot)
+        raise
+
+
+def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
+    from premium_emoji import protect_premium_emoji
+    protect_premium_emoji(pbot, db_bot_id)
     pstate = DBState(db_bot_id)
     protect_text_lengths(pbot)
     flow_lock = threading.RLock()
@@ -214,10 +222,9 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         # Забираем состояние ДО сетевого вызова: его завершение не может
         # стереть новый диалог, даже если заново выбран тот же адресат
         with flow_lock:
-            state = pstate.get(uid)
-            if not isinstance(state, str) or not state.startswith(prefix):
-                return None
-            _reset_flow(uid)
+            state = pstate.take(uid, lambda v: isinstance(v, str) and v.startswith(prefix))
+            if state is not None:
+                faq_input.pop(uid, None)
             return state
 
     def _edit(text, chat_id, message_id, reply_markup=None, parse_mode='HTML'):
@@ -449,7 +456,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             if action == 'reset': db_set_bot_setting(db_bot_id, key, TEXTS[key][1])
             if action == 'edit':
                 hint = '\nПодстановки: {start}, {end}, {wait}' if key == 'txt_offhours' else ''
-                settings_input(cb, 'text', f'Введи новый текст: «{TEXTS[key][0]}». Форматирование сохраняется.{hint}', 'ps_text_' + key, key=key)
+                settings_input(cb, 'text', f'Введи новый текст: «{TEXTS[key][0]}». Форматирование сохраняется{hint}', 'ps_text_' + key, key=key)
             else: show_text(cb, key)
         elif data.startswith('ps_hours'):
             if data.endswith('_toggle'):
@@ -495,7 +502,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                 show_rules(cb)
                 return
             if action in ('phrases', 'answer'):
-                settings_input(cb, action, 'Введи фразы через запятую или с новой строки' if action == 'phrases' else 'Введи текст ответа. Форматирование сохраняется.', f'ps_rule_{rid}', rid=rid)
+                settings_input(cb, action, 'Введи фразы через запятую или с новой строки' if action == 'phrases' else 'Введи текст ответа. Форматирование сохраняется', f'ps_rule_{rid}', rid=rid)
             elif action == 'delete':
                 settings_show(cb, 'Удалить правило?', [[('Да, удалить', f'ps_remove_{rid}'), ('Отмена', f'ps_rule_{rid}')]])
             elif action == 'remove':
@@ -512,7 +519,8 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                          not in ('/start', '/admin', '/status', '/templates'))
     def support_settings_input(m):
         if not settings_access(m): return
-        state = pstate[m.from_user.id]
+        state, revision = pstate.snapshot(m.from_user.id)
+        if not isinstance(state, dict) or state.get('step') != 'support_input': return
         action = state['action']
         try:
             if action == 'test':
@@ -523,7 +531,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                 if action == 'new_phrases':
                     _set_flow(m.from_user.id, dict(step='support_input', action='new_answer', phrases=phrases, back='ps_rules_0'))
                     kb = InlineKeyboardMarkup(); kb.add(_pbtn('Отмена', callback_data='ps_rules_0'))
-                    pbot.send_message(m.chat.id, 'Введи текст ответа. Форматирование сохраняется.', reply_markup=kb)
+                    pbot.send_message(m.chat.id, 'Введи текст ответа. Форматирование сохраняется', reply_markup=kb)
                     return
                 rule = next((r for r in db.db_auto_rules(db_bot_id) if r['id'] == state['rid']), None)
                 if not rule: raise ValueError('Правило больше недоступно')
@@ -548,7 +556,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
             kb = InlineKeyboardMarkup(); kb.add(_pbtn('Отмена', callback_data=state['back']))
             pbot.send_message(m.chat.id, result, reply_markup=kb)
             return
-        _reset_flow(m.from_user.id)
+        pstate.finish(m.from_user.id, revision)
         kb = InlineKeyboardMarkup(); kb.add(_pbtn('Назад', callback_data=state['back']))
         pbot.send_message(m.chat.id, result, reply_markup=kb)
 
@@ -610,13 +618,6 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         pages = max(1, (len(children) + 7) // 8)
         page = max(0, min(page, pages - 1))
         text = f"<b>{html.escape(node['title'])}</b>" + ('\n\n' + node['text'] if node['text'] else '') if node else f'<b>{TE_NOTE} FAQ</b>\n\nВыбери вопрос'
-        # edit_html использует предел 3800: оставляем запас и сохраняем
-        # навигацию именно в одном сообщении, включая длинные ответы FAQ.
-        chunks = html_chunks(text, 3790)
-        text = chunks[0] + ('…' if len(chunks) > 1 else '')
-        if len(text.encode('utf-16-le')) // 2 > 4096:
-            text = html.escape(re.sub('<[^>]*>', '', text))
-            text = html_chunks(text, 3790)[0] + '…'
         rows = [[(n['title'], f"fq_{mode}_{n['id']}_0")] for n in children[page*8:page*8+8]]
         if pages > 1:
             nav = []
@@ -642,8 +643,8 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     def faq_prompt(cb, action, node_id, **values):
         prompts = {'add': 'Введи название кнопки (1–40 символов)',
                    'name': 'Введи новое название (1–40 символов)',
-                   'text': 'Введи текст раздела. Форматирование сохраняется.',
-                   'new_text': 'Введи текст раздела или нажми «Пропустить». Форматирование сохраняется.'}
+                   'text': 'Введи текст раздела. Форматирование сохраняется',
+                   'new_text': 'Введи текст раздела или нажми «Пропустить». Форматирование сохраняется'}
         faq_input[cb.from_user.id] = dict(action=action, node_id=node_id, **values)
         rows = [[('Отмена', f'fq_e_{node_id}_0')]]
         if action == 'new_text': rows.insert(0, [('Пропустить', f'fq_skip_{node_id}')])
@@ -712,19 +713,21 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                 if not 1 <= len(title) <= 40: raise ValueError('Название должно содержать от 1 до 40 символов')
                 if action == 'add':
                     sent = pbot.send_message(m.chat.id, 'Название принято')
+                    if faq_input.get(m.from_user.id) is not state: return
                     cb = SimpleNamespace(from_user=m.from_user, message=SimpleNamespace(chat=m.chat, message_id=sent.message_id))
                     faq_prompt(cb, 'new_text', node_id, title=title)
                     return
                 db.db_faq_edit(db_bot_id, node_id, 'title', title)
             else:
                 text = m.html_text or ''
-                # Проверяем весь HTML, включая обрезаемую при показе часть.
-                validate_support_html(text, 100000)
+                db.validate_faq_text(text)
+                validate_support_html(text, db.FAQ_TEXT_LIMIT)
                 from telegram_text import send_html
                 send_html(pbot, m.chat.id, text)
                 if action == 'new_text': node_id = db.db_faq_add(db_bot_id, node_id or None, state['title'], text)
                 else: db.db_faq_edit(db_bot_id, node_id, 'text', text)
-            faq_input.pop(m.from_user.id, None)
+            if faq_input.get(m.from_user.id) is state:
+                faq_input.pop(m.from_user.id, None)
             faq_open_saved(m, node_id)
         except Exception as exc:
             message = str(exc) if isinstance(exc, ValueError) else 'Текст не сохранён: проверь HTML и попробуй ещё раз'
@@ -967,7 +970,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
 
     @pbot.message_handler(func=lambda m: pstate.get(m.from_user.id) == 'await_msg')
     def p_user_text(m):
-        if _take_flow(m.from_user.id, 'await_msg') is None: return
+        _take_flow(m.from_user.id, 'await_msg')
         _deliver_direct(m)
 
     # ── Медиа ──────────────────────────────────────────
@@ -978,7 +981,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         func=lambda m: pstate.get(m.from_user.id) == 'await_msg'
     )
     def p_user_media(m):
-        if _take_flow(m.from_user.id, 'await_msg') is None: return
+        _take_flow(m.from_user.id, 'await_msg')
         _deliver_direct(m)
 
     # ── Ответ админа ───────────────────────────────────
@@ -1123,7 +1126,10 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
     @pbot.message_handler(func=lambda m: isinstance(pstate.get(m.from_user.id), str)
                                          and pstate[m.from_user.id].startswith('await_reply_'))
     def p_admin_text(m):
-        if not is_admin(m.from_user.id): return
+        if not is_admin(m.from_user.id):
+            _reset_flow(m.from_user.id)
+            _deliver_direct(m)
+            return
         state = _take_flow(m.from_user.id, 'await_reply_')
         if state is None: return
         target_id = int(state.split('_')[-1])
@@ -1142,13 +1148,57 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         pbot.send_message(m.chat.id, f"<b>{TE_CHECK}  Ответ отправлен</b>",
             parse_mode='HTML', reply_markup=pk_close())
 
+    reply_albums = {}
+    reply_album_routes = {}
+    reply_album_lock = threading.RLock()
+
+    def flush_reply_albums(key=None):
+        with reply_album_lock:
+            keys = [key] if key is not None else list(reply_albums)
+            batches = [reply_albums.pop(k) for k in keys if k in reply_albums]
+        for batch in batches:
+            batch['timer'].cancel()
+            if not is_admin(batch['admin']):
+                continue
+            from telegram_text import ordered_album
+            ids = ordered_album(set(batch['ids']), key=int)
+            from forum_support import _batch_message_ids
+            ok = _retry_send(lambda: _batch_message_ids(
+                pbot.copy_messages(batch['target'], batch['admin'], ids), ids))
+            pbot.send_message(batch['admin'],
+                f'{TE_CHECK} Ответ отправлен' if ok else f'{TE_EXCLAM} Не удалось доставить альбом, отправь ещё раз',
+                parse_mode='HTML', reply_markup=pk_close())
+
+    pbot._flush_reply_albums = flush_reply_albums
+
     @pbot.message_handler(
         content_types=['photo'],
         func=lambda m: isinstance(pstate.get(m.from_user.id), str)
                        and pstate[m.from_user.id].startswith('await_reply_')
+                       or (m.from_user.id, m.media_group_id) in reply_album_routes
     )
     def p_admin_photo_reply(m):
-        if not is_admin(m.from_user.id): return
+        if not is_admin(m.from_user.id):
+            _reset_flow(m.from_user.id)
+            _deliver_direct(m)
+            return
+        if m.media_group_id:
+            key = (m.from_user.id, m.media_group_id)
+            with reply_album_lock:
+                state = _take_flow(m.from_user.id, 'await_reply_') if key not in reply_album_routes else None
+                if state:
+                    reply_album_routes[key] = (int(state.split('_')[-1]), time.time())
+                route = reply_album_routes.get(key)
+                if not route: return
+                batch = reply_albums.setdefault(key, dict(admin=m.from_user.id, target=route[0], ids=[]))
+                if 'timer' in batch: batch['timer'].cancel()
+                batch['ids'].append(m.message_id)
+                batch['timer'] = threading.Timer(1, flush_reply_albums, args=(key,))
+                batch['timer'].daemon = True
+                batch['timer'].start()
+                for old, (_, stamp) in list(reply_album_routes.items()):
+                    if time.time() - stamp > 60: reply_album_routes.pop(old, None)
+            return
         state = _take_flow(m.from_user.id, 'await_reply_')
         if state is None: return
         target_id = int(state.split('_')[-1])
@@ -1397,6 +1447,7 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         s = pstate[m.from_user.id]
         s['address'] = address
         s['step'] = 'p_await_withdraw_amount'
+        s['operation_key'] = uuid.uuid4().hex
         _set_flow(m.from_user.id, s)
         balance = s['balance']
         pbot.send_message(m.chat.id,
@@ -1409,7 +1460,8 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                                          and pstate[m.from_user.id].get('step') == 'p_await_withdraw_amount')
     def p_save_withdraw_amount(m):
         if not _require_owner(m): return
-        s = pstate[m.from_user.id]
+        s = pstate.get(m.from_user.id)
+        if not isinstance(s, dict) or s.get('step') != 'p_await_withdraw_amount': return
         balance = s['balance']
         address = s['address']
         text = m.text.strip().lower()
@@ -1425,27 +1477,17 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
                     f"<b>{TE_CROSS}  Неверная сумма. Максимум: {balance:.4f} USDT</b>",
                     parse_mode='HTML')
                 return
-        _reset_flow(m.from_user.id)
-        # Атомарное списание: двойные конкурентные заявки не уйдут в минус
-        from database import db_deduct_bot_earnings_atomic
-        if not db_deduct_bot_earnings_atomic(db_bot_id, amount):
-            pbot.send_message(m.chat.id,
-                f"<b>{TE_CROSS}  Недостаточно средств (баланс изменился). Заявка не создана.</b>",
-                parse_mode='HTML')
-            return
-        # Получаем данные владельца бота
-        info = db_get_bot_info(db_bot_id)
-        owner_id = info[2] if info else m.from_user.id
-        # Создаём запрос; при сбое INSERT деньги возвращаются на баланс —
-        # иначе списание есть, а заявки нет (деньги «зависают»)
+        owner_id = m.from_user.id
         try:
-            wr_id = db_create_withdrawal(db_bot_id, owner_id, address, amount)
+            key = 'withdraw:' + s.get('operation_key', f'{owner_id}:{m.message_id}')
+            wr_id = db.db_spend_balance(db_bot_id, owner_id, amount, key, address=address, state=s)
+            if wr_id is None:
+                pbot.send_message(m.chat.id, f'{TE_CROSS} Недостаточно средств или заявка уже создана', parse_mode='HTML')
+                return
         except Exception as e:
             log.warning(f'withdrawal create failed bot#{db_bot_id}: {e}')
-            db_return_bot_earnings(db_bot_id, amount)
             pbot.send_message(m.chat.id,
-                f"<b>{TE_CROSS}  Не удалось создать заявку — средства возвращены "
-                f"на баланс. Попробуй позже.</b>", parse_mode='HTML', reply_markup=pk_close())
+                f'{TE_CROSS} Не удалось создать заявку, попробуй позже', parse_mode='HTML', reply_markup=pk_close())
             return
         # Отправляем в канал суперадмина через main_bot (чтобы кнопки обрабатывались в нём)
         if WITHDRAWAL_CHANNEL and main_bot:
@@ -1533,19 +1575,16 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
         if balance < cost:
             pbot.answer_callback_query(cb.id, f"❌ Недостаточно баланса. Нужно: {cost:.4f} USDT", show_alert=True)
             return
-        from database import db_deduct_bot_earnings_atomic
-        if not db_deduct_bot_earnings_atomic(db_bot_id, cost):
-            pbot.answer_callback_query(cb.id,
-                "❌ Недостаточно средств (баланс изменился)", show_alert=True)
-            return
         try:
-            new_exp = db_renew_bot(db_bot_id, days)
+            key = f'renew:{cb.message.chat.id}:{cb.message.message_id}'
+            new_exp = db.db_spend_balance(db_bot_id, cb.from_user.id, cost, key, days=days)
+            if new_exp is None:
+                pbot.answer_callback_query(cb.id, '❌ Недостаточно средств', show_alert=True)
+                return
         except Exception as e:
-            # продление не прошло — списанные деньги возвращаем (целостность)
             log.warning(f'p_renew_bal renew failed bot#{db_bot_id}: {e}')
-            db_return_bot_earnings(db_bot_id, cost)
             pbot.answer_callback_query(cb.id,
-                "❌ Не удалось продлить — средства возвращены на баланс. Попробуй позже.",
+                '❌ Не удалось продлить, попробуй позже',
                 show_alert=True)
             return
         exp_str = str(new_exp)[:10] if new_exp else '—'

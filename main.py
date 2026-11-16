@@ -13,6 +13,7 @@ from database import init_db, db_get_all_bots_for_checker, DB_PATH
 from purchased_bot import launch_bot, running_bots
 from handlers import register, start_subscription_checker
 from forum_support import start_weekly_scheduler
+from payments import start_payment_checker
 
 # ── Логирование с ротацией: без неё bot.log за месяцы забьёт диск ──
 _data_dir = os.getenv('DATA_DIR', '.')
@@ -60,6 +61,9 @@ if __name__ == '__main__':
         launch_bot(db_bot_id, token, admin_id, bot)
         time.sleep(0.3)  # разносим старты polling-потоков, чтобы не бить залпом
     log.info(f'Started. Loaded {len(running_bots)} purchased bot(s), skipped {skipped_expired} expired.')
+    from service_broadcast import start as resume_broadcasts
+    resume_broadcasts(bot)
+    start_payment_checker(bot)
 
     start_subscription_checker(bot)
 
@@ -107,6 +111,14 @@ if __name__ == '__main__':
     _start_watchdog()
 
     def _run_polling():
+        # Старый webhook блокирует getUpdates даже после неудачного setWebhook
+        while True:
+            try:
+                bot.delete_webhook(drop_pending_updates=False)
+                break
+            except Exception as exc:
+                log.warning('Не удалось снять webhook: %s', exc)
+                time.sleep(5)
         log.info('Running in polling mode.')
 
         def _shutdown(signum, frame):
@@ -192,7 +204,9 @@ if __name__ == '__main__':
         if webhook_ok:
             try:
                 app.run(host='0.0.0.0', port=WEBHOOK_PORT, threaded=True)
-            except OSError as e:
+            except (OSError, SystemExit) as e:
+                if isinstance(e, SystemExit) and e.code in (None, 0):
+                    raise
                 # порт занят (зомби-процесс и т.п.) — webhook всё равно не
                 # примет апдейты: снимаем его и уходим в polling, бот живёт
                 log.error(f'Порт {WEBHOOK_PORT} недоступен ({e}) — fallback в polling')

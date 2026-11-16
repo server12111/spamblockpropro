@@ -11,7 +11,7 @@ import database as db
 from safe_logging import register_secret
 from telegram_text import send_html, send_long, edit_html, protect_text_lengths
 from purchase_store import (db_get_payment, db_register_paid_bot, db_activate_trial,
-                            db_use_purchase_discount, purchase_context)
+                            db_use_purchase_discount, purchase_context, db_claim_coupon, claim_ton_transfer)
 from datetime import datetime
 from database import subscription_days_left
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -113,59 +113,65 @@ def start_subscription_checker(main_bot):
                 bots = db_get_all_bots_for_checker()
                 now  = datetime.now()
                 for bot_id, owner_id, token, admin_id, expires_at in bots:
-                    if not expires_at:
-                        continue
-                    try:
-                        exp = datetime.fromisoformat(str(expires_at))
-                    except Exception:
-                        continue
-                    days_left = subscription_days_left(exp, now)
+                    with _lifecycle_lock:
+                        live = db_get_bot_info(bot_id)
+                        if not live: continue
+                        token = live[0]
+                        expires_at = db.db_get_bot_expires(bot_id)
+                        if not expires_at:
+                            continue
+                        try:
+                            exp = datetime.fromisoformat(str(expires_at))
+                        except Exception:
+                            continue
+                        days_left = subscription_days_left(exp, now)
 
-                    if days_left <= -30:
-                        if token in running_bots:
+                        if days_left <= -30:
+                            if not db_deactivate_bot(bot_id, expected_expires=expires_at):
+                                continue
+                            if token in running_bots:
+                                stop_bot(token)
+                            log.info(f'Bot #{bot_id} deactivated (expired {abs(days_left)}d ago).')
+                            continue
+
+                        if days_left <= 0 and token in running_bots:
                             stop_bot(token)
-                        db_deactivate_bot(bot_id)
-                        log.info(f'Bot #{bot_id} deactivated (expired {abs(days_left)}d ago).')
-                        continue
+                            log.info(f'Bot #{bot_id} subscription expired, stopped.')
+                            try:
+                                main_bot.send_message(owner_id,
+                                    f"{TE_CROSS} <b>Подписка на вашего бота истекла!</b>\n\n"
+                                    f"Чтобы возобновить — нажми «{TE_CART} Купить бота» в главном меню.",
+                                    parse_mode='HTML')
+                            except Exception:
+                                pass
 
-                    if days_left <= 0 and token in running_bots:
-                        stop_bot(token)
-                        log.info(f'Bot #{bot_id} subscription expired, stopped.')
-                        try:
-                            main_bot.send_message(owner_id,
-                                f"{TE_CROSS} <b>Подписка на вашего бота истекла!</b>\n\n"
-                                f"Чтобы возобновить — нажми «{TE_CART} Купить бота» в главном меню.",
-                                parse_mode='HTML')
-                        except Exception:
-                            pass
+                        elif days_left == 3 and not db_get_bot_setting(bot_id, 'reminded_3d', ''):
+                            db_set_bot_setting(bot_id, 'reminded_3d', '1')
+                            try:
+                                kb = InlineKeyboardMarkup()
+                                kb.add(_btn('Продлить сейчас', style='success', callback_data=f'renew_bot_{bot_id}'))
+                                main_bot.send_message(owner_id,
+                                    f"{TE_EXCLAM} <b>Подписка истекает через 3 дня!</b>\n\n"
+                                    f"Продли через «{TE_CART} Купить бота» в главном меню или нажми кнопку ниже.",
+                                    parse_mode='HTML', reply_markup=kb)
+                            except Exception:
+                                pass
 
-                    elif days_left == 3 and not db_get_bot_setting(bot_id, 'reminded_3d', ''):
-                        db_set_bot_setting(bot_id, 'reminded_3d', '1')
-                        try:
-                            kb = InlineKeyboardMarkup()
-                            kb.add(_btn('Продлить сейчас', style='success', callback_data=f'renew_bot_{bot_id}'))
-                            main_bot.send_message(owner_id,
-                                f"{TE_EXCLAM} <b>Подписка истекает через 3 дня!</b>\n\n"
-                                f"Продли через «{TE_CART} Купить бота» в главном меню или нажми кнопку ниже.",
-                                parse_mode='HTML', reply_markup=kb)
-                        except Exception:
-                            pass
+                        elif days_left == 1 and not db_get_bot_setting(bot_id, 'reminded_1d', ''):
+                            db_set_bot_setting(bot_id, 'reminded_1d', '1')
+                            try:
+                                kb = InlineKeyboardMarkup()
+                                kb.add(_btn('Продлить срочно', style='danger', callback_data=f'renew_bot_{bot_id}'))
+                                main_bot.send_message(owner_id,
+                                    f"{TE_EXCLAM} <b>Подписка истекает завтра!</b>\n\n"
+                                    f"Срочно продли через «{TE_CART} Купить бота».",
+                                    parse_mode='HTML', reply_markup=kb)
+                            except Exception:
+                                pass
 
-                    elif days_left == 1 and not db_get_bot_setting(bot_id, 'reminded_1d', ''):
-                        db_set_bot_setting(bot_id, 'reminded_1d', '1')
-                        try:
-                            kb = InlineKeyboardMarkup()
-                            kb.add(_btn('Продлить срочно', style='danger', callback_data=f'renew_bot_{bot_id}'))
-                            main_bot.send_message(owner_id,
-                                f"{TE_EXCLAM} <b>Подписка истекает завтра!</b>\n\n"
-                                f"Срочно продли через «{TE_CART} Купить бота».",
-                                parse_mode='HTML', reply_markup=kb)
-                        except Exception:
-                            pass
-
-                    if days_left > 3:
-                        db_set_bot_setting(bot_id, 'reminded_3d', '')
-                        db_set_bot_setting(bot_id, 'reminded_1d', '')
+                        if days_left > 3:
+                            db_set_bot_setting(bot_id, 'reminded_3d', '')
+                            db_set_bot_setting(bot_id, 'reminded_1d', '')
 
             except Exception as e:
                 log.error(f'Subscription checker error: {e}')
@@ -230,10 +236,11 @@ def register(bot: telebot.TeleBot):
             state[uid] = clean
 
     def _resume_bot(bot_id):
-        info = db_get_bot_info(bot_id)
-        if info and info[0] not in running_bots:
-            return launch_bot(bot_id, info[0], info[1], bot)
-        return bool(info)
+        with _lifecycle_lock:
+            info = db_get_bot_info(bot_id)
+            if info and info[0] not in running_bots:
+                return launch_bot(bot_id, info[0], info[1], bot)
+            return bool(info)
 
     def _edit(text, chat_id, message_id, reply_markup=None, parse_mode='HTML'):
         try:
@@ -253,12 +260,8 @@ def register(bot: telebot.TeleBot):
         return _bot_username_cache[0]
 
     def _safe_send(uid, text):
-        try: bot.send_message(uid, text, parse_mode='HTML'); return True
-        except: return False
-
-    def _safe_photo(uid, photo, caption):
-        try: bot.send_photo(uid, photo, caption=caption, parse_mode='HTML'); return True
-        except: return False
+        from purchased_bot import _retry_send
+        return _retry_send(lambda: bot.send_message(uid, text, parse_mode='HTML'))
 
     def token_cancel_kb():
         kb = InlineKeyboardMarkup()
@@ -385,10 +388,6 @@ def register(bot: telebot.TeleBot):
             text += f"\n<i>… показаны первые {limit} из {len(rows)}</i>"
         return text
 
-    def _broadcast_users(scope):
-        if scope == 'all': return db_get_all_users()
-        return db_get_bot_users(0)
-
     def _after_payment_confirmed(uid, chat_id, message_id, renew_days=30,
                                  context=None):
         # Начисления уже сохранены транзакцией; здесь только запуск и ответ
@@ -464,13 +463,19 @@ def register(bot: telebot.TeleBot):
     def cmd_backup(m):
         if not _is_super_admin(m): return
         try:
-            with open(DB_PATH, 'rb') as f:
-                bot.send_document(m.chat.id, f,
-                    caption=f"{TE_FOLDER} Backup <code>spambots.db</code>\n{TE_CALENDAR} {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                    parse_mode='HTML')
+            import tempfile
+            with tempfile.TemporaryDirectory(dir=db.DATA_DIR, prefix='download_') as backup_dir:
+                snapshot = db.db_backup(backup_dir)
+                self_send_backup(m.chat.id, snapshot)
         except Exception as e:
-            log.error(f'backup error: {e}')
-            bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Ошибка бэкапа: {e}</b>", parse_mode='HTML')
+            log.error('backup error: %s', e)
+            bot.send_message(m.chat.id, f'{TE_CROSS} Не получилось скачать копию, попробуй позже', parse_mode='HTML')
+
+    def self_send_backup(chat_id, snapshot):
+        with open(snapshot, 'rb') as f:
+            bot.send_document(chat_id, f,
+                caption=f"{TE_FOLDER} Резервная копия\n{TE_CALENDAR} {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                parse_mode='HTML')
 
     @bot.message_handler(commands=['restore_db'])
     def cmd_restore_db(m):
@@ -536,10 +541,9 @@ def register(bot: telebot.TeleBot):
     def backup_db_cb(cb):
         if not _is_super_admin(cb): return
         try:
-            with open(DB_PATH, 'rb') as f:
-                bot.send_document(cb.message.chat.id, f,
-                    caption=f"{TE_FOLDER} Backup <code>spambots.db</code>\n{TE_CALENDAR} {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                    parse_mode='HTML')
+            import tempfile
+            with tempfile.TemporaryDirectory(dir=db.DATA_DIR, prefix='download_') as backup_dir:
+                self_send_backup(cb.message.chat.id, db.db_backup(backup_dir))
         except Exception as e:
             bot.answer_callback_query(cb.id, f"❌ Ошибка: {e}", show_alert=True)
             return
@@ -616,6 +620,7 @@ def register(bot: telebot.TeleBot):
                 f"<b>{TE_HOURGLASS} Подожди {MAIN_RATE_SEC} секунд перед следующим сообщением</b>",
                 parse_mode='HTML')
             return
+        if state.take(m.from_user.id, lambda v: v == 'await_user_msg') is None: return
         username = f"@{m.from_user.username}" if m.from_user.username else "нет"
         header = (f"<b>{TE_INBOX} Сообщение от:</b>\n"
                   f"{TE_USER} Имя: <b>{html.escape(m.from_user.full_name)}</b>\n"
@@ -637,7 +642,6 @@ def register(bot: telebot.TeleBot):
                 bot.send_message(m.chat.id,
                     f"<b>{TE_CROSS}  Не удалось доставить сообщение. Попробуй позже.</b>",
                     parse_mode='HTML', reply_markup=close_kb())
-                state.pop(m.from_user.id, None)
                 return
         else:
             try:
@@ -648,11 +652,9 @@ def register(bot: telebot.TeleBot):
                 bot.send_message(m.chat.id,
                     f"<b>{TE_CROSS}  Не удалось доставить сообщение. Попробуй позже.</b>",
                     parse_mode='HTML', reply_markup=close_kb())
-                state.pop(m.from_user.id, None)
                 return
         bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Сообщение отправлено</b>",
             parse_mode='HTML', reply_markup=close_kb())
-        state.pop(m.from_user.id, None)
 
     @bot.message_handler(func=lambda m: isinstance(state.get(m.from_user.id), str)
                                         and state[m.from_user.id].startswith('await_admin_msg_'))
@@ -660,14 +662,15 @@ def register(bot: telebot.TeleBot):
         if not _is_super_admin(m):
             _reset_flow(m.from_user.id)
             return
-        target_id = int(state[m.from_user.id].split('_')[-1])
+        captured = state.take(m.from_user.id, lambda v: isinstance(v, str) and v.startswith('await_admin_msg_'))
+        if captured is None: return
+        target_id = int(captured.split('_')[-1])
         try:
             send_long(bot, target_id, f"<b>{TE_INBOX} Сообщение от администратора</b>", m.text)
         except Exception as e:
             # адресат недоступен (заблокировал бота / удалил аккаунт): не молчим —
             # сообщаем и снимаем состояние, иначе админ застрянет в режиме ответа
             log.warning(f'admin_text delivery to {target_id} failed: {e}')
-            state.pop(m.from_user.id, None)
             bot.send_message(m.chat.id,
                 f"<b>{TE_CROSS}  Не удалось доставить ответ: пользователь недоступен "
                 f"(заблокировал бота или удалил аккаунт).</b>",
@@ -675,7 +678,6 @@ def register(bot: telebot.TeleBot):
             return
         bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Ответ отправлен</b>",
             parse_mode='HTML', reply_markup=close_kb())
-        state.pop(m.from_user.id, None)
 
     # ── Купить / продлить бота ────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'buy_bot')
@@ -684,10 +686,8 @@ def register(bot: telebot.TeleBot):
         _reset_flow(uid)
 
         # Проверяем бесплатный купон от суперадмина
-        coupon_days = db_get_free_coupon(uid)
+        coupon_days = db_claim_coupon(uid)
         if coupon_days:
-            db_mark_coupon_used(uid)
-            db_mark_paid(uid, days=coupon_days)
             state[uid] = {'step': 'await_bot_token_free', 'days': coupon_days}
             _edit(
                 f"{TE_GIFT} <b>У тебя есть бесплатный купон на {coupon_days} дней!</b>\n\n"
@@ -826,11 +826,12 @@ def register(bot: telebot.TeleBot):
 
     @bot.callback_query_handler(func=lambda c: c.data == 'pay_cryptobot')
     def pay_cryptobot_cb(cb):
+        context = state.get(cb.from_user.id)
         invoice = cb_create_invoice(cb.from_user.id)
         if not invoice:
             bot.answer_callback_query(cb.id, "Не удалось создать счёт — попробуй ещё раз", show_alert=True)
             return
-        db_set_pending(cb.from_user.id, invoice['invoice_id'], context=state.get(cb.from_user.id),
+        db_set_pending(cb.from_user.id, invoice['invoice_id'], context=context,
                        amount=invoice.get('amount'), expires_at=time.time() + 3600)
         _edit(
             f"<b>{TE_CARD} Оплата через CryptoBot</b>\n\n"
@@ -866,6 +867,8 @@ def register(bot: telebot.TeleBot):
 
     @bot.callback_query_handler(func=lambda c: c.data == 'pay_ton')
     def pay_ton_cb(cb):
+        cur = state.get(cb.from_user.id)
+        quoted_price = get_price()
         bot.answer_callback_query(cb.id, "⏳ Получаю курс TON...")
         ton_amount = get_ton_amount()
         if ton_amount <= 0:
@@ -873,8 +876,7 @@ def register(bot: telebot.TeleBot):
             return
         payment_code = f"SPB{cb.from_user.id}_{uuid.uuid4().hex[:16]}"
         link = ton_payment_link(ton_amount, payment_code)
-        cur = state.get(cb.from_user.id)
-        db_set_pending(cb.from_user.id, payment_code, context=cur, amount=get_price(),
+        db_set_pending(cb.from_user.id, payment_code, context=cur, amount=quoted_price,
                        expires_at=time.time() + 7200, provider='ton', expected_ton=ton_amount)
         new_state = {'step': 'ton_pending', 'ton': ton_amount, 'code': payment_code}
         target, via = purchase_context(cur)
@@ -911,8 +913,17 @@ def register(bot: telebot.TeleBot):
         order = db_get_payment(uid, payment_code, provider='ton')
         # Совместимость с кнопками TON, созданными до миграции
         if not order and isinstance(current, dict) and current.get('code') == payment_code and 'ton' in current:
+            c = db._conn()
+            try: row = c.execute('SELECT updated_at FROM states WHERE bot_id=0 AND user_id=?', (uid,)).fetchone()
+            finally: c.close()
+            try:
+                from datetime import timezone
+                deadline = datetime.fromisoformat(str(row[0])).replace(tzinfo=timezone.utc).timestamp() + 7200
+            except (TypeError, ValueError):
+                bot.answer_callback_query(cb.id, 'Счёт истёк, создай новый', show_alert=True)
+                return
             db_set_pending(uid, payment_code, context=current, amount=get_price(),
-                           provider='ton', expected_ton=current['ton'])
+                           provider='ton', expected_ton=current['ton'], expires_at=deadline)
             order = db_get_payment(uid, payment_code, provider='ton')
         if not order:
             bot.answer_callback_query(cb.id, "Платёж не найден", show_alert=True)
@@ -922,19 +933,15 @@ def register(bot: telebot.TeleBot):
             return
         ton_amount = order['ton']
         bot.answer_callback_query(cb.id, "Проверяю оплату")
-        found = ton_check_transfer(uid, ton_amount, payment_code, return_tx=True)
+        found = ton_check_transfer(uid, ton_amount, payment_code, return_tx=True, expires_at=order['expires_at'])
         if found:
-            tx_hash = found['tx_hash'] if isinstance(found, dict) else found
-            paid_amount = order['amount']
-            if isinstance(found, dict) and paid_amount is not None:
-                paid_amount *= found['ton_amount'] / ton_amount
-            if db_claim_pending_payment(uid, payment_code, provider='ton', tx_hash=tx_hash,
-                                        paid_amount=paid_amount):
+            if claim_ton_transfer(uid, payment_code, found):
                 context = dict(db_get_payment(uid, payment_code, provider='ton'),
                                step='renewing' if order['bot_id'] else 'new')
                 _after_payment_confirmed(uid, cb.message.chat.id, cb.message.message_id, context=context)
             else:
-                bot.answer_callback_query(cb.id, "Оплата уже зачтена", show_alert=True)
+                settled = db_get_payment(uid, payment_code, provider='ton')['settled']
+                bot.answer_callback_query(cb.id, 'Оплата уже зачтена' if settled else 'Счёт истёк, создай новый', show_alert=True)
         else:
             link = ton_payment_link(ton_amount, payment_code)
             kb   = InlineKeyboardMarkup()
@@ -973,7 +980,7 @@ def register(bot: telebot.TeleBot):
             return
         register_secret(token_val)
         try:
-            me = telebot.TeleBot(token_val).get_me()
+            me = telebot.TeleBot(token_val, threaded=False).get_me()
         except Exception:
             bot.send_message(m.chat.id, f"<b>{TE_CROSS}  Токен недействителен. Проверь и введи правильный:</b>",
                 parse_mode='HTML')
@@ -1051,16 +1058,56 @@ def register(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda c: c.data == 'broadcast')
     def broadcast_start(cb):
         if not _is_super_admin(cb): return
-        _edit(f"<b>{TE_ANNOUNCE} Выбери тип рассылки:</b>",
+        state[cb.from_user.id] = 'bcast_any_mine'
+        _edit(f'{TE_ANNOUNCE} Отправь сообщение или альбом для рассылки',
             cb.message.chat.id, cb.message.message_id,
-            parse_mode='HTML', reply_markup=broadcast_type_kb('mine'))
+            parse_mode='HTML', reply_markup=cancel_kb())
 
     @bot.callback_query_handler(func=lambda c: c.data == 'broadcast_all')
     def broadcast_all_start(cb):
         if not _is_super_admin(cb): return
-        _edit(f"<b>{TE_ANNOUNCE} Рассылка по всем ботам. Выбери тип:</b>",
+        state[cb.from_user.id] = 'bcast_any_all'
+        _edit(f'{TE_ANNOUNCE} Отправь сообщение или альбом для рассылки',
             cb.message.chat.id, cb.message.message_id,
-            parse_mode='HTML', reply_markup=broadcast_type_kb('all'))
+            parse_mode='HTML', reply_markup=cancel_kb())
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(('svc_send_', 'svc_cancel_')))
+    def service_confirm(cb):
+        if not _is_super_admin(cb): return
+        import service_broadcast as svc
+        try: job_id = int(cb.data.rsplit('_', 1)[1])
+        except ValueError: return
+        cancel = cb.data.startswith('svc_cancel_')
+        changed = svc.confirm(bot, job_id, cb.from_user.id, cancel=cancel)
+        bot.answer_callback_query(cb.id, 'Отменено' if cancel and changed else 'Рассылка запущена' if changed else 'Уже обработано')
+        state.take(cb.from_user.id, lambda v: isinstance(v, dict) and v.get('job_id') == job_id)
+
+    def is_service_input(m):
+        if not _is_super_admin(m): return False
+        value = state.get(m.from_user.id)
+        return isinstance(value, str) and value.startswith('bcast_') or (
+            isinstance(value, dict) and value.get('step') == 'service_broadcast'
+            and m.media_group_id and value.get('album') == m.media_group_id)
+
+    @bot.message_handler(content_types=['text','photo','video','animation','document','audio','voice',
+                         'video_note','sticker','contact','location','venue','poll'], func=is_service_input)
+    def service_input(m):
+        import service_broadcast as svc
+        # Сериализация элементов альбома включает чтение и смену состояния
+        with svc._lock:
+            value = state.get(m.from_user.id)
+            scope = value.rsplit('_', 1)[1] if isinstance(value, str) else value['scope']
+            previous = value.get('job_id') if isinstance(value, dict) else None
+            jid = svc.append(bot, m.from_user.id, m.chat.id, scope, m, previous)
+            state[m.from_user.id] = dict(step='service_broadcast', job_id=jid, scope=scope, album=m.media_group_id)
+        if m.media_group_id:
+            svc.schedule_preview(bot, jid)
+        else:
+            try: svc.preview(bot, jid)
+            except Exception as exc:
+                log.warning('service preview failed: %s', exc)
+                svc.fail_preview(bot, jid)
+                state[m.from_user.id] = 'bcast_any_' + scope
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith('bcast_') and not c.data.endswith('_p'))
     def broadcast_type(cb):
@@ -1076,36 +1123,6 @@ def register(bot: telebot.TeleBot):
                 cb.message.chat.id, cb.message.message_id, parse_mode='HTML')
             state[cb.from_user.id] = f'bcast_photo_{scope}'
 
-    @bot.message_handler(func=lambda m: isinstance(state.get(m.from_user.id), str)
-                                        and state[m.from_user.id].startswith('bcast_text_'))
-    def broadcast_text(m):
-        scope = state.pop(m.from_user.id).split('_')[-1]
-        users = _broadcast_users(scope)
-        sent  = sum(1 for uid in users if _safe_send(uid, m.text))
-        bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Рассылка завершена: {sent}/{len(users)}</b>",
-            parse_mode='HTML', reply_markup=close_kb())
-
-    @bot.message_handler(content_types=['photo'],
-                         func=lambda m: isinstance(state.get(m.from_user.id), str)
-                                        and state[m.from_user.id].startswith('bcast_photo_'))
-    def broadcast_photo(m):
-        scope   = state.pop(m.from_user.id).split('_')[-1]
-        users   = _broadcast_users(scope)
-        photo   = m.photo[-1].file_id
-        caption = html.escape(m.caption or '')
-        if len(caption) > 1000:
-            # экранирование могло раздуть подпись за лимит Telegram (1024):
-            # фото без подписи + подпись отдельным текстом (кусками)
-            cap_chunks = html_safe_chunks(caption)
-            sent = sum(1 for uid in users
-                       if _safe_photo(uid, photo, '')
-                       and all(_safe_send(uid, c) for c in cap_chunks))
-        else:
-            sent = sum(1 for uid in users if _safe_photo(uid, photo, caption))
-        bot.send_message(m.chat.id, f"<b>{TE_CHECK}  Рассылка завершена: {sent}/{len(users)}</b>",
-            parse_mode='HTML', reply_markup=close_kb())
-
-    # ── Статистика ────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'stats')
     def stats_cb(cb):
         if not _is_super_admin(cb): return
@@ -1533,7 +1550,6 @@ def register(bot: telebot.TeleBot):
         if not db_claim_withdrawal(wr_id, 'rejected'):
             bot.answer_callback_query(cb.id, f"⚠️ Заявка #{wr_id} уже обработана", show_alert=True)
             return
-        db_return_bot_earnings(bot_id, usdt_amount)
         try:
             send_html(bot, owner_id,
                 f"{TE_CROSS} <b>Запрос на вывод #{wr_id} отклонён.</b>\n\n"

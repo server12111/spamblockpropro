@@ -207,6 +207,8 @@ class DeliverySender:
         except Exception as exc:
             code = getattr(exc, 'error_code', None)
             low = str(exc).lower()
+            if name.startswith('edit_') and 'not modified' in low:
+                return True
             if code == 429:
                 parameters = (getattr(exc, 'result_json', None) or {}).get('parameters', {})
                 delay = max(0, float(parameters.get('retry_after', 1)))
@@ -258,10 +260,12 @@ class DeliverySender:
         return '\n\n'.join(parts)
 
     def _batch(self, first, all_rows):
+        from telegram_text import ordered_album
         progress = json.loads(first['progress'])
         if progress.get('sealed'):
             ids = progress['ids']
-            return [r for r in all_rows if r['id'] in ids], progress
+            by_id = {r['id']: r for r in all_rows}
+            return [by_id[i] for i in ids if i in by_id], progress
         user_rows = [r for r in all_rows if r['user_id'] == first['user_id'] and r['id'] >= first['id']]
         rows = [first]
         group = __import__('forum_support').fs_get_group(self.bot_id)
@@ -278,6 +282,8 @@ class DeliverySender:
             else:
                 break
             rows.append(row)
+        if first['media_group_id']:
+            rows = ordered_album(rows, key=lambda row: row['message_id'])
         progress['ids'] = [r['id'] for r in rows]
         return rows, progress
 
@@ -286,6 +292,11 @@ class DeliverySender:
         self._save()
 
     def _deliver(self):
+        import forum_support as fs
+        with fs._mgmt_lock(self.bot_id):
+            return self._deliver_locked()
+
+    def _deliver_locked(self):
         import forum_support as fs
         rows = self.rows
         messages = [Message.de_json(r['payload']) for r in rows]
@@ -373,7 +384,7 @@ class DeliverySender:
             self.api(self.bot.send_message, aid, header, parse_mode='HTML', reply_markup=kb)
             mids = fs._batch_message_ids(self.api(self.bot.copy_messages, aid, m.chat.id,
                 [ms.message_id for ms in messages]), [ms.message_id for ms in messages])
-        elif m.content_type in ('photo', 'video', 'document', 'audio', 'animation'):
+        elif m.content_type in ('photo', 'video', 'document', 'audio', 'animation', 'voice'):
             obj = getattr(m, m.content_type)
             file_id = obj[-1].file_id if m.content_type == 'photo' else obj.file_id
             cap = header + ('\n\n' + TE_CHAT + ' ' + html.escape(m.caption) if m.caption else '')

@@ -62,10 +62,14 @@ def run():
     check('/start сбрасывает редактор без переименования узла',db.db_faq_get(bid,nid)['title']=='Срок доставки')
     click(f'fq_add_{nid}'); click(f'p_reply_{uid}'); q.dispatch(bot,q.message(777,13,'Ответ пользователю'))
     check('редактор не мешает ответам пользователю',any(s[0]=='send_message' and s[1][0]==uid and 'Ответ пользователю' in s[1][1] for s in q.SENT))
-    db.db_faq_edit(bid,nid,'text','<b>'+'Длинный текст '*900+'</b>')
+    full_text='<b>'+'я'*(db.FAQ_TEXT_LIMIT-7)+'</b>'
+    db.db_faq_edit(bid,nid,'text',full_text)
     start=len(q.SENT); click(f'fq_u_{nid}_0',uid)
     shown=last_edit()[1][0]
-    check('длинный текст обрезан до 4096 с многоточием',len(shown.encode('utf-16-le'))//2<=4096 and shown.endswith('…') and '</b>' in shown and not q.SENT[start:])
+    check('текст максимальной длины показан целиком',len(shown.encode('utf-16-le'))//2<=4096 and full_text in shown and not shown.endswith('…') and not q.SENT[start:])
+    click(f'fq_text_{nid}'); q.dispatch(bot,q.message(777,103,'я'*(db.FAQ_TEXT_LIMIT+1)))
+    check('превышение лимита отклоняется с точной подсказкой',db.db_faq_get(bid,nid)['text']==full_text and any(
+        s[0]=='send_message' and s[1][1]==f'Текст раздела — не больше {db.FAQ_TEXT_LIMIT} символов' for s in q.SENT[start:]))
     click(f'fq_del_{selected}')
     check('подтверждение удаления считает потомков','(2)' in last_edit()[1][0] and next(b for b in buttons() if b.text=='Да, удалить').style=='danger')
     click(f'fq_yes_{selected}')

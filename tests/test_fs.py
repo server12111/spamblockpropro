@@ -630,12 +630,12 @@ check('повторный claim → None', fs.fs_claim_pending(1, 600) is None)
 fs.fs_restore_pending(1, 600, items)
 row = fs.fs_get_pending(1, 600)
 check('restore возвращает очередь', row and row[1] == 'pending')
-# confirm: rate limit мягкий — очередь не теряется
+# Подтверждение отправляет очередь даже во время ограничения обычных сообщений
 forum_support._rate_cache[(1, 600)] = time.time()
 cb6 = make_cb('fs_confirm_send', from_id=600)
 fs.confirm_send(fb6, 1, cb6)
 row = fs.fs_get_pending(1, 600)
-check('при rate limit очередь сохраняется', row is not None and row[1] == 'pending')
+check('при rate limit подтверждённая очередь доставлена', row is None)
 alerts = [c for c in fb6.calls if c[0] == 'send_message' and False]
 forum_support._rate_cache.pop((1, 600), None)
 # успешная отправка
@@ -647,8 +647,8 @@ check('оба сообщения доставлены в тему',
       [c[1][2] for c in copied] == [301, 302], str(len(copied)))
 mapped = fs.fs_get_mapping(GID, fb6._mid)
 check('соответствия очереди записаны', mapped is not None)
-check('rate limit зафиксирован после доставки',
-      rate_limited(1, 600, mark=False) is True)
+check('подтверждение не фиксирует rate limit',
+      rate_limited(1, 600, mark=False) is False)
 
 
 class QueuePromptBot(FakeBot):

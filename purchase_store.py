@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta
 import math
 import json
+import time
 
 def _conn():
     import database
@@ -121,15 +122,17 @@ def _apply_purchase(c, user_id, days, target=None, via=None, amount=None):
     return receipt
 
 
-def db_claim_pending_payment(user_id, invoice_id, *, paid_amount=None, provider='crypto', tx_hash=None):
+def db_claim_pending_payment(user_id, invoice_id, *, paid_amount=None, provider='crypto', tx_hash=None, paid_at=None):
     """Зачёт и начисления неделимы; повтор после сбоя безопасен"""
     c = _conn()
     try:
         c.execute('BEGIN IMMEDIATE')
-        row = c.execute('SELECT amount, target_bot_id, via_bot_id, settled FROM payment_orders '
+        row = c.execute('SELECT amount, target_bot_id, via_bot_id, settled, expires_at FROM payment_orders '
                         'WHERE provider=? AND invoice_id=? AND user_id=?',
                         (provider, str(invoice_id), user_id)).fetchone()
         if not row or row[3]:
+            return False
+        if provider == 'ton' and (row[4] is None or paid_at is not None and not row[4] - 7200 <= paid_at <= row[4]):
             return False
         if tx_hash and not c.execute('INSERT OR IGNORE INTO used_txs (tx_hash, user_id) VALUES (?,?)',
                                      (tx_hash, user_id)).rowcount:
@@ -144,6 +147,19 @@ def db_claim_pending_payment(user_id, invoice_id, *, paid_amount=None, provider=
         return True
     finally:
         c.close()
+
+
+def claim_ton_transfer(user_id, code, found):
+    order = db_get_payment(user_id, code, 'ton')
+    if not order or not found: return False
+    amount = order['amount']
+    if isinstance(found, dict):
+        if amount is not None: amount *= found['ton_amount'] / order['ton']
+        tx_hash, paid_at = found['tx_hash'], found.get('utime', time.time())
+    else:
+        tx_hash, paid_at = found, time.time()
+    return db_claim_pending_payment(user_id, code, provider='ton', tx_hash=tx_hash,
+                                    paid_amount=amount, paid_at=paid_at)
 
 
 def db_use_purchase_discount(user_id, context=None):
@@ -174,6 +190,21 @@ def db_activate_trial(user_id):
         _grant(c, user_id, 3)
         c.commit()
         return True
+    finally:
+        c.close()
+
+
+def db_claim_coupon(user_id):
+    c = _conn()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        row = c.execute('SELECT days FROM free_coupons WHERE user_id=? AND used=0', (user_id,)).fetchone()
+        if not row:
+            return None
+        c.execute('UPDATE free_coupons SET used=1 WHERE user_id=? AND used=0', (user_id,))
+        _grant(c, user_id, row[0])
+        c.commit()
+        return row[0]
     finally:
         c.close()
 

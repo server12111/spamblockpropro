@@ -1,7 +1,23 @@
 """Отправка длинного HTML с сохранением тегов, сущностей и кнопок"""
 import html
+import time
 from functools import wraps
 from html.parser import HTMLParser
+
+
+def ordered_album(items, key=lambda message: message.message_id):
+    """Порядок обработки worker-потоками не является порядком сообщений Telegram"""
+    return sorted(items, key=key)
+
+
+def retry_telegram(call):
+    """Любая 429 повторяется только после retry_after и сохраняет результат API"""
+    while True:
+        try: return call()
+        except Exception as exc:
+            if getattr(exc, 'error_code', None) != 429: raise
+            params = (getattr(exc, 'result_json', None) or {}).get('parameters', {})
+            time.sleep(max(1, float(params.get('retry_after', 1))))
 
 
 def html_chunks(text, limit=3800):
@@ -67,7 +83,7 @@ def protect_text_lengths(bot):
 
 
 def send_html(bot, chat_id, text, reply_markup=None, parse_mode='HTML'):
-    chunks = html_chunks(text) if parse_mode == 'HTML' else [text[i:i+1900] for i in range(0, len(text), 1900)]
+    chunks = html_chunks(text, 4096) if parse_mode == 'HTML' else [text[i:i+1900] for i in range(0, len(text), 1900)]
     result = None
     for i, chunk in enumerate(chunks):
         result = bot.send_message(chat_id, chunk, parse_mode=parse_mode,
@@ -80,7 +96,7 @@ def send_long(bot, chat_id, header, body, reply_markup=None):
 
 
 def edit_html(bot, chat_id, message_id, text, reply_markup=None, parse_mode='HTML'):
-    chunks = html_chunks(text) if parse_mode == 'HTML' else [text[i:i+1900] for i in range(0, len(text), 1900)]
+    chunks = html_chunks(text, 4096) if parse_mode == 'HTML' else [text[i:i+1900] for i in range(0, len(text), 1900)]
     result = None
     for i, chunk in enumerate(chunks):
         markup = reply_markup if i == len(chunks) - 1 else None
