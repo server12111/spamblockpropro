@@ -302,9 +302,9 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
     # ── Клавиатуры ─────────────────────────────────────
     def pk_start(show_admin: bool = False):
         kb = InlineKeyboardMarkup()
+        kb.add(_pbtn('Отправить сообщение', icon='📤', style='primary', callback_data='p_send'))
         if db.db_faq_nodes(db_bot_id):
             kb.add(_pbtn('FAQ', icon='❓', callback_data='fq_u_0_0'))
-        kb.add(_pbtn('Отправить сообщение', icon='📤', style='primary', callback_data='p_send'))
         if show_admin:
             kb.add(_pbtn('Панель админа', icon='⌨️', style='primary', callback_data='p_open_admin'))
         if db_is_marketplace_enabled(db_bot_id) and BOT_USERNAME:
