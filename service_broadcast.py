@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from datetime import datetime
+from contextlib import contextmanager, ExitStack
 from telebot import types as t
 import database as db
 from keyboards import TE_ANNOUNCE, TE_CHECK, TE_CROSS, _btn
@@ -17,6 +18,19 @@ _worker_lock = threading.Lock()
 _workers = {}
 _timers = {}
 _supervisor = None
+_dispatch_locks = tuple(threading.RLock() for _ in range(64))
+
+
+def dispatch_lock(bid):
+    return _dispatch_locks[bid % len(_dispatch_locks)]
+
+
+@contextmanager
+def pause_delivery():
+    """Замена БД ждёт отправки всех ботов, обычные рассылки идут параллельно"""
+    with ExitStack() as stack:
+        for lock in _dispatch_locks: stack.enter_context(lock)
+        yield
 
 
 def query(sql, values=(), *, write=False):
@@ -69,6 +83,15 @@ def append(main_bot, creator, chat_id, scope, m, job_id=None):
     """Альбом собирается до подтверждения; каждое входящее сообщение сохраняется сразу"""
     with _lock:
         current = job(job_id) if job_id else None
+        same_album = bool(current and m.media_group_id and current['payload'] and
+                          current['payload'][0].get('media_group_id') == m.media_group_id)
+        if current and current['status'] == 'preview' and same_album:
+            # Поздняя часть отменяет прежний предпросмотр и его снимок адресатов
+            query("UPDATE service_broadcasts SET status='draft' WHERE id=?", (job_id,), write=True)
+            current['status'] = 'draft'
+        if current and same_album and current['status'] not in ('draft', 'preview'):
+            # Подтверждённое задание уже нельзя менять или незаметно разделять
+            raise ValueError('Рассылка уже подтверждена')
         if not current or current['status'] != 'draft':
             job_id = query('INSERT INTO service_broadcasts(creator,chat_id,scope,updated_at) VALUES(?,?,?,?)',
                            (creator, chat_id, scope, time.time()), write=True)
@@ -188,7 +211,10 @@ def schedule_preview(main_bot, job_id):
     with _lock:
         if job_id in _timers: _timers.pop(job_id).cancel()
         def run():
-            try: preview(main_bot, job_id)
+            try:
+                with _lock:
+                    if _timers.get(job_id) is not threading.current_thread(): return
+                    preview(main_bot, job_id)
             except Exception:
                 log.exception('Не удалось подготовить рассылку #%s', job_id)
                 fail_preview(main_bot, job_id)
@@ -209,9 +235,15 @@ def fail_preview(main_bot, job_id):
 
 
 def confirm(main_bot, job_id, creator, cancel=False, start=True):
+    with _lock:
+        return _confirm(main_bot, job_id, creator, cancel, start)
+
+
+def _confirm(main_bot, job_id, creator, cancel, start):
     c = db._conn()
     try:
-        cur = c.execute("UPDATE service_broadcasts SET status=? WHERE id=? AND creator=? AND status='preview'",
+        statuses = "('draft','preview')" if cancel else "('preview')"
+        cur = c.execute(f"UPDATE service_broadcasts SET status=? WHERE id=? AND creator=? AND status IN {statuses}",
                         ('cancelled' if cancel else 'queued', job_id, creator))
         c.commit()
         changed = bool(cur.rowcount)
@@ -221,8 +253,16 @@ def confirm(main_bot, job_id, creator, cancel=False, start=True):
 
 
 def pump(main_bot, bid, *, limit=1000):
+    # Восстановление БД ждёт завершения текущей отправки
+    with dispatch_lock(bid):
+        return _pump(main_bot, bid, limit=limit)
+
+
+def _pump(main_bot, bid, *, limit=1000):
     """Один рабочий поток на бота; уже доставленные адресаты не выбираются снова"""
     count = 0
+    pause = query('SELECT not_before FROM service_limits WHERE bot_id=?', (bid,))
+    if pause and pause[0][0] > time.time(): return 0
     for jid, uid, next_at in query(
             "SELECT r.job_id,r.user_id,r.next_at FROM service_recipients r JOIN service_broadcasts b ON b.id=r.job_id "
             "WHERE r.bot_id=? AND r.status='pending' AND b.status='queued' ORDER BY r.job_id,r.user_id", (bid,)):
@@ -230,6 +270,8 @@ def pump(main_bot, bid, *, limit=1000):
         if next_at > time.time(): continue
         current = job(jid)
         bot = destinations(main_bot, current['scope']).get(bid)
+        if bot is None and db.db_bot_can_run(bid):
+            break  # Временная остановка сохраняет адресатов в очереди
         try:
             if bot is None or db.db_is_blocked(bid, uid):
                 raise ValueError('Адресат недоступен')
@@ -239,6 +281,9 @@ def pump(main_bot, bid, *, limit=1000):
             code = getattr(exc, 'error_code', None)
             if code == 429 or code is None and not isinstance(exc, ValueError) or code and code >= 500:
                 delay = max(1, float((getattr(exc, 'result_json', {}) or {}).get('parameters', {}).get('retry_after', 5)))
+                query('INSERT INTO service_limits(bot_id,not_before) VALUES(?,?) '
+                      'ON CONFLICT(bot_id) DO UPDATE SET not_before=MAX(not_before,excluded.not_before)',
+                      (bid, time.time() + delay), write=True)
                 query("UPDATE service_recipients SET next_at=MAX(next_at,?) WHERE bot_id=? AND status='pending'",
                       (time.time() + delay, bid), write=True)
                 break  # 429 останавливает весь бот до retry_after

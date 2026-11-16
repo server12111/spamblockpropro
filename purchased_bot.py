@@ -93,14 +93,45 @@ def _safe_photo(b, uid, photo, caption):
 
 
 def _close_bot(bot):
-    """Остановить polling и освободить worker_pool также при неудачном запуске"""
+    """Остановить приём, дождаться принятых обработчиков, затем закрыть отправителей"""
+    bot.stop_polling()
+    polling = getattr(bot, '_polling_thread', None)
+    if polling is not None and polling is not threading.current_thread():
+        polling.join()
+    pool = getattr(bot, 'worker_pool', None)
+    if pool is not None and any(w.is_alive() for w in pool.workers):
+        if threading.current_thread() in pool.workers:
+            raise RuntimeError('Остановка должна выполняться вне обработчика')
+        # telebot не вызывает task_done: по одному барьеру на каждого worker
+        # FIFO гарантирует завершение всех заданий перед барьерами
+        workers = [w for w in pool.workers if w.is_alive()]
+        release = threading.Event()
+        reached = [threading.Event() for _ in workers]
+        def barrier(event):
+            event.set()
+            release.wait()
+        try:
+            for event in reached: pool.put(barrier, event)
+            for event in reached: event.wait()
+        finally:
+            release.set()
+    bot.stop_bot()
+    stop_albums = getattr(bot, '_stop_reply_albums', None)
+    if stop_albums: stop_albums()
+    bid = getattr(bot, '_db_bot_id', None)
+    if bid is not None:
+        from forum_support import stop_bot_albums
+        stop_bot_albums(bid)
     sender = getattr(bot, '_delivery_sender', None)
     if sender is not None:
         sender.stop()
     replies = getattr(bot, '_reply_sender', None)
     if replies is not None:
         replies.stop_event.set()
-    bot.stop_bot()
+        with replies.lock: pass
+    if bid is not None:
+        from forum_support import _mgmt_lock
+        with _mgmt_lock(bid): bot._closed = True
 
 @_serialize_lifecycle
 def stop_bot(token: str) -> bool:
@@ -108,12 +139,19 @@ def stop_bot(token: str) -> bool:
     if not bot_obj:
         return False
     try:
-        running_bots.pop(token, None)
-        for bid, tok in list(running_bot_ids.items()):
-            if tok == token:
-                running_bot_ids.pop(bid, None)
-                break
-        _close_bot(bot_obj)
+        import service_broadcast as svc
+        bid = getattr(bot_obj, '_db_bot_id', 0)
+        with svc.dispatch_lock(bid):
+            # Рассылка не может держать экземпляр во время его остановки
+            running_bots.pop(token, None)
+            removed_ids = [bid for bid, tok in running_bot_ids.items() if tok == token]
+            for bid in removed_ids: running_bot_ids.pop(bid, None)
+            try:
+                _close_bot(bot_obj)
+            except Exception:
+                running_bots[token] = bot_obj
+                for bid in removed_ids: running_bot_ids[bid] = token
+                raise
         return True
     except Exception as e:
         log.error(f'stop_bot failed: {e}')
@@ -215,12 +253,26 @@ def make_purchased_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None)
 
 
 def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
+    pbot._db_bot_id = db_bot_id
     from premium_emoji import protect_premium_emoji
     protect_premium_emoji(pbot, db_bot_id)
     pstate = DBState(db_bot_id)
     protect_text_lengths(pbot)
     flow_lock = threading.RLock()
     faq_input = {}
+
+    def _commit_input(uid, expected, save, revision=None, next_faq=None):
+        """Проверка актуальности и запись не могут перемежаться с отменой ввода"""
+        with flow_lock:
+            if revision is not None:
+                if pstate.snapshot(uid)[1] != revision: return False
+            elif faq_input.get(uid) is not expected:
+                return False
+            save()
+            if revision is not None: pstate.finish(uid, revision)
+            elif next_faq is not None: faq_input[uid] = next_faq
+            else: faq_input.pop(uid, None)
+            return True
 
     def _set_flow(uid, state, revision=None):
         with flow_lock:
@@ -567,7 +619,8 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                     return
                 rule = next((r for r in db.db_auto_rules(db_bot_id) if r['id'] == state['rid']), None)
                 if not rule: raise ValueError('Правило больше недоступно')
-                db.db_auto_save(db_bot_id, phrases, rule['text'], rule['id'], rule['offhours'])
+                if not _commit_input(m.from_user.id, state, lambda: db.db_auto_save(
+                        db_bot_id, phrases, rule['text'], rule['id'], rule['offhours']), revision): return
                 result = 'Фразы сохранены'
             else:
                 text = m.html_text or ''
@@ -576,12 +629,14 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                     validate_support_html(re.sub(r'\{(start|end|wait)\}',
                         lambda m: '999 часов' if m[1] == 'wait' else '23:00', text))
                 pbot.send_message(m.chat.id, text, parse_mode='HTML')
-                if action == 'text': db_set_bot_setting(db_bot_id, state['key'], text)
-                elif action == 'new_answer': db.db_auto_save(db_bot_id, state['phrases'], text)
-                else:
-                    rule = next((r for r in db.db_auto_rules(db_bot_id) if r['id'] == state['rid']), None)
-                    if not rule: raise ValueError('Правило больше недоступно')
-                    db.db_auto_save(db_bot_id, rule['phrases'], text, rule['id'], rule['offhours'])
+                def save():
+                    if action == 'text': db_set_bot_setting(db_bot_id, state['key'], text)
+                    elif action == 'new_answer': db.db_auto_save(db_bot_id, state['phrases'], text)
+                    else:
+                        rule = next((r for r in db.db_auto_rules(db_bot_id) if r['id'] == state['rid']), None)
+                        if not rule: raise ValueError('Правило больше недоступно')
+                        db.db_auto_save(db_bot_id, rule['phrases'], text, rule['id'], rule['offhours'])
+                if not _commit_input(m.from_user.id, state, save, revision): return
                 result = 'Текст сохранён'
         except Exception as exc:
             result = str(exc) if isinstance(exc, ValueError) else 'Текст не сохранён: проверь HTML и попробуй ещё раз'
@@ -614,6 +669,9 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
     def pump_notifications():
         import forum_support as fs
         for row in db.db_support_notifications(db_bot_id, time.time()):
+            if db_is_blocked(db_bot_id, row[1]):
+                db.db_support_notification_done(db_bot_id, row)
+                continue
             try:
                 if row[6] == 0:
                     pbot.send_message(row[1], row[3], parse_mode='HTML')
@@ -672,12 +730,16 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
             if mode == 'v': rows.append([('К редактору', f'fq_e_{node_id}_{page}')])
         settings_show(cb, text, rows)
 
-    def faq_prompt(cb, action, node_id, **values):
+    def faq_prompt(cb, action, node_id, expected=None, **values):
         prompts = {'add': 'Введи название кнопки (1–40 символов)',
                    'name': 'Введи новое название (1–40 символов)',
                    'text': 'Введи текст раздела. Форматирование сохраняется',
                    'new_text': 'Введи текст раздела или нажми «Пропустить». Форматирование сохраняется'}
-        faq_input[cb.from_user.id] = dict(action=action, node_id=node_id, **values)
+        value = dict(action=action, node_id=node_id, **values)
+        if expected is not None:
+            if not _commit_input(cb.from_user.id, expected, lambda: None, next_faq=value): return
+        else:
+            with flow_lock: faq_input[cb.from_user.id] = value
         rows = [[('Отмена', f'fq_e_{node_id}_0')]]
         if action == 'new_text': rows.insert(0, [('Пропустить', f'fq_skip_{node_id}')])
         settings_show(cb, prompts[action], rows)
@@ -745,21 +807,22 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                 if not 1 <= len(title) <= 40: raise ValueError('Название должно содержать от 1 до 40 символов')
                 if action == 'add':
                     sent = pbot.send_message(m.chat.id, 'Название принято')
-                    if faq_input.get(m.from_user.id) is not state: return
                     cb = SimpleNamespace(from_user=m.from_user, message=SimpleNamespace(chat=m.chat, message_id=sent.message_id))
-                    faq_prompt(cb, 'new_text', node_id, title=title)
+                    faq_prompt(cb, 'new_text', node_id, expected=state, title=title)
                     return
-                db.db_faq_edit(db_bot_id, node_id, 'title', title)
+                if not _commit_input(m.from_user.id, state,
+                        lambda: db.db_faq_edit(db_bot_id, node_id, 'title', title)): return
             else:
                 text = m.html_text or ''
                 db.validate_faq_text(text)
                 validate_support_html(text, db.FAQ_TEXT_LIMIT)
                 from telegram_text import send_html
                 send_html(pbot, m.chat.id, text)
-                if action == 'new_text': node_id = db.db_faq_add(db_bot_id, node_id or None, state['title'], text)
-                else: db.db_faq_edit(db_bot_id, node_id, 'text', text)
-            if faq_input.get(m.from_user.id) is state:
-                faq_input.pop(m.from_user.id, None)
+                def save():
+                    nonlocal node_id
+                    if action == 'new_text': node_id = db.db_faq_add(db_bot_id, node_id or None, state['title'], text)
+                    else: db.db_faq_edit(db_bot_id, node_id, 'text', text)
+                if not _commit_input(m.from_user.id, state, save): return
             faq_open_saved(m, node_id)
         except Exception as exc:
             message = str(exc) if isinstance(exc, ValueError) else 'Текст не сохранён: проверь HTML и попробуй ещё раз'
@@ -1191,6 +1254,16 @@ def _configure_purchased_bot(pbot, db_bot_id, token, admin_id, main_bot):
                     dict(mode='album', target=batch['target'], chat=batch['admin'], ids=ids, notify=batch['admin']))
 
     pbot._flush_reply_albums = flush_reply_albums
+
+    def stop_reply_albums():
+        with reply_album_lock:
+            timers = [v['timer'] for v in reply_albums.values()]
+            reply_albums.clear()
+            reply_album_routes.clear()
+            for timer in timers: timer.cancel()
+        for timer in timers:
+            if timer.ident is not None and timer is not threading.current_thread(): timer.join()
+    pbot._stop_reply_albums = stop_reply_albums
 
     def persisted_album_target(m):
         if not m.media_group_id: return None
@@ -1761,7 +1834,8 @@ def launch_bot(db_bot_id: int, token: str, admin_id: int, main_bot=None) -> bool
                 sender.stop()
             log.info(f'Bot #{db_bot_id} polling stopped.')
 
-        threading.Thread(target=polling_loop, daemon=True).start()
+        pbot._polling_thread = threading.Thread(target=polling_loop, daemon=True)
+        pbot._polling_thread.start()
         log.info(f'Bot #{db_bot_id} (@{me.username}) launched.')
         return True
     except Exception as e:

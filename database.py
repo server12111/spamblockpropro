@@ -547,6 +547,12 @@ def _init_db_connection(conn, *, schema=False):
         CREATE TABLE IF NOT EXISTS service_file_ids (
             job_id INTEGER NOT NULL, bot_id INTEGER NOT NULL, source_id TEXT NOT NULL, file_id TEXT NOT NULL,
             PRIMARY KEY(job_id,bot_id,source_id));
+        CREATE TABLE IF NOT EXISTS service_limits (
+            bot_id INTEGER PRIMARY KEY, not_before REAL NOT NULL);
+        INSERT INTO service_limits(bot_id,not_before)
+            SELECT bot_id,MAX(next_at) FROM service_recipients
+            WHERE status='pending' GROUP BY bot_id
+            ON CONFLICT(bot_id) DO UPDATE SET not_before=MAX(not_before,excluded.not_before);
     ''')
     conn.commit()
     conn.execute('CREATE TABLE IF NOT EXISTS reply_queue ('
@@ -813,13 +819,15 @@ def db_replace_bot_token(bot_id, expected, token, username, reset_group=False):
         if not previous or previous[0] != expected: raise ValueError('Токен уже изменён. Открой список ботов заново')
         ensure_bot_identity(c, token, bot_id)
         snapshot = dict(previous=previous, tables={})
-        if reset_group:
-            for table in ('fs_groups', 'fs_topics', 'fs_msgs', 'delivery_sources'):
+        # История сообщений и file_id принадлежат Telegram-боту, а не подписке
+        if previous[0].split(':', 1)[0] != token.split(':', 1)[0]:
+            for table in ('fs_groups', 'fs_topics', 'fs_msgs', 'delivery_sources',
+                          'delivery_queue', 'delivery_limits', 'reply_queue', 'fs_pending',
+                          'states', 'fs_connect_requests', 'service_file_ids', 'service_limits',
+                          'support_notifications', 'support_album_replies', 'support_cooldowns'):
                 cursor = c.execute(f'SELECT * FROM {table} WHERE bot_id=?', (bot_id,))
                 snapshot['tables'][table] = ([col[0] for col in cursor.description], cursor.fetchall())
                 c.execute(f'DELETE FROM {table} WHERE bot_id=?', (bot_id,))
-            snapshot['notices'] = c.execute('SELECT id,notice FROM support_notifications WHERE bot_id=?', (bot_id,)).fetchall()
-            c.execute("UPDATE support_notifications SET notice='[]' WHERE bot_id=?", (bot_id,))
         c.execute('UPDATE bots SET token=?,username=? WHERE id=?', (token, username, bot_id))
         c.commit()
         return snapshot

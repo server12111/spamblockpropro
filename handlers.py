@@ -96,6 +96,48 @@ def _replace_owned_token(owner_id, bot_id, expected, token, me, main_bot):
 def _is_super_admin(event):
     return event.from_user.id == SUPER_ADMIN
 
+
+def _is_private_super_admin(event):
+    message = getattr(event, 'message', None) or event
+    return (_is_super_admin(event) and message.chat.type == 'private'
+            and message.chat.id == SUPER_ADMIN)
+
+
+def _restore_database(tmp_path, main_bot):
+    """Ни один экземпляр прежней БД не должен работать с восстановленными ID"""
+    import shutil
+    import service_broadcast as svc
+    backup_path = DB_PATH + f'.pre_restore_{int(time.time())}.bak'
+    with _lifecycle_lock:
+        previous_ids = set(running_bot_ids)
+        replaced = False
+        try:
+            for token in list(running_bots):
+                if not stop_bot(token):
+                    raise RuntimeError('Не удалось остановить ботов')
+            if running_bots or running_bot_ids:
+                raise RuntimeError('Не удалось остановить ботов')
+            # Рабочая рассылка завершает текущую отправку до замены файла
+            with svc.pause_delivery(), svc._lock, db.db_restore_section():
+                for timer in svc._timers.values(): timer.cancel()
+                svc._timers.clear()
+                db.db_close_all()
+                if os.path.exists(DB_PATH): shutil.copy2(DB_PATH, backup_path)
+                os.replace(tmp_path, DB_PATH)
+                try:
+                    init_db()
+                except Exception:
+                    db.db_close_all()
+                    shutil.copy2(backup_path, DB_PATH)
+                    raise
+                replaced = True
+        finally:
+            # После успеха запускаем данные новой БД; после отказа — прежние
+            for bid, owner, token, admin, expires in db.db_get_all_bots_for_checker():
+                if (replaced or bid in previous_ids) and db.db_bot_can_run(bid):
+                    launch_bot(bid, token, admin, main_bot)
+    log.info('БД заменена; прежняя сохранена: %s', backup_path)
+
 def _is_main_rate_limited(user_id: int) -> bool:
     now = time.time()
     if now - _main_rate.get(user_id, 0) < MAIN_RATE_SEC:
@@ -465,7 +507,7 @@ def register(bot: telebot.TeleBot):
     # ── /backup ──────────────────────────────────────────
     @bot.message_handler(commands=['backup'])
     def cmd_backup(m):
-        if not _is_super_admin(m): return
+        if not _is_private_super_admin(m): return
         try:
             import tempfile
             with tempfile.TemporaryDirectory(dir=db.DATA_DIR, prefix='download_') as backup_dir:
@@ -483,7 +525,7 @@ def register(bot: telebot.TeleBot):
 
     @bot.message_handler(commands=['restore_db'])
     def cmd_restore_db(m):
-        if not _is_super_admin(m): return
+        if not _is_private_super_admin(m): return
         state[m.from_user.id] = 'await_db_file'
         bot.send_message(m.chat.id,
             f"<b>{TE_FOLDER} Восстановление базы данных</b>\n\n"
@@ -494,7 +536,7 @@ def register(bot: telebot.TeleBot):
     @bot.message_handler(content_types=['document'],
                          func=lambda m: state.get(m.from_user.id) == 'await_db_file')
     def handle_db_restore(m):
-        if not _is_super_admin(m): return
+        if not _is_private_super_admin(m): return
         state.pop(m.from_user.id, None)
         doc = m.document
         # file_name у документа опционален (Telegram) — None сломал бы .endswith
@@ -518,25 +560,7 @@ def register(bot: telebot.TeleBot):
             finally:
                 _chk.close()
             db.validate_restore(tmp_path)
-            # бэкап текущей базы перед заменой.
-            # Гейт: на время подмены файла доступ к БД всех остальных потоков
-            # приостановлен (ждут в _conn), иначе параллельные операции писали
-            # бы в старый файл или открывали соединения посреди замены
-            import shutil as _shutil
-            from database import db_close_all, db_restore_section
-            backup_path = DB_PATH + f'.pre_restore_{int(time.time())}.bak'
-            with db_restore_section():
-                db_close_all()
-                if os.path.exists(DB_PATH):
-                    _shutil.copy2(DB_PATH, backup_path)
-                os.replace(tmp_path, DB_PATH)  # атомарная замена
-                try:
-                    init_db()
-                except Exception:
-                    db_close_all()
-                    _shutil.copy2(backup_path, DB_PATH)
-                    raise
-            log.info(f'БД заменена; прежняя сохранена: {backup_path}')
+            _restore_database(tmp_path, bot)
             bot.send_message(m.chat.id,
                 f"<b>{TE_CHECK} База данных восстановлена</b>",
                 parse_mode='HTML', reply_markup=close_kb())
@@ -548,19 +572,19 @@ def register(bot: telebot.TeleBot):
     # ── Backup / Restore через кнопки ────────────────────
     @bot.callback_query_handler(func=lambda c: c.data == 'backup_db')
     def backup_db_cb(cb):
-        if not _is_super_admin(cb): return
+        if not _is_private_super_admin(cb): return
         try:
             import tempfile
             with tempfile.TemporaryDirectory(dir=db.DATA_DIR, prefix='download_') as backup_dir:
                 self_send_backup(cb.message.chat.id, db.db_backup(backup_dir))
         except Exception as e:
-            bot.answer_callback_query(cb.id, f"❌ Ошибка: {e}", show_alert=True)
+            bot.answer_callback_query(cb.id, 'Не получилось скачать копию, попробуй позже', show_alert=True)
             return
         bot.answer_callback_query(cb.id)
 
     @bot.callback_query_handler(func=lambda c: c.data == 'restore_db_btn')
     def restore_db_btn_cb(cb):
-        if not _is_super_admin(cb): return
+        if not _is_private_super_admin(cb): return
         state[cb.from_user.id] = 'await_db_file'
         bot.answer_callback_query(cb.id)
         bot.send_message(cb.message.chat.id,
@@ -1088,9 +1112,14 @@ def register(bot: telebot.TeleBot):
         try: job_id = int(cb.data.rsplit('_', 1)[1])
         except ValueError: return
         cancel = cb.data.startswith('svc_cancel_')
-        changed = svc.confirm(bot, job_id, cb.from_user.id, cancel=cancel)
-        bot.answer_callback_query(cb.id, 'Отменено' if cancel and changed else 'Рассылка запущена' if changed else 'Уже обработано')
-        state.take(cb.from_user.id, lambda v: isinstance(v, dict) and v.get('job_id') == job_id)
+        with svc._lock:
+            changed = svc.confirm(bot, job_id, cb.from_user.id, cancel=cancel)
+            current = svc.job(job_id)
+            pending = current and current['status'] == 'draft'
+            if changed:
+                state.take(cb.from_user.id, lambda v: isinstance(v, dict) and v.get('job_id') == job_id)
+        bot.answer_callback_query(cb.id, 'Отменено' if cancel and changed else 'Рассылка запущена'
+                                  if changed else 'Подожди предпросмотр' if pending else 'Уже обработано')
 
     def is_service_input(m):
         if not _is_super_admin(m): return False

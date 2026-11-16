@@ -115,6 +115,8 @@ def _group_guard(fn):
     def call(*args, **kwargs):
         bot_id = kwargs['bot_id'] if 'bot_id' in kwargs else args[0 if fn.__name__ in ('fs_bind_group', 'fs_unbind_group') else 1]
         with _mgmt_lock(bot_id):
+            pbot = kwargs.get('pbot') or (args[0] if args else None)
+            if getattr(pbot, '_closed', False) is True: return
             return fn(*args, **kwargs)
     return call
 
@@ -1404,6 +1406,20 @@ def _deliver_admin_reply(pbot, bot_id: int, m, target_uid: int, thread: int,
 _admin_album_buffers: dict = {}
 _admin_album_lock = threading.Lock()
 
+
+def stop_bot_albums(bot_id):
+    """Остановленный экземпляр больше не обращается к API из таймеров альбомов"""
+    timers = []
+    for buffers, lock in ((_album_buffers, _album_lock), (_admin_album_buffers, _admin_album_lock)):
+        with lock:
+            for key in [k for k in buffers if k[0] == bot_id]:
+                timer = buffers.pop(key).get('timer')
+                if timer:
+                    timer.cancel()
+                    timers.append(timer)
+    for timer in timers:
+        if timer.ident is not None and timer is not threading.current_thread(): timer.join()
+
 def _buffer_admin_album(pbot, bot_id: int, gid: int, target_uid: int,
                         thread: int, m):
     from reply_queue import enqueue_album
@@ -2205,6 +2221,7 @@ def fs_weekly_report_text(bot_id: int, start_tz: datetime, end_tz: datetime) -> 
             f'• Отправлено администраторами: {_fmt_num(msgs_admin)}\n\n'
             f'{TE_CLOCK} Последнее обновление: {updated}')
 
+@_group_guard
 def _publish_period(pbot, bot_id: int, chat_id: int, thread_stats,
                     start_tz: datetime, end_tz: datetime) -> None:
     ps_key = start_tz.strftime('%Y-%m-%d')
